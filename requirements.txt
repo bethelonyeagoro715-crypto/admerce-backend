@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+databases[postgresql]
+asyncpg
+sqlalchemy
+psycopg2-binary
+requests
+passlib[bcrypt]
+python-jose[cryptography]
+firebase-admin
+groq
+anthropic
+sendinblue
+python-multipart
