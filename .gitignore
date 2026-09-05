@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+*.pkl
+*.csv
+*.sqbpro
+uploads/
+venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+.env
