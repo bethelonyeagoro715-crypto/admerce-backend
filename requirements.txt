@@ -12,5 +12,5 @@ python-jose[cryptography]
 firebase-admin
 groq
 anthropic
-sendinblue
+sib-api-v3-sdk
 python-multipart
