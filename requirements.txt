@@ -18,5 +18,3 @@ numpy
 pandas
 scikit-learn
 Pillow
-torch
-torchvision

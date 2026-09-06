@@ -1,47 +1,51 @@
-import io, random, os
+import io, random, os, requests
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
-from rembg import remove, new_session
-
-# ------------------------------------------------------------
-# Force CPU so we never run out of GPU memory
-# ------------------------------------------------------------
-os.environ["CUDA_VISIBLE_DEVICES"] = ""          # hide any GPU
-os.environ["PYTORCH_NO_CUDA_MEMORY"] = "1"
 
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-BACKGROUND_MODEL = "isnet-general-use"   # best for products
+BACKGROUND_MODEL = "isnet-general-use"   # kept for compatibility, not used if using API
 ENABLE_SUPER_RES = False                  # keep False – too slow on CPU
+REMOVEBG_API_KEY = os.getenv("REMOVEBG_API_KEY", "")
 
-# Lazy‑load the rembg session (speeds up subsequent calls)
-_session = None
-def _get_session():
-    global _session
-    if _session is None:
-        _session = new_session(BACKGROUND_MODEL)
-    return _session
+# ------------------------------------------------------------
+# Background removal via remove.bg API (free tier: 50 images/month)
+# ------------------------------------------------------------
+def _remove_background(image_bytes: bytes) -> bytes:
+    """Remove background using remove.bg API. If API key missing or error, return original."""
+    if not REMOVEBG_API_KEY:
+        print("⚠️ REMOVEBG_API_KEY not set. Returning original image (no background removal).")
+        return image_bytes
+
+    try:
+        response = requests.post(
+            "https://api.remove.bg/v1.0/removebg",
+            files={"image_file": ("input.jpg", image_bytes, "image/jpeg")},
+            data={"size": "auto"},
+            headers={"X-Api-Key": REMOVEBG_API_KEY},
+            timeout=30,
+        )
+        if response.status_code == 200:
+            return response.content
+        else:
+            print(f"⚠️ remove.bg error: {response.text}")
+            return image_bytes
+    except Exception as e:
+        print(f"⚠️ remove.bg request failed: {e}")
+        return image_bytes
 
 # ------------------------------------------------------------
 # Public API
 # ------------------------------------------------------------
 def process_image(image_bytes: bytes, style: str = "warm") -> bytes:
-    """
-    Main entry point called by the FastAPI endpoint.
-    style = 'warm'  → Pinterest aesthetic
-    style = 'studio'→ photolab composite
-    style = 'clean' → background removal + auto‑enhance (white bg)
-    """
     if style == "studio":
         return _process_photolab(image_bytes)
     elif style == "clean":
         return _process_clean(image_bytes)
     return _process_warm(image_bytes)
 
-# ------------------------------------------------------------
-# 1. Warm Pinterest‑style (improved)
-# ------------------------------------------------------------
+# Warm Pinterest style (unchanged from your original)
 def _process_warm(image_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img = _auto_enhance(img)
@@ -56,76 +60,57 @@ def _process_warm(image_bytes: bytes) -> bytes:
     img.save(output, format="PNG")
     return output.getvalue()
 
-# ------------------------------------------------------------
-# 2. Clean (background removal + enhancement)
-# ------------------------------------------------------------
+# Clean style (background removal + auto-enhance)
 def _process_clean(image_bytes: bytes) -> bytes:
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    # Remove background using the best model (CPU)
-    output_data = remove(image_bytes, session=_get_session())
-    obj = Image.open(io.BytesIO(output_data)).convert("RGBA")
+    # Use external API for background removal
+    removed_bytes = _remove_background(image_bytes)
+    obj = Image.open(io.BytesIO(removed_bytes)).convert("RGBA")
     obj = _auto_enhance(obj.convert("RGB")).convert("RGBA")
     obj = _feather_edges(obj, radius=1.2)
+
     # Place on pure white
     bg = Image.new("RGBA", obj.size, (255, 255, 255, 255))
     bg.paste(obj, (0, 0), obj)
-    if ENABLE_SUPER_RES:
-        bg = _super_resolve(bg, scale=2)
     output = io.BytesIO()
     bg.convert("RGB").save(output, format="PNG", quality=95)
     return output.getvalue()
 
-# ------------------------------------------------------------
-# 3. Studio photolab (your original creative pipeline)
-# ------------------------------------------------------------
+# Studio photolab style (same as before, but with API background removal)
 def _process_photolab(image_bytes: bytes) -> bytes:
-    # Remove background
-    output_data = remove(image_bytes, session=_get_session())
-    obj = Image.open(io.BytesIO(output_data)).convert("RGBA")
-    # Enhance
+    removed_bytes = _remove_background(image_bytes)
+    obj = Image.open(io.BytesIO(removed_bytes)).convert("RGBA")
     obj = _auto_enhance(obj.convert("RGB")).convert("RGBA")
     obj = _feather_edges(obj, radius=1.5)
 
-    # Super resolution (disabled – too heavy for CPU)
-    if ENABLE_SUPER_RES:
-        obj = _super_resolve(obj, scale=2)
-
-    # Generate premium surface
     width, height = 1920, 1080
     surface = random.choice(["marble", "metal", "velvet", "wood", "neon", "pastel"])
     bg = _make_background(width, height, surface)
 
-    # Resize object (45% of canvas)
     base_width = int(width * 0.45)
     w_percent = base_width / float(obj.size[0])
     h_size = int(float(obj.size[1]) * float(w_percent))
     obj = obj.resize((base_width, h_size), Image.Resampling.LANCZOS)
 
-    # Floor reflection
     reflection = obj.copy().transpose(Image.FLIP_TOP_BOTTOM)
     reflection = reflection.crop((0, 0, reflection.width, int(reflection.height * 0.4)))
     alpha = reflection.split()[3]
     alpha = ImageEnhance.Brightness(alpha).enhance(0.25)
     reflection.putalpha(alpha)
 
-    # Drop shadow
     mask = obj.split()[3]
     shadow = Image.new("RGBA", obj.size, (0, 0, 0, 0))
     shadow.putalpha(mask)
     shadow = shadow.filter(ImageFilter.GaussianBlur(radius=25))
 
-    # Position
     obj_x = (width - base_width) // 2
     obj_y = (height - h_size) // 2 - 60
     ref_y = obj_y + h_size + 10
     shadow_x, shadow_y = obj_x + 20, obj_y + 40
 
-    # Composite
     bg.paste(reflection, (obj_x, ref_y), reflection)
     bg.paste(shadow, (shadow_x, shadow_y), shadow)
     bg.paste(obj, (obj_x, obj_y), obj)
 
-    # Lighting & vignette
     bg = _add_lighting(bg)
     bg = _add_vignette(bg, intensity=0.3)
 
@@ -133,9 +118,7 @@ def _process_photolab(image_bytes: bytes) -> bytes:
     bg.convert("RGB").save(output, format="PNG", quality=95)
     return output.getvalue()
 
-# ------------------------------------------------------------
-# Helper functions
-# ------------------------------------------------------------
+# Helper functions (unchanged)
 def _auto_enhance(img):
     arr = np.array(img, dtype=np.float32)
     for c in range(3):
@@ -149,21 +132,6 @@ def _feather_edges(img, radius=1.0):
     alpha = alpha.filter(ImageFilter.GaussianBlur(radius=radius))
     img.putalpha(alpha)
     return img
-
-def _super_resolve(img, scale=2):
-    try:
-        import importlib
-        realesrgan = importlib.import_module("realesrgan")
-        module = importlib.import_module("basicsr.archs.rrdbnet_arch")
-        RRDBNet = module.RRDBNet
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=scale)
-        upscaler = realesrgan.RealESRGANer(scale=scale, model_path=None, model=model, device='cpu')
-        img_np = np.array(img)
-        output, _ = upscaler.enhance(img_np, outscale=scale)
-        return Image.fromarray(output)
-    except ImportError:
-        w, h = img.size
-        return img.resize((w*scale, h*scale), Image.Resampling.LANCZOS)
 
 def _add_vignette(img, intensity=0.3):
     width, height = img.size
@@ -184,7 +152,6 @@ def _add_grain(img, strength=5):
     arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
     return Image.fromarray(arr)
 
-# Background surfaces (unchanged)
 def _make_background(w, h, style):
     bg = Image.new("RGB", (w, h))
     pixels = np.array(bg, dtype=np.float32)
@@ -232,4 +199,3 @@ def _add_lighting(img):
     img = img.convert("RGBA")
     img = Image.alpha_composite(img, overlay)
     return img.convert("RGB")
- 
