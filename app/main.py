@@ -23,9 +23,8 @@ from app.db.wallet_models import WalletModel, EscrowModel
 from app.db.courier_models import CourierModel
 from app.db.user_models import UserModel
 
-# ── Routers ──────────────────────────────────────────────────────────────
+# ── Routers (lightweight ones always imported) ─────────────────────────
 from app.routes.payment import router as payment_router
-from app.routes.shopper import router as shopper_router
 from app.routes.storekeeper import router as storekeeper_router
 from app.routes.courier import router as courier_router
 from app.routes.wallet import router as wallet_router
@@ -35,20 +34,35 @@ from app.routes.events import router as events_router
 from app.routes.flipper import router as flipper_router
 from app.routes.service import router as services_router
 from app.routes.auth import router as auth_router
-from app.routes.ai_tools import router as ai_tools_router
-from app.routes.seai_search import router as seai_search_router
-from app.routes.seai_ask import router as seai_ask_router
 from app.routes.map import router as map_router
 from app.routes.auth_social import router as social_router
 from app.routes.kyc import router as kyc_router
-from app.routes.seai_lens import router as lens_router
 from app.routes.admin import router as admin_router
 from app.routes.chat import router as chat_router
-from app.routes.seai_transcribe import router as transcribe_router
-from app.routes.businesses import router as businesses_router
 from app.routes.basket import router as basket_router
 from app.routes import settings
 from app.routes.notifications import router as notifications_router
+
+# Conditionally import heavy AI routers
+SKIP_MODELS = os.getenv("SKIP_MODELS") == "1"
+
+if not SKIP_MODELS:
+    from app.routes.shopper import router as shopper_router
+    from app.routes.ai_tools import router as ai_tools_router
+    from app.routes.seai_search import router as seai_search_router
+    from app.routes.seai_ask import router as seai_ask_router
+    from app.routes.seai_lens import router as lens_router
+    from app.routes.seai_transcribe import router as transcribe_router
+    from app.routes.businesses import router as businesses_router
+else:
+    shopper_router = None
+    ai_tools_router = None
+    seai_search_router = None
+    seai_ask_router = None
+    lens_router = None
+    transcribe_router = None
+    businesses_router = None
+    print("⚠️ SKIP_MODELS=1 – Heavy AI models disabled")
 
 # ── Background task: auto‑refund expired escrow ──────────────────────────
 async def _refund_expired_escrows() -> None:
@@ -60,9 +74,7 @@ async def _refund_expired_escrows() -> None:
                 {"now": now},
             )
             for row in expired:
-                # Convert total_amount from TEXT to float before updating wallet
                 refund_amount = float(row["total_amount"])
-
                 await database.execute(
                     "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
                     {"amt": refund_amount, "uid": row["shopper_id"]},
@@ -77,18 +89,13 @@ async def _refund_expired_escrows() -> None:
         await asyncio.sleep(60)
 
 
-# ── Lifespan ──────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Create tables (synchronous, using sync_engine)
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
-
-    # 2. Connect the async database pool
     await database.connect()
     print("✅ Async database pool connected.")
 
-    # 3. Create provider_availability table
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
             user_id      TEXT    PRIMARY KEY,
@@ -98,7 +105,6 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ provider_availability table ready.")
 
-    # 4. Create wallets table
     await database.execute("""
         CREATE TABLE IF NOT EXISTS wallets (
             user_id        TEXT PRIMARY KEY,
@@ -109,7 +115,6 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ wallets table ready.")
 
-    # 5. Create wallet_transactions table
     await database.execute("""
         CREATE TABLE IF NOT EXISTS wallet_transactions (
             id         SERIAL PRIMARY KEY,
@@ -123,7 +128,6 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ wallet_transactions table ready.")
 
-    # 6. Create user_devices table (for FCM tokens)
     await database.execute("""
         CREATE TABLE IF NOT EXISTS user_devices (
             id         SERIAL PRIMARY KEY,
@@ -135,7 +139,6 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ user_devices table ready.")
 
-    # 7. Create user_notifications table (notification history)
     await database.execute("""
         CREATE TABLE IF NOT EXISTS user_notifications (
             id         SERIAL PRIMARY KEY,
@@ -149,12 +152,11 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ user_notifications table ready.")
 
-    # 8. Create cards table
     await database.execute("""
         CREATE TABLE IF NOT EXISTS cards (
             id              SERIAL PRIMARY KEY,
             user_id         TEXT NOT NULL,
-            card_token      TEXT NOT NULL,           -- Paystack authorization code
+            card_token      TEXT NOT NULL,
             last4           TEXT NOT NULL,
             expiry_month    TEXT NOT NULL,
             expiry_year     TEXT NOT NULL,
@@ -165,7 +167,6 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ cards table ready.")
 
-    # 9. Start background escrow refund worker
     task = asyncio.create_task(_refund_expired_escrows())
     print("✅ Server is ready.")
     yield
@@ -174,16 +175,12 @@ async def lifespan(app: FastAPI):
         await task
     except asyncio.CancelledError:
         pass
-
-    # 10. Shutdown: disconnect database pool
     await database.disconnect()
     print("🛑 Server shut down cleanly.")
 
 
-# ── FastAPI app ──────────────────────────────────────────────────────────
 app = FastAPI(title="SEAI - Admerce Backend (Multi-Role)", lifespan=lifespan)
 
-# ── CORS – allow all origins (dev) with credentials ─────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -192,12 +189,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Static file serving (uploads) ──────────────────────────────────────
-BASE_DIR = r"C:\Users\Bethel\SEAI PROJECT"
+BASE_DIR = os.getcwd()  # Use current working directory on Render
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Dedicated media route for services (videos/images) to ensure correct MIME type
 @app.get("/uploads/services/{filename}")
 async def serve_service_media(filename: str):
     filepath = os.path.join(BASE_DIR, "uploads", "services", filename)
@@ -206,12 +201,11 @@ async def serve_service_media(filename: str):
     media_type = "video/mp4" if filename.lower().endswith(".mp4") else "image/jpeg"
     return FileResponse(filepath, media_type=media_type)
 
-# General static mount for all other uploads (must be after the dedicated route)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-# ── Include all routers ──────────────────────────────────────────────────
+# Include routers (only those that are not None)
 app.include_router(payment_router)
-app.include_router(shopper_router)
+if shopper_router: app.include_router(shopper_router)
 app.include_router(storekeeper_router)
 app.include_router(courier_router)
 app.include_router(wallet_router)
@@ -221,27 +215,25 @@ app.include_router(events_router)
 app.include_router(flipper_router)
 app.include_router(services_router)
 app.include_router(auth_router)
-app.include_router(ai_tools_router)
-app.include_router(seai_search_router)
-app.include_router(seai_ask_router)
+if ai_tools_router: app.include_router(ai_tools_router)
+if seai_search_router: app.include_router(seai_search_router)
+if seai_ask_router: app.include_router(seai_ask_router)
 app.include_router(map_router)
 app.include_router(social_router)
 app.include_router(kyc_router)
-app.include_router(lens_router)
+if lens_router: app.include_router(lens_router)
 app.include_router(admin_router)
 app.include_router(chat_router)
-app.include_router(transcribe_router)
-app.include_router(businesses_router)
+if transcribe_router: app.include_router(transcribe_router)
+if businesses_router: app.include_router(businesses_router)
 app.include_router(basket_router)
 app.include_router(settings.router)
 app.include_router(notifications_router)
 
-# ── Exception handler (fixed – no body re‑read) ─────────────────────────
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     print("❌ 422 validation errors:", exc.errors())
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
-
 
 @app.get("/")
 async def root():
