@@ -14,3 +14,9 @@ groq
 anthropic
 sib-api-v3-sdk
 python-multipart
+numpy
+pandas
+scikit-learn
+Pillow
+torch
+torchvision
