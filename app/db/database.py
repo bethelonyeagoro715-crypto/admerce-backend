@@ -11,8 +11,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 if DATABASE_URL:
     # Convert standard postgresql:// to SQLAlchemy/asyncpg formats
-    ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
-    SYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
+    # Also add `statement_cache_size=0` to disable prepared statement caching (fixes stale schema cache issue)
+    if "?" in DATABASE_URL:
+        ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://") + "&statement_cache_size=0"
+        SYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
+    else:
+        ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://") + "?statement_cache_size=0"
+        SYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
 else:
     # Fallback to local hardcoded settings (for development)
     DB_USER = "Admerce2026"
@@ -21,14 +26,14 @@ else:
     DB_PORT = "5432"
     DB_NAME = "admerce_db"
     encoded_password = quote_plus(DB_PASSWORD)
-    ASYNC_DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    ASYNC_DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}?statement_cache_size=0"
     SYNC_DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 engine = create_async_engine(
     ASYNC_DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    connect_args={"statement_cache_size": 0},   # ✅ disable asyncpg statement cache
+    connect_args={"statement_cache_size": 0},   # ✅ also set for SQLAlchemy engine
 )
 sync_engine = create_engine(SYNC_DATABASE_URL, echo=False, pool_pre_ping=True)
 
