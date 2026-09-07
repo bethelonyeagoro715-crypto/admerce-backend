@@ -61,7 +61,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise credentials_exception
 
-    # ✅ Include business fields
     user = await database.fetch_one(
         "SELECT id, phone, email, nickname, verified, role, avatar_url, business_image_url, business_name FROM users WHERE id = :uid",
         {"uid": user_id}
@@ -78,7 +77,6 @@ async def get_optional_user(token: str = Depends(oauth2_scheme)) -> Optional[dic
         user_id: str = payload.get("sub")
         if user_id is None:
             return None
-        # ✅ Include business fields
         user = await database.fetch_one(
             "SELECT id, phone, email, nickname, verified, role, avatar_url, business_image_url, business_name FROM users WHERE id = :uid",
             {"uid": user_id}
@@ -130,10 +128,11 @@ async def signup(req: SignupRequest):
     user_id = uuid.uuid4().hex
     hashed = hash_password(req.password)
 
+    # ✅ Use False instead of 0 for boolean column
     await database.execute(
         "INSERT INTO users (id, phone, email, hashed_password, nickname, verified) "
-        "VALUES (:id, :ph, :em, :pw, :nn, 0)",
-        {"id": user_id, "ph": req.phone, "em": req.email, "pw": hashed, "nn": req.username}
+        "VALUES (:id, :ph, :em, :pw, :nn, :verified)",
+        {"id": user_id, "ph": req.phone, "em": req.email, "pw": hashed, "nn": req.username, "verified": False}
     )
     await database.execute("INSERT INTO wallets (user_id, balance) VALUES (:uid, 0.0)", {"uid": user_id})
 
@@ -173,7 +172,8 @@ async def verify_account(req: VerifyAccountRequest):
         raise HTTPException(status_code=400, detail="Invalid verification code")
 
     await database.execute("UPDATE otp_codes SET used = 1 WHERE id = :id", {"id": otp_record["id"]})
-    await database.execute("UPDATE users SET verified = 1 WHERE phone = :ph", {"ph": req.phone})
+    # ✅ Use True instead of 1 for boolean column
+    await database.execute("UPDATE users SET verified = True WHERE phone = :ph", {"ph": req.phone})
 
     user = await database.fetch_one("SELECT * FROM users WHERE phone = :ph", {"ph": req.phone})
     token = create_access_token({"sub": user["id"], "phone": user["phone"]})
