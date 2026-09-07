@@ -24,7 +24,12 @@ else:
     ASYNC_DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     SYNC_DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-engine = create_async_engine(ASYNC_DATABASE_URL, echo=False, pool_pre_ping=True)
+engine = create_async_engine(
+    ASYNC_DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,
+    connect_args={"statement_cache_size": 0},   # ✅ disable asyncpg statement cache
+)
 sync_engine = create_engine(SYNC_DATABASE_URL, echo=False, pool_pre_ping=True)
 
 AsyncSessionLocal = sessionmaker(
