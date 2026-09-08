@@ -14,7 +14,6 @@ if DATABASE_URL:
     ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
     SYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
 else:
-    # Fallback to local hardcoded settings (for development)
     DB_USER = "Admerce2026"
     DB_PASSWORD = "Bethel2026@"
     DB_HOST = "127.0.0.1"
@@ -24,17 +23,17 @@ else:
     ASYNC_DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     SYNC_DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-# Ensure statement cache is disabled for asyncpg in both engine and Database
+# Add statement_cache_size=0 to the async URL for the Database object
 if "?" in ASYNC_DATABASE_URL:
-    ASYNC_DATABASE_URL += "&statement_cache_size=0"
+    ASYNC_DATABASE_URL_FOR_POOL = ASYNC_DATABASE_URL + "&statement_cache_size=0"
 else:
-    ASYNC_DATABASE_URL += "?statement_cache_size=0"
+    ASYNC_DATABASE_URL_FOR_POOL = ASYNC_DATABASE_URL + "?statement_cache_size=0"
 
 engine = create_async_engine(
     ASYNC_DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    connect_args={"statement_cache_size": 0},   # explicit for engine
+    connect_args={"statement_cache_size": 0},   # disable cache for engine
 )
 sync_engine = create_engine(SYNC_DATABASE_URL, echo=False, pool_pre_ping=True)
 
@@ -46,6 +45,6 @@ AsyncSessionLocal = sessionmaker(
     expire_on_commit=False,
 )
 
-# Use the same URL for the Database object (with statement_cache_size=0)
-database = Database(ASYNC_DATABASE_URL, min_size=5, max_size=20)
+# Use the modified URL for Database (ensures statement_cache_size=0)
+database = Database(ASYNC_DATABASE_URL_FOR_POOL, min_size=5, max_size=20)
 Base = declarative_base()
