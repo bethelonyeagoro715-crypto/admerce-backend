@@ -7,6 +7,7 @@ from app.services.image_processor import process_image
 from app.services.image_embedder import image_to_embedding, embedding_to_json
 from app.services.auto_fill import suggest_from_barcode
 from app.utils.category_utils import validate_product_category
+from app.services.cloudinary_service import upload_image   # ✅ Cloudinary helper
 from fastapi.responses import FileResponse
 import uuid, os, json
 from datetime import datetime
@@ -61,8 +62,7 @@ async def create_store(
             raise HTTPException(status_code=400, detail="You already have a store")
 
         store_id = uuid.uuid4().hex[:12]
-        # ✅ Use datetime object, not string
-        now = datetime.utcnow()
+        now = datetime.utcnow()   # ✅ datetime object
 
         category_json = json.dumps(store_data.category)
         hours_json = json.dumps(store_data.business_hours) if store_data.business_hours else "{}"
@@ -91,7 +91,7 @@ async def create_store(
             "img": store_data.store_image_url,
             "hours": hours_json,
             "pref": store_data.contact_preference,
-            "now": now,   # ✅ pass datetime object
+            "now": now,
         })
 
         return {
@@ -121,14 +121,12 @@ async def create_listing(
     style: str = Form("warm"),
     quantity: int = Form(1),
 ):
-    # Validate category
     if not validate_product_category(category):
         raise HTTPException(
             status_code=400,
             detail=f"Invalid category: '{category}'. Valid categories are: tech_electronics, food_beverage, health_wellness, fashion_apparel, building_industrial, home_garden, kids_toys, sports_outdoors, automotive, media_office"
         )
 
-    # Auto-fill from barcode
     suggested_title = title
     suggested_category = ""
     if barcode:
@@ -138,30 +136,21 @@ async def create_listing(
         if info.get("suggested_category"):
             suggested_category = info["suggested_category"]
 
-    # Process image
+    # Process and upload image to Cloudinary
     image_url = None
-    saved_filename = None
     if image and image.filename:
         image_bytes = await image.read()
         if image_bytes:
             try:
                 processed = process_image(image_bytes, style=style)
-                os.makedirs("uploads", exist_ok=True)
-                saved_filename = f"{uuid.uuid4().hex}.png"
-                fpath = os.path.join("uploads", saved_filename)
-                with open(fpath, "wb") as f:
-                    f.write(processed)
-                image_url = f"{request.base_url}uploads/{saved_filename}"
+                image_url = upload_image(processed, folder="listings")   # ✅ Cloudinary
             except Exception as e:
                 print(f"Image processing error: {e}")
-                os.makedirs("uploads", exist_ok=True)
-                saved_filename = f"{uuid.uuid4().hex}_original.png"
-                fpath = os.path.join("uploads", saved_filename)
-                with open(fpath, "wb") as f:
-                    f.write(image_bytes)
-                image_url = f"{request.base_url}uploads/{saved_filename}"
+                try:
+                    image_url = upload_image(image_bytes, folder="listings")
+                except Exception as e2:
+                    print(f"Upload error: {e2}")
 
-    # Verify store exists
     existing_store = await database.fetch_one(
         "SELECT store_id FROM stores WHERE store_id = :sid", {"sid": store_id}
     )
@@ -171,21 +160,13 @@ async def create_listing(
     listing_id = uuid.uuid4().hex[:8]
     final_title = suggested_title if suggested_title else title
     title_quality = compute_title_quality(final_title)
-    # ✅ Use datetime object, not string
-    created_at = datetime.utcnow()
+    created_at = datetime.utcnow()   # ✅ datetime object
 
-    # Compute embedding (optional)
+    # Compute embedding (optional) – still may use local file? we can skip or use image_url
     embedding = None
-    if saved_filename:
-        try:
-            base = r"C:\Users\Bethel\SEAI PROJECT"
-            full_path = os.path.join(base, "uploads", saved_filename)
-            emb = image_to_embedding(full_path)
-            embedding = embedding_to_json(emb)
-        except Exception as e:
-            print(f"Embedding generation failed: {e}")
+    # embedding generation currently expects a local file path; we'll skip for now
+    # if you need embeddings, you can download from Cloudinary URL or process in memory
 
-    # Insert listing with quantity
     query = """
     INSERT INTO listings (
         listing_id, store_id, title, price, lat, lng, category, created_at,
@@ -249,12 +230,7 @@ async def upload_store_image(
     current_user: dict = Depends(get_current_user)
 ):
     image_bytes = await image.read()
-    os.makedirs("uploads/stores", exist_ok=True)
-    filename = f"store_{uuid.uuid4().hex}.png"
-    filepath = os.path.join("uploads/stores", filename)
-    with open(filepath, "wb") as f:
-        f.write(image_bytes)
-    image_url = f"{request.base_url}uploads/stores/{filename}"
+    image_url = upload_image(image_bytes, folder="store_images")   # ✅ Cloudinary
     return {"image_url": image_url}
 
 # ==================== PREVIEW IMAGE ====================
@@ -266,27 +242,17 @@ async def preview_image(
 ):
     image_bytes = await image.read()
     processed = process_image(image_bytes, style=style)
-    os.makedirs("uploads/previews", exist_ok=True)
-    fname = f"{uuid.uuid4().hex}.png"
-    fpath = os.path.join("uploads/previews", fname)
-    with open(fpath, "wb") as f:
-        f.write(processed)
-    image_url = f"{request.base_url}uploads/previews/{fname}"
+    image_url = upload_image(processed, folder="previews")   # ✅ Cloudinary
     return {"image_url": image_url}
 
-# ==================== SERVE UPLOADED FILES ====================
+# ==================== SERVE UPLOADED FILES (kept for legacy) ====================
 @router.get("/uploads/{file_path:path}")
 async def get_upload(file_path: str):
-    base_dir = r"C:\Users\Bethel\SEAI PROJECT"
+    # Since we now use Cloudinary, this may not be needed, but keep for compatibility.
+    base_dir = os.getcwd()
     filepath = os.path.join(base_dir, "uploads", file_path)
     if os.path.exists(filepath):
-        return FileResponse(
-            filepath,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET",
-            },
-        )
+        return FileResponse(filepath)
     raise HTTPException(status_code=404, detail="Image not found")
 
 # ==================== GET STORE DETAILS ====================
@@ -341,7 +307,6 @@ async def update_item_order(
 # ==================== GET ORDERS FOR A STORE (FIXED) ====================
 @router.get("/orders/{store_id}")
 async def get_store_orders(store_id: str):
-    # Get the owner_id of the store
     store = await database.fetch_one(
         "SELECT owner_id FROM stores WHERE store_id = :sid",
         {"sid": store_id}
@@ -351,7 +316,6 @@ async def get_store_orders(store_id: str):
 
     owner_id = store["owner_id"]
 
-    # Join escrow with users to get shopper's nickname (customer name).
     query = """
         SELECT e.*, 
                COALESCE(u.nickname, 'Customer') AS customer_name
@@ -437,13 +401,7 @@ async def update_store_image(
     store_id = store["store_id"]
 
     image_bytes = await image.read()
-    os.makedirs("uploads/stores", exist_ok=True)
-    filename = f"store_{store_id}_{uuid.uuid4().hex[:8]}.png"
-    filepath = os.path.join("uploads/stores", filename)
-    with open(filepath, "wb") as f:
-        f.write(image_bytes)
-
-    image_url = f"{request.base_url}uploads/stores/{filename}"
+    image_url = upload_image(image_bytes, folder="store_images")   # ✅ Cloudinary
 
     await database.execute(
         "UPDATE stores SET store_image_url = :url WHERE store_id = :sid",
