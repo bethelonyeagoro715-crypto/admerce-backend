@@ -184,7 +184,10 @@ async def resend_verification(req: ResendVerificationRequest):
     user = await database.fetch_one("SELECT * FROM users WHERE phone = :ph", {"ph": req.phone})
     if not user:
         return {"message": "If this phone is registered, a new code has been sent."}
-    if user["verified"]:
+
+    # ✅ Replace user.get("verified") with bracket notation
+    verified = user["verified"] if "verified" in user else False
+    if verified:
         return {"message": "Account already verified. Please log in."}
 
     await invalidate_old_otps(req.phone, purpose="signup_verify")
@@ -197,7 +200,8 @@ async def resend_verification(req: ResendVerificationRequest):
         {"ph": req.phone, "code": code, "exp": expires_at.isoformat()}
     )
 
-    email = user.get("email")
+    # ✅ Safe access to email
+    email = user["email"] if "email" in user else None
     if email:
         try:
             send_otp_email(email, code, "signup_verify")
@@ -241,7 +245,8 @@ async def forgot_password(req: ForgotPasswordRequest):
         {"ph": req.phone, "code": code, "exp": expires_at.isoformat()}
     )
 
-    email = user.get("email")
+    # ✅ Replace user.get("email")
+    email = user["email"] if "email" in user else None
     if email:
         try:
             send_otp_email(email, code, "reset_password")
