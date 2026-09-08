@@ -68,15 +68,13 @@ else:
 async def _refund_expired_escrows() -> None:
     while True:
         try:
-            now = datetime.utcnow()   # ✅ pass datetime object, not string
+            now = datetime.utcnow()   # ✅ datetime object
             expired = await database.fetch_all(
                 "SELECT * FROM escrow WHERE status = 'locked' AND expires_at < :now",
                 {"now": now},
             )
             for row in expired:
-                # Convert total_amount from TEXT to float before updating wallet
                 refund_amount = float(row["total_amount"])
-
                 await database.execute(
                     "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
                     {"amt": refund_amount, "uid": row["shopper_id"]},
@@ -97,10 +95,9 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
 
-    # 2. Run schema migrations (ensure columns exist, correct types)
+    # 2. Run schema migrations using raw SQL with exec_driver_sql
     with sync_engine.connect() as conn:
-        # Create otp_codes table if missing
-        conn.execute("""
+        conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS otp_codes (
                 id SERIAL PRIMARY KEY,
                 phone TEXT NOT NULL,
@@ -111,31 +108,29 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # Add missing users columns
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS real_name TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS middle_name TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS lga TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS state_of_origin TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS nationality TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS residence_address TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS national_id_number TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_verified BOOLEAN DEFAULT FALSE")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS id_document_url TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS selfie_url TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS liveness_verified BOOLEAN DEFAULT FALSE")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN DEFAULT FALSE")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_image_url TEXT")
-        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_name TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS real_name TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS middle_name TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS lga TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS state_of_origin TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS nationality TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS residence_address TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS national_id_number TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_verified BOOLEAN DEFAULT FALSE")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS id_document_url TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS selfie_url TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS liveness_verified BOOLEAN DEFAULT FALSE")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN DEFAULT FALSE")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_image_url TEXT")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_name TEXT")
 
-        # Add escrow expires_at if missing
-        conn.execute("ALTER TABLE escrow ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
+        conn.exec_driver_sql("ALTER TABLE escrow ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
 
     print("✅ Schema migrations complete.")
 
@@ -143,7 +138,7 @@ async def lifespan(app: FastAPI):
     await database.connect()
     print("✅ Async database pool connected.")
 
-    # 4. Create other necessary tables
+    # 4. Create other necessary tables (using async database)
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
             user_id      TEXT    PRIMARY KEY,
@@ -240,7 +235,7 @@ app.add_middleware(
 )
 
 # ── Static file serving (uploads) ──────────────────────────────────────
-BASE_DIR = os.getcwd()  # Use current working directory on Render
+BASE_DIR = os.getcwd()
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
