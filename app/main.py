@@ -161,7 +161,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # messages (updated with conversation_id and name fields)
+        # messages (updated with conversation_id, names, and read)
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -172,9 +172,16 @@ async def lifespan(app: FastAPI):
                 receiver_name TEXT,
                 text TEXT,
                 image_url TEXT,
+                read BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP
             )
         """)
+
+        # Ensure messages table has all required columns if it already existed
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT")
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_name TEXT")
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS receiver_name TEXT")
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS read BOOLEAN DEFAULT FALSE")
 
         # listing_events (for stats)
         conn.exec_driver_sql("""
@@ -195,11 +202,6 @@ async def lifespan(app: FastAPI):
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
-
-        # Ensure messages table has conversation_id if it already existed without it
-        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT")
-        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_name TEXT")
-        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS receiver_name TEXT")
 
         # users columns (ensure existence)
         for col, dtype in [
