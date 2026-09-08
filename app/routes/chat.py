@@ -158,7 +158,7 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
                 ORDER BY created_at DESC LIMIT 1) AS last_sender,
                (SELECT COUNT(*) FROM messages
                 WHERE conversation_id = m.conversation_id
-                AND receiver_id = :uid AND read = 0) AS unread_count
+                AND receiver_id = :uid AND read = false) AS unread_count
         FROM messages m
         WHERE m.conversation_id LIKE '%%' || :uid || '%%'
         GROUP BY m.conversation_id
@@ -223,9 +223,9 @@ async def get_messages_by_user(
 
     rows = await database.fetch_all(query, params)
 
-    # Mark as read
+    # Mark as read (boolean true/false)
     await database.execute(
-        "UPDATE messages SET read = 1 WHERE conversation_id = :cid AND receiver_id = :uid AND read = 0",
+        "UPDATE messages SET read = true WHERE conversation_id = :cid AND receiver_id = :uid AND read = false",
         {"cid": conversation_id, "uid": user_id}
     )
 
@@ -268,19 +268,18 @@ async def get_messages(
             raise HTTPException(status_code=403, detail="Invalid conversation ID")
 
     # 2. Fetch messages
+    params: dict = {"cid": conversation_id, "lim": limit}
     query = "SELECT * FROM messages WHERE conversation_id = :cid"
-    params = {"cid": conversation_id}
     if before_id:
         query += " AND id < :bid"
         params["bid"] = before_id
     query += " ORDER BY created_at DESC LIMIT :lim"
-    params["lim"] = limit
 
     rows = await database.fetch_all(query, params)
 
-    # Mark unread as read
+    # Mark unread as read (boolean true/false)
     await database.execute(
-        "UPDATE messages SET read = 1 WHERE conversation_id = :cid AND receiver_id = :uid AND read = 0",
+        "UPDATE messages SET read = true WHERE conversation_id = :cid AND receiver_id = :uid AND read = false",
         {"cid": conversation_id, "uid": user_id}
     )
 
