@@ -97,6 +97,7 @@ async def lifespan(app: FastAPI):
 
     # 2. Run schema migrations using raw SQL with exec_driver_sql
     with sync_engine.connect() as conn:
+        # Create otp_codes table if missing
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS otp_codes (
                 id SERIAL PRIMARY KEY,
@@ -108,6 +109,28 @@ async def lifespan(app: FastAPI):
             )
         """)
 
+        # Create stores table if missing
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS stores (
+                store_id TEXT PRIMARY KEY,
+                owner_id TEXT,
+                name TEXT,
+                description TEXT,
+                category TEXT,
+                address TEXT,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                phone TEXT,
+                store_image_url TEXT,
+                business_hours TEXT,
+                contact_preference TEXT,
+                verified BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """)
+
+        # Add missing users columns
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE")
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname TEXT")
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS real_name TEXT")
@@ -130,6 +153,7 @@ async def lifespan(app: FastAPI):
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_image_url TEXT")
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_name TEXT")
 
+        # Add escrow expires_at if missing
         conn.exec_driver_sql("ALTER TABLE escrow ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
 
     print("✅ Schema migrations complete.")
@@ -235,7 +259,7 @@ app.add_middleware(
 )
 
 # ── Static file serving (uploads) ──────────────────────────────────────
-BASE_DIR = os.getcwd()
+BASE_DIR = os.getcwd()  # Use current working directory on Render
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
