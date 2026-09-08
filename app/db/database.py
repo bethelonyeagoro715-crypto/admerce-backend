@@ -24,14 +24,18 @@ else:
     ASYNC_DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     SYNC_DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-# Create async engine with statement cache disabled
+# Ensure statement cache is disabled for asyncpg in both engine and Database
+if "?" in ASYNC_DATABASE_URL:
+    ASYNC_DATABASE_URL += "&statement_cache_size=0"
+else:
+    ASYNC_DATABASE_URL += "?statement_cache_size=0"
+
 engine = create_async_engine(
     ASYNC_DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    connect_args={"statement_cache_size": 0},   # ✅ SQLAlchemy engine cache off
+    connect_args={"statement_cache_size": 0},   # explicit for engine
 )
-
 sync_engine = create_engine(SYNC_DATABASE_URL, echo=False, pool_pre_ping=True)
 
 AsyncSessionLocal = sessionmaker(
@@ -42,13 +46,6 @@ AsyncSessionLocal = sessionmaker(
     expire_on_commit=False,
 )
 
-# Create Database instance with the same cache-disabled URL
-# The `databases` package uses asyncpg directly and respects query parameters in the URL.
-# We append `?statement_cache_size=0` to the asyncpg connection string.
-if "?" in ASYNC_DATABASE_URL:
-    DATABASE_URL_FOR_POOL = ASYNC_DATABASE_URL + "&statement_cache_size=0"
-else:
-    DATABASE_URL_FOR_POOL = ASYNC_DATABASE_URL + "?statement_cache_size=0"
-
-database = Database(DATABASE_URL_FOR_POOL, min_size=5, max_size=20)
+# Use the same URL for the Database object (with statement_cache_size=0)
+database = Database(ASYNC_DATABASE_URL, min_size=5, max_size=20)
 Base = declarative_base()
