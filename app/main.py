@@ -69,7 +69,7 @@ else:
 async def _refund_expired_escrows() -> None:
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.utcnow()   # ✅ datetime object
             expired = await database.fetch_all(
                 "SELECT * FROM escrow WHERE status = 'locked' AND expires_at < :now",
                 {"now": now},
@@ -92,12 +92,13 @@ async def _refund_expired_escrows() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 1. Create tables from models
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
 
+    # 2. Run schema migrations (raw SQL)
     with sync_engine.connect() as conn:
-        # ... (migration code same as before, but omitted for brevity) ...
-        # Ensure all tables: otp_codes, stores, listings, favorites, messages, listing_events, app_settings
+        # otp_codes
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS otp_codes (
                 id SERIAL PRIMARY KEY,
@@ -108,6 +109,8 @@ async def lifespan(app: FastAPI):
                 used INTEGER DEFAULT 0
             )
         """)
+
+        # stores
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS stores (
                 store_id TEXT PRIMARY KEY,
@@ -127,6 +130,8 @@ async def lifespan(app: FastAPI):
                 updated_at TIMESTAMP
             )
         """)
+
+        # listings
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS listings (
                 listing_id TEXT PRIMARY KEY,
@@ -145,6 +150,8 @@ async def lifespan(app: FastAPI):
                 quantity_available INTEGER
             )
         """)
+
+        # favorites
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS favorites (
                 user_id TEXT,
@@ -153,16 +160,23 @@ async def lifespan(app: FastAPI):
                 PRIMARY KEY (user_id, store_id)
             )
         """)
+
+        # messages (updated with conversation_id and name fields)
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
+                conversation_id TEXT,
                 sender_id TEXT,
                 receiver_id TEXT,
+                sender_name TEXT,
+                receiver_name TEXT,
                 text TEXT,
                 image_url TEXT,
                 created_at TIMESTAMP
             )
         """)
+
+        # listing_events (for stats)
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS listing_events (
                 id SERIAL PRIMARY KEY,
@@ -171,6 +185,8 @@ async def lifespan(app: FastAPI):
                 created_at TIMESTAMP
             )
         """)
+
+        # app_settings
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
@@ -179,7 +195,13 @@ async def lifespan(app: FastAPI):
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        # Add users columns
+
+        # Ensure messages table has conversation_id if it already existed without it
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT")
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_name TEXT")
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS receiver_name TEXT")
+
+        # users columns (ensure existence)
         for col, dtype in [
             ("verified", "BOOLEAN DEFAULT FALSE"),
             ("nickname", "TEXT"),
@@ -204,16 +226,89 @@ async def lifespan(app: FastAPI):
             ("business_name", "TEXT"),
         ]:
             conn.exec_driver_sql(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}")
+
+        # escrow expires_at
         conn.exec_driver_sql("ALTER TABLE escrow ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
 
     print("✅ Schema migrations complete.")
 
+    # 3. Connect async database pool
     await database.connect()
     print("✅ Async database pool connected.")
 
-    # Other table creations (async) remain unchanged
-    # ...
+    # 4. Create other necessary tables (async)
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS provider_availability (
+            user_id      TEXT    PRIMARY KEY,
+            is_available BOOLEAN DEFAULT TRUE,
+            updated_at   TEXT
+        )
+    """)
+    print("✅ provider_availability table ready.")
 
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            user_id        TEXT PRIMARY KEY,
+            balance        NUMERIC DEFAULT 0,
+            withdrawal_pin TEXT,
+            created_at     TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    print("✅ wallets table ready.")
+
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_transactions (
+            id         SERIAL PRIMARY KEY,
+            user_id    TEXT NOT NULL,
+            amount     NUMERIC NOT NULL,
+            type       TEXT NOT NULL,
+            reference  TEXT NOT NULL,
+            status     TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    print("✅ wallet_transactions table ready.")
+
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS user_devices (
+            id         SERIAL PRIMARY KEY,
+            user_id    TEXT,
+            fcm_token  TEXT NOT NULL,
+            is_active  BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    print("✅ user_devices table ready.")
+
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS user_notifications (
+            id         SERIAL PRIMARY KEY,
+            user_id    TEXT NOT NULL,
+            title      TEXT,
+            body       TEXT,
+            data       TEXT,
+            is_read    BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    print("✅ user_notifications table ready.")
+
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS cards (
+            id              SERIAL PRIMARY KEY,
+            user_id         TEXT NOT NULL,
+            card_token      TEXT NOT NULL,
+            last4           TEXT NOT NULL,
+            expiry_month    TEXT NOT NULL,
+            expiry_year     TEXT NOT NULL,
+            brand           TEXT NOT NULL,
+            cardholder_name TEXT,
+            created_at      TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    print("✅ cards table ready.")
+
+    # 5. Start background task
     task = asyncio.create_task(_refund_expired_escrows())
     print("✅ Server is ready.")
     yield
@@ -226,6 +321,7 @@ async def lifespan(app: FastAPI):
     print("🛑 Server shut down cleanly.")
 
 
+# ── FastAPI app ──────────────────────────────────────────────────────────
 app = FastAPI(title="SEAI - Admerce Backend (Multi-Role)", lifespan=lifespan)
 
 app.add_middleware(
@@ -236,7 +332,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = os.getcwd()
+# ── Static file serving (uploads) ──────────────────────────────────────
+BASE_DIR = os.getcwd()  # Use current working directory on Render
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -250,7 +347,7 @@ async def serve_service_media(filename: str):
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-# Include routers
+# ── Include all routers ──────────────────────────────────────────────────
 app.include_router(payment_router)
 app.include_router(shopper_router)   # ✅ always included
 app.include_router(storekeeper_router)
