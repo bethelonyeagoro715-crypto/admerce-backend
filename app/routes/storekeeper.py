@@ -61,7 +61,8 @@ async def create_store(
             raise HTTPException(status_code=400, detail="You already have a store")
 
         store_id = uuid.uuid4().hex[:12]
-        now = datetime.utcnow().isoformat()
+        # ✅ Use datetime object, not string
+        now = datetime.utcnow()
 
         category_json = json.dumps(store_data.category)
         hours_json = json.dumps(store_data.business_hours) if store_data.business_hours else "{}"
@@ -90,7 +91,7 @@ async def create_store(
             "img": store_data.store_image_url,
             "hours": hours_json,
             "pref": store_data.contact_preference,
-            "now": now
+            "now": now,   # ✅ pass datetime object
         })
 
         return {
@@ -170,7 +171,8 @@ async def create_listing(
     listing_id = uuid.uuid4().hex[:8]
     final_title = suggested_title if suggested_title else title
     title_quality = compute_title_quality(final_title)
-    created_at = datetime.utcnow().isoformat()
+    # ✅ Use datetime object, not string
+    created_at = datetime.utcnow()
 
     # Compute embedding (optional)
     embedding = None
@@ -350,7 +352,6 @@ async def get_store_orders(store_id: str):
     owner_id = store["owner_id"]
 
     # Join escrow with users to get shopper's nickname (customer name).
-    # If your users table uses a different column (e.g., name, full_name), replace u.nickname.
     query = """
         SELECT e.*, 
                COALESCE(u.nickname, 'Customer') AS customer_name
@@ -396,7 +397,7 @@ async def follow_store(store_id: str, current_user: dict = Depends(get_current_u
     await database.execute(
         "INSERT INTO favorites (user_id, store_id, created_at) VALUES (:uid, :sid, :now) "
         "ON CONFLICT DO NOTHING",
-        {"uid": current_user["id"], "sid": store_id, "now": datetime.utcnow().isoformat()}
+        {"uid": current_user["id"], "sid": store_id, "now": datetime.utcnow()}
     )
     return {"message": "Store followed"}
 
@@ -467,10 +468,8 @@ async def get_store_stats(current_user: dict = Depends(get_current_user)):
     store_id = store["store_id"]
     owner_id = current_user["id"]
 
-    # Completed statuses: orders that have been picked up or dispatched
     completed_statuses = ('picked_up', 'dispatched', 'completed')
 
-    # Views (from listing_events if table exists)
     views = 0
     try:
         views = await database.fetch_val(
@@ -484,7 +483,6 @@ async def get_store_stats(current_user: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"Could not fetch views: {e}")
 
-    # Inquiries – count messages received by the storekeeper
     inquiries = 0
     try:
         inquiries = await database.fetch_val(
@@ -494,7 +492,6 @@ async def get_store_stats(current_user: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"Could not fetch inquiries: {e}")
 
-    # Sold items – count completed escrow orders
     sold = 0
     try:
         sold = await database.fetch_val(
@@ -504,7 +501,6 @@ async def get_store_stats(current_user: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"Could not fetch sold: {e}")
 
-    # Revenue – sum of total_amount for completed orders
     revenue = 0
     try:
         revenue = await database.fetch_val(
