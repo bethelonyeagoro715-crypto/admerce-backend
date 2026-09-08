@@ -95,9 +95,9 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
 
-    # 2. Run schema migrations using raw SQL with exec_driver_sql
+    # 2. Run schema migrations (raw SQL)
     with sync_engine.connect() as conn:
-        # Create otp_codes table if missing
+        # otp_codes
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS otp_codes (
                 id SERIAL PRIMARY KEY,
@@ -109,7 +109,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # Create stores table if missing
+        # stores
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS stores (
                 store_id TEXT PRIMARY KEY,
@@ -130,30 +130,84 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # Add missing users columns
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS real_name TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS middle_name TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS lga TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS state_of_origin TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS nationality TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS residence_address TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS national_id_number TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_verified BOOLEAN DEFAULT FALSE")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS id_document_url TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS selfie_url TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS liveness_verified BOOLEAN DEFAULT FALSE")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN DEFAULT FALSE")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_image_url TEXT")
-        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS business_name TEXT")
+        # listings
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS listings (
+                listing_id TEXT PRIMARY KEY,
+                store_id TEXT,
+                title TEXT,
+                price DOUBLE PRECISION,
+                lat DOUBLE PRECISION,
+                lng DOUBLE PRECISION,
+                category TEXT,
+                created_at TIMESTAMP,
+                title_quality DOUBLE PRECISION,
+                image_url TEXT,
+                embedding TEXT,
+                quantity_total INTEGER,
+                quantity_available INTEGER
+            )
+        """)
 
-        # Add escrow expires_at if missing
+        # favorites
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id TEXT,
+                store_id TEXT,
+                created_at TIMESTAMP,
+                PRIMARY KEY (user_id, store_id)
+            )
+        """)
+
+        # messages
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                sender_id TEXT,
+                receiver_id TEXT,
+                text TEXT,
+                image_url TEXT,
+                created_at TIMESTAMP
+            )
+        """)
+
+        # listing_events (for stats)
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS listing_events (
+                id SERIAL PRIMARY KEY,
+                listing_id TEXT,
+                event_type TEXT,
+                created_at TIMESTAMP
+            )
+        """)
+
+        # users columns (ensure existence)
+        for col, dtype in [
+            ("verified", "BOOLEAN DEFAULT FALSE"),
+            ("nickname", "TEXT"),
+            ("real_name", "TEXT"),
+            ("first_name", "TEXT"),
+            ("last_name", "TEXT"),
+            ("middle_name", "TEXT"),
+            ("date_of_birth", "DATE"),
+            ("lga", "TEXT"),
+            ("state_of_origin", "TEXT"),
+            ("nationality", "TEXT"),
+            ("residence_address", "TEXT"),
+            ("national_id_number", "TEXT"),
+            ("kyc_verified", "BOOLEAN DEFAULT FALSE"),
+            ("id_document_url", "TEXT"),
+            ("selfie_url", "TEXT"),
+            ("liveness_verified", "BOOLEAN DEFAULT FALSE"),
+            ("avatar_url", "TEXT"),
+            ("role", "TEXT"),
+            ("suspended", "BOOLEAN DEFAULT FALSE"),
+            ("business_image_url", "TEXT"),
+            ("business_name", "TEXT"),
+        ]:
+            conn.exec_driver_sql(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}")
+
+        # escrow expires_at
         conn.exec_driver_sql("ALTER TABLE escrow ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
 
     print("✅ Schema migrations complete.")
@@ -162,7 +216,7 @@ async def lifespan(app: FastAPI):
     await database.connect()
     print("✅ Async database pool connected.")
 
-    # 4. Create other necessary tables (using async database)
+    # 4. Create other necessary tables (async)
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
             user_id      TEXT    PRIMARY KEY,
@@ -198,7 +252,7 @@ async def lifespan(app: FastAPI):
     await database.execute("""
         CREATE TABLE IF NOT EXISTS user_devices (
             id         SERIAL PRIMARY KEY,
-            user_id    TEXT NOT NULL,
+            user_id    TEXT,
             fcm_token  TEXT NOT NULL,
             is_active  BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMP DEFAULT NOW()
