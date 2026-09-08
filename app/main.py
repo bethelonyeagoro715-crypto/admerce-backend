@@ -140,6 +140,7 @@ async def lifespan(app: FastAPI):
                 lat DOUBLE PRECISION,
                 lng DOUBLE PRECISION,
                 category TEXT,
+                sort_order INTEGER,
                 created_at TIMESTAMP,
                 title_quality DOUBLE PRECISION,
                 image_url TEXT,
