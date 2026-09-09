@@ -7,6 +7,7 @@ import uuid
 import asyncio
 from app.db.database import database
 from app.utils.security import get_current_user
+from app.services.cloudinary_service import upload_image   # ✅ Cloudinary helper
 
 router = APIRouter(prefix="/profile", tags=["Profile"])
 
@@ -82,10 +83,9 @@ async def update_settings(
         )
     return {"message": "Settings saved"}
 
-# ---------- UPLOAD AVATAR ----------
+# ---------- UPLOAD AVATAR (Cloudinary) ----------
 @router.post("/upload-avatar")
 async def upload_avatar(
-    request: Request,
     avatar: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
@@ -94,14 +94,9 @@ async def upload_avatar(
         raise HTTPException(status_code=400, detail="Invalid file type")
 
     image_bytes = await avatar.read()
-    os.makedirs("uploads/avatars", exist_ok=True)
-    filename = f"avatar_{current_user['id']}_{uuid.uuid4().hex[:8]}.jpg"
-    filepath = os.path.join("uploads/avatars", filename)
-    with open(filepath, "wb") as f:
-        f.write(image_bytes)
+    avatar_url = upload_image(image_bytes, folder="avatars")   # ✅ Cloudinary
 
-    avatar_url = f"{request.base_url}uploads/avatars/{filename}"
-
+    # Update user's avatar_url with retry
     for attempt in range(3):
         try:
             await database.execute(
@@ -114,12 +109,12 @@ async def upload_avatar(
                 await asyncio.sleep(0.5)
             else:
                 raise
+
     return {"avatar_url": avatar_url}
 
-# ---------- UPLOAD BUSINESS IMAGE ----------
+# ---------- UPLOAD BUSINESS IMAGE (Cloudinary) ----------
 @router.post("/upload-business-image")
 async def upload_business_image(
-    request: Request,
     image: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
@@ -127,15 +122,10 @@ async def upload_business_image(
     if image.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="Invalid file type")
 
-    os.makedirs("uploads/business_images", exist_ok=True)
-    filename = f"biz_{current_user['id']}_{uuid.uuid4().hex[:8]}.jpg"
-    filepath = os.path.join("uploads/business_images", filename)
-    content = await image.read()
-    with open(filepath, "wb") as f:
-        f.write(content)
+    image_bytes = await image.read()
+    business_image_url = upload_image(image_bytes, folder="business_images")   # ✅ Cloudinary
 
-    business_image_url = f"{request.base_url}uploads/business_images/{filename}"
-
+    # Update user's business_image_url with retry
     for attempt in range(3):
         try:
             await database.execute(
@@ -148,6 +138,7 @@ async def upload_business_image(
                 await asyncio.sleep(0.5)
             else:
                 raise
+
     return {"business_image_url": business_image_url}
 
 # ---------- UPDATE PROVIDER PROFILE (display name & business name) ----------
