@@ -475,3 +475,41 @@ async def get_store_stats(current_user: dict = Depends(get_current_user)):
         "sold": sold,
         "revenue": revenue,
     }
+# ==================== DELETE LISTING ====================
+@router.delete("/listing/{listing_id}")
+async def delete_listing(
+    listing_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    # 1. Confirm the listing exists
+    listing = await database.fetch_one(
+        "SELECT listing_id, store_id, image_url FROM listings WHERE listing_id = :lid",
+        {"lid": listing_id}
+    )
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    # 2. Confirm it belongs to this storekeeper's store
+    store = await database.fetch_one(
+        "SELECT store_id FROM stores WHERE store_id = :sid AND owner_id = :uid",
+        {"sid": listing["store_id"], "uid": current_user["id"]}
+    )
+    if not store:
+        raise HTTPException(status_code=403, detail="You can only delete your own listings")
+
+    # 3. Delete dependent rows (ignore failures for optional tables)
+    try:
+        await database.execute(
+            "DELETE FROM listing_events WHERE listing_id = :lid",
+            {"lid": listing_id}
+        )
+    except Exception as e:
+        print(f"⚠️  listing_events cleanup skipped: {e}")
+
+    # 4. Delete the listing itself
+    await database.execute(
+        "DELETE FROM listings WHERE listing_id = :lid",
+        {"lid": listing_id}
+    )
+
+    return {"success": True, "deleted": listing_id}
