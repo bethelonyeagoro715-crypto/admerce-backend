@@ -12,9 +12,24 @@ from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
 load_dotenv()
 
+# ── Cloudinary diagnostic – runs once at import time ─────────────────────
+print(
+    "🔑 Cloudinary env:",
+    {
+        "cloud_name":      bool(os.getenv("CLOUDINARY_CLOUD_NAME")),
+        "api_key":         bool(os.getenv("CLOUDINARY_API_KEY")),
+        "api_secret":      bool(os.getenv("CLOUDINARY_API_SECRET")),
+        "CLOUDINARY_URL":  bool(os.getenv("CLOUDINARY_URL")),
+    },
+    flush=True,
+)
+
+# Import the Cloudinary service so its import-time config log fires too
+import app.services.cloudinary_service  # noqa: F401
+
 from app.db.database import engine, sync_engine, Base, database
 
-# ── Models – IMPORT ALL OF THEM so Base.metadata knows about them ────
+# ── Models – IMPORT ALL OF THEM so Base.metadata knows about them ────────
 from app.db.service_models import ServiceModel
 from app.db.flipper_models import FlipperListingModel
 from app.db.models import EventModel
@@ -23,7 +38,7 @@ from app.db.wallet_models import WalletModel, EscrowModel
 from app.db.courier_models import CourierModel
 from app.db.user_models import UserModel
 
-# ── Routers (lightweight ones always imported) ─────────────────────────
+# ── Routers (lightweight ones always imported) ───────────────────────────
 from app.routes.payment import router as payment_router
 from app.routes.storekeeper import router as storekeeper_router
 from app.routes.courier import router as courier_router
@@ -46,7 +61,7 @@ from app.routes.notifications import router as notifications_router
 # ✅ Always include shopper_router (it doesn't use heavy models)
 from app.routes.shopper import router as shopper_router
 
-# Conditionally import heavy AI routers
+# ── Conditionally import heavy AI routers ────────────────────────────────
 SKIP_MODELS = os.getenv("SKIP_MODELS") == "1"
 
 if not SKIP_MODELS:
@@ -65,7 +80,8 @@ else:
     businesses_router = None
     print("⚠️ SKIP_MODELS=1 – Heavy AI models disabled")
 
-# ── Background task: auto‑refund expired escrow ──────────────────────────
+
+# ── Background task: auto-refund expired escrow ──────────────────────────
 async def _refund_expired_escrows() -> None:
     while True:
         try:
@@ -92,11 +108,11 @@ async def _refund_expired_escrows() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Create tables from models
+    # ── 1. Create tables from models ─────────────────────────────────────
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
 
-    # 2. Run schema migrations (raw SQL)
+    # ── 2. Run schema migrations (raw SQL) ───────────────────────────────
     with sync_engine.connect() as conn:
         # otp_codes
         conn.exec_driver_sql("""
@@ -176,8 +192,6 @@ async def lifespan(app: FastAPI):
                 created_at TIMESTAMP
             )
         """)
-
-        # Ensure messages table has all required columns if it already existed
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_name TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS receiver_name TEXT")
@@ -227,18 +241,56 @@ async def lifespan(app: FastAPI):
             ("business_image_url", "TEXT"),
             ("business_name", "TEXT"),
         ]:
-            conn.exec_driver_sql(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}")
+            conn.exec_driver_sql(
+                f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}"
+            )
 
         # escrow expires_at
-        conn.exec_driver_sql("ALTER TABLE escrow ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
+        conn.exec_driver_sql(
+            "ALTER TABLE escrow ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP"
+        )
+
+        # ✅ Fix for "/services/ 500 – column s.is_active does not exist"
+        conn.exec_driver_sql(
+            "ALTER TABLE services ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"
+        )
+
+        # ✅ Missing tables referenced by profile.py and chat.py
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS role_onboardings (
+                user_id TEXT NOT NULL,
+                role    TEXT NOT NULL,
+                PRIMARY KEY (user_id, role)
+            )
+        """)
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id TEXT NOT NULL,
+                role    TEXT NOT NULL,
+                key     TEXT NOT NULL,
+                value   TEXT,
+                PRIMARY KEY (user_id, role, key)
+            )
+        """)
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS call_signals (
+                id              SERIAL PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                sender_id       TEXT NOT NULL,
+                receiver_id     TEXT NOT NULL,
+                type            TEXT NOT NULL,
+                data            TEXT,
+                created_at      TIMESTAMP DEFAULT NOW()
+            )
+        """)
 
     print("✅ Schema migrations complete.")
 
-    # 3. Connect async database pool
+    # ── 3. Connect async database pool ───────────────────────────────────
     await database.connect()
     print("✅ Async database pool connected.")
 
-    # 4. Create other necessary tables (async)
+    # ── 4. Create other necessary tables (async) ─────────────────────────
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
             user_id      TEXT    PRIMARY KEY,
@@ -310,7 +362,7 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ cards table ready.")
 
-    # 5. Start background task
+    # ── 5. Start background task ─────────────────────────────────────────
     task = asyncio.create_task(_refund_expired_escrows())
     print("✅ Server is ready.")
     yield
@@ -334,10 +386,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Static file serving (uploads) ──────────────────────────────────────
-BASE_DIR = os.getcwd()  # Use current working directory on Render
+# ── Static file serving (legacy uploads) ─────────────────────────────────
+BASE_DIR = os.getcwd()
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 
 @app.get("/uploads/services/{filename}")
 async def serve_service_media(filename: str):
@@ -347,11 +400,12 @@ async def serve_service_media(filename: str):
     media_type = "video/mp4" if filename.lower().endswith(".mp4") else "image/jpeg"
     return FileResponse(filepath, media_type=media_type)
 
+
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # ── Include all routers ──────────────────────────────────────────────────
 app.include_router(payment_router)
-app.include_router(shopper_router)   # ✅ always included
+app.include_router(shopper_router)
 app.include_router(storekeeper_router)
 app.include_router(courier_router)
 app.include_router(wallet_router)
@@ -382,10 +436,12 @@ app.include_router(basket_router)
 app.include_router(settings.router)
 app.include_router(notifications_router)
 
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     print("❌ 422 validation errors:", exc.errors())
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 
 @app.get("/")
 async def root():
