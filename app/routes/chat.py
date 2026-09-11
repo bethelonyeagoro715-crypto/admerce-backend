@@ -73,7 +73,7 @@ async def send_message(
         raise HTTPException(status_code=400, detail="Cannot message yourself")
 
     conversation_id = await _get_conversation_id(sender_id, receiver_id)
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow()   # ✅ datetime object, not str
 
     await database.execute(
         """
@@ -121,7 +121,7 @@ async def send_voice(
         print(f"Transcription failed: {e}")
 
     conversation_id = await _get_conversation_id(sender_id, receiver_id)
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow()   # ✅ datetime object, not str
 
     await database.execute(
         """
@@ -316,7 +316,7 @@ async def poll_signals(conversation_id: str, current_user: dict = Depends(get_cu
     return [{"type": row["type"], "data": json.loads(row["data"]), "sender_id": row["sender_id"]} for row in rows]
 
 async def _store_signal(conv_id: str, sender: str, receiver: str, signal_type: str, data: str):
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow()   # ✅ datetime object, not str
     await database.execute(
         "INSERT INTO call_signals (conversation_id, sender_id, receiver_id, type, data, created_at) "
         "VALUES (:cid, :sid, :rid, :type, :data, :now)",
@@ -336,7 +336,7 @@ async def save_seai_exchange(
         raise HTTPException(status_code=400, detail="Missing text")
 
     conversation_id = f"{user_id}_seai"
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow()   # ✅ datetime object, not str
 
     # User message
     await database.execute(
