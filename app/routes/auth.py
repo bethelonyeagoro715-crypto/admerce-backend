@@ -38,6 +38,23 @@ def create_access_token(data: dict):
 def generate_otp() -> str:
     return str(random.randint(100000, 999999))
 
+def _is_otp_expired(expires_at_value) -> bool:
+    """
+    Robustly determine if an OTP has expired.
+    Handles both str (ISO 8601) and datetime values from the DB.
+    Falls back to "expired" if the value can't be parsed.
+    """
+    if expires_at_value is None:
+        return True
+    if isinstance(expires_at_value, datetime):
+        exp = expires_at_value
+    else:
+        try:
+            exp = datetime.fromisoformat(str(expires_at_value))
+        except (ValueError, TypeError):
+            return True
+    return datetime.utcnow() > exp
+
 async def invalidate_old_otps(phone: str, purpose: str = "reset_password"):
     await database.execute(
         "UPDATE otp_codes SET used = 1 WHERE phone = :ph AND purpose = :pur AND used = 0",
@@ -159,25 +176,56 @@ async def signup(req: SignupRequest):
 
 @router.post("/verify")
 async def verify_account(req: VerifyAccountRequest):
+    # Find any unused OTP for this phone, whether from signup or password reset.
     otp_record = await database.fetch_one(
-        "SELECT * FROM otp_codes WHERE phone = :ph AND purpose = 'signup_verify' AND used = 0 "
+        "SELECT * FROM otp_codes "
+        "WHERE phone = :ph AND used = 0 "
+        "AND purpose IN ('signup_verify', 'reset_password') "
         "ORDER BY id DESC LIMIT 1",
         {"ph": req.phone}
     )
     if not otp_record:
         raise HTTPException(status_code=400, detail="No verification code requested")
-    if otp_record["expires_at"] < datetime.utcnow().isoformat():
+    if _is_otp_expired(otp_record["expires_at"]):
         raise HTTPException(status_code=400, detail="Verification code expired")
     if otp_record["code"] != req.otp:
         raise HTTPException(status_code=400, detail="Invalid verification code")
 
-    await database.execute("UPDATE otp_codes SET used = 1 WHERE id = :id", {"id": otp_record["id"]})
-    # ✅ Use True instead of 1 for boolean column
-    await database.execute("UPDATE users SET verified = True WHERE phone = :ph", {"ph": req.phone})
+    purpose = otp_record["purpose"]
 
-    user = await database.fetch_one("SELECT * FROM users WHERE phone = :ph", {"ph": req.phone})
-    token = create_access_token({"sub": user["id"], "phone": user["phone"]})
-    return {"access_token": token, "token_type": "bearer", "user_id": user["id"]}
+    # ── Signup verification ────────────────────────────────────────────
+    if purpose == "signup_verify":
+        await database.execute(
+            "UPDATE otp_codes SET used = 1 WHERE id = :id",
+            {"id": otp_record["id"]}
+        )
+        # ✅ Use True instead of 1 for boolean column
+        await database.execute(
+            "UPDATE users SET verified = True WHERE phone = :ph",
+            {"ph": req.phone}
+        )
+        user = await database.fetch_one(
+            "SELECT * FROM users WHERE phone = :ph",
+            {"ph": req.phone}
+        )
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        token = create_access_token({"sub": user["id"], "phone": user["phone"]})
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "user_id": user["id"],
+            "purpose": "signup_verify",
+        }
+
+    # ── Reset-password verification ────────────────────────────────────
+    # Leave the OTP unused so /auth/reset-password can consume it in the
+    # next step. Do NOT issue a JWT — the user hasn't set a new password yet.
+    return {
+        "verified": True,
+        "purpose": "reset_password",
+        "message": "OTP verified. Continue to set a new password.",
+    }
 
 @router.post("/resend-verification")
 async def resend_verification(req: ResendVerificationRequest):
@@ -267,7 +315,7 @@ async def reset_password(req: ResetPasswordRequest):
     )
     if not otp_record:
         raise HTTPException(status_code=400, detail="No OTP requested")
-    if otp_record["expires_at"] < datetime.utcnow().isoformat():
+    if _is_otp_expired(otp_record["expires_at"]):
         raise HTTPException(status_code=400, detail="OTP expired")
     if otp_record["code"] != req.otp:
         raise HTTPException(status_code=400, detail="Invalid OTP")
