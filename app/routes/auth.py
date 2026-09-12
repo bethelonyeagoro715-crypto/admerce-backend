@@ -130,6 +130,10 @@ class VerifyAccountRequest(BaseModel):
 class ResendVerificationRequest(BaseModel):
     phone: str
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
 # ---------- Routes ----------
 @router.post("/signup")
 async def signup(req: SignupRequest):
@@ -332,6 +336,49 @@ async def reset_password_direct(req: DirectResetRequest):
         raise HTTPException(status_code=404, detail="User not found")
     new_hashed = hash_password(req.new_password)
     await database.execute("UPDATE users SET hashed_password = :pw WHERE phone = :ph", {"pw": new_hashed, "ph": req.phone})
+    return {"message": "Password updated successfully"}
+
+@router.post("/change-password")
+async def change_password(
+    req: ChangePasswordRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user["id"]
+
+    # ── Validate the new password ────────────────────────────────────
+    if len(req.new_password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be at least 6 characters",
+        )
+    if req.current_password == req.new_password:
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be different from current password",
+        )
+
+    # ── Fetch the current hash (get_current_user omits it) ───────────
+    user = await database.fetch_one(
+        "SELECT id, hashed_password FROM users WHERE id = :uid",
+        {"uid": user_id},
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # ── Verify the current password ──────────────────────────────────
+    if not verify_password(req.current_password, user["hashed_password"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Current password is incorrect",
+        )
+
+    # ── Persist the new hash ─────────────────────────────────────────
+    new_hashed = hash_password(req.new_password)
+    await database.execute(
+        "UPDATE users SET hashed_password = :pw WHERE id = :uid",
+        {"pw": new_hashed, "uid": user_id},
+    )
+
     return {"message": "Password updated successfully"}
 
 @router.get("/me")
