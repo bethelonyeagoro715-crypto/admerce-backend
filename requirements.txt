@@ -11,7 +11,6 @@ passlib[bcrypt]
 python-jose[cryptography]
 firebase-admin
 groq
-anthropic
 sib-api-v3-sdk
 python-multipart
 numpy
