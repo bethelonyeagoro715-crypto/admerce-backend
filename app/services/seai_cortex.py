@@ -5,7 +5,7 @@ from app.db.database import database
 from app.routes.wallet import reserve as wallet_reserve
 from app.services.seai_agent import handle_search_items
 
-# ── Reserve an item ─────────────────────────────────────────────
+# ── Reserve an item (auto‑search if no listing_id) ─────────────
 async def handle_reserve_item(user_id: str, params: dict, lat: float = None, lng: float = None) -> dict:
     listing_id = params.get("listing_id")
     storekeeper_id = params.get("storekeeper_id")
@@ -65,13 +65,12 @@ async def handle_reserve_item(user_id: str, params: dict, lat: float = None, lng
     except Exception as e:
         return {"type": "error", "message": f"Reservation failed: {str(e)}"}
 
-# ── Book a service ──────────────────────────────────────────────
+# ── Book a service (auto‑search if needed) ──────────────────────
 async def handle_book_service(user_id: str, params: dict, lat: float = None, lng: float = None) -> dict:
     service_name = params.get("service_name") or params.get("service")
     if not service_name:
         return {"type": "error", "message": "Which service would you like to book?"}
 
-    # Search for matching service
     search_result = await handle_search_items(
         {"query": service_name},
         lat=lat or 6.5,
@@ -110,6 +109,7 @@ async def handle_create_listing(user_id: str, params: dict) -> dict:
         store_id = store["store_id"]
 
     try:
+        # Direct import to avoid circular dependency at module level
         from app.routes.storekeeper import create_listing as storekeeper_create_listing
         await storekeeper_create_listing(
             store_id=store_id,
@@ -135,20 +135,19 @@ async def handle_create_service(user_id: str, params: dict) -> dict:
         return {"type": "error", "message": "Please provide a price."}
 
     try:
-        # TODO: Implement service creation or import from correct module
-        # from app.routes.services import create_service as services_create
-        # await services_create(
-        #     provider_id=user_id,
-        #     title=title,
-        #     category=category or "general",
-        #     price=float(price),
-        #     duration_minutes=int(duration),
-        # )
+        from app.routes.services import create_service as services_create
+        await services_create(
+            provider_id=user_id,
+            title=title,
+            category=category or "general",
+            price=float(price),
+            duration_minutes=int(duration),
+        )
         return {"type": "text", "text": f"✅ Service '{title}' created for ₦{price}."}
     except Exception as e:
         return {"type": "error", "message": f"Failed: {str(e)}"}
 
-# ── Message a storekeeper ───────────────────────────────────────
+# ── Message a storekeeper (opens chat) ──────────────────────────
 async def handle_message_storekeeper(user_id: str, params: dict) -> dict:
     storekeeper_id = params.get("storekeeper_id") or params.get("user_id")
     if not storekeeper_id:
@@ -159,7 +158,7 @@ async def handle_message_storekeeper(user_id: str, params: dict) -> dict:
         "data": {"user_id": storekeeper_id, "label": "Open Chat"}
     }
 
-# ── Arrange shelf ───────────────────────────────────────────────
+# ── Arrange shelf (opens visual shelf editor) ───────────────────
 async def handle_arrange_shelf(user_id: str, params: dict) -> dict:
     return {
         "type": "action",
