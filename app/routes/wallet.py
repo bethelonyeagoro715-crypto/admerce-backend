@@ -184,7 +184,7 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
         "new_balance": new_balance
     }
 
-# ---------- Instant Pickup (Pay in person) ----------
+# ---------- Instant Pickup ----------
 @router.post("/instant-pickup")
 async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
@@ -513,23 +513,50 @@ async def get_orders(
     rows = await database.fetch_all(query, params)
     return [dict(row) for row in rows]
 
-# ---------- Get Order Detail ----------
+# ---------- Get Order Detail (with proper fallbacks for customer + storekeeper) ----------
 @router.get("/order/{order_id}")
 async def get_order_detail(order_id: str, current_user: dict = Depends(get_current_user)):
     order = await database.fetch_one(
         """
         SELECT e.*,
-               COALESCE(u.nickname, 'Customer') AS customer_name,
-               s.name AS store_name
+
+               -- Customer display name: try every available field, then phone.
+               COALESCE(
+                   NULLIF(u.nickname, ''),
+                   NULLIF(u.real_name, ''),
+                   NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''),
+                   NULLIF(u.phone, ''),
+                   'Customer'
+               ) AS customer_name,
+               u.avatar_url AS customer_avatar,
+
+               -- Storekeeper display name via the storekeeper's user row.
+               COALESCE(
+                   NULLIF(sk.nickname, ''),
+                   NULLIF(sk.real_name, ''),
+                   NULLIF(TRIM(CONCAT_WS(' ', sk.first_name, sk.last_name)), ''),
+                   NULLIF(sk.phone, ''),
+                   'Storekeeper'
+               ) AS storekeeper_name,
+
+               s.name AS store_name,
+               s.store_image_url AS store_image_url
         FROM escrow e
-        LEFT JOIN users u ON e.shopper_id = u.id
-        LEFT JOIN stores s ON e.storekeeper_id = s.owner_id
+        LEFT JOIN users u   ON e.shopper_id      = u.id
+        LEFT JOIN users sk  ON e.storekeeper_id  = sk.id
+        LEFT JOIN stores s  ON e.storekeeper_id  = s.owner_id
         WHERE e.order_id = :oid
         """,
         {"oid": order_id}
     )
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+
+    # Only the shopper or the storekeeper can view the receipt.
+    viewer_id = current_user["id"]
+    if viewer_id not in (order["shopper_id"], order["storekeeper_id"]):
+        raise HTTPException(status_code=403, detail="Not your order")
+
     return dict(order)
 
 # ---------- Get Wallet Transactions ----------
