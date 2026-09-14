@@ -60,7 +60,7 @@ async def seai_ask(
         result = await handle_get_store_info(params)
         return _respond_from_result(result)
 
-    # Fallback: ask the LLM (Groq → Gemini → Anthropic)
+    # Fallback: ask the LLM (Groq → Gemini → NVIDIA)
     llm_result = await call_llm(req.query)
 
     if llm_result["type"] == "action":
@@ -270,3 +270,32 @@ async def _stream_text_and_action(action: dict):
         yield f"data: {json.dumps({'text': word + ' '})}\n\n"
     yield f"data: {json.dumps({'type': 'action', 'data': action['data']})}\n\n"
     yield "data: [DONE]\n\n"
+
+
+# ════════════════════════════════════════════════════════════
+# Backward compatibility — imported by events.py and legacy callers
+# ════════════════════════════════════════════════════════════
+
+async def _process_ask(
+    query: str,
+    lat: float,
+    lng: float,
+    radius_km: float,
+    conversation_history: List[Dict[str, str]],
+    user_id: Optional[str] = None,
+):
+    """
+    Legacy entry point. Some modules (e.g. app/routes/events.py) still
+    import this. Delegates to seai_ask() with a wrapped request object.
+    """
+    req = AskRequest(
+        query=query,
+        lat=lat,
+        lng=lng,
+        radius_km=radius_km,
+        conversation_history=conversation_history,
+    )
+    return await seai_ask(
+        req=req,
+        current_user={"id": user_id} if user_id else None,
+    )
