@@ -194,23 +194,57 @@ async def feed_recall(req: RecallRequest, current_user: Optional[dict] = Depends
 # ==================== RANK ENDPOINT ====================
 @router.post("/feed/rank")
 async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = Depends(get_optional_user)):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not available")
-
     if not req.candidate_ids:
-        return {"feed": [], "total": 0}
+        return {"feed": [], "total": 0, "model_used": model is not None}
 
     now = datetime.utcnow()
-    placeholders = ','.join(f"'{cid}'" for cid in req.candidate_ids)
+    # Safe parameter binding instead of string-interpolated placeholders.
+    id_params = {f"id_{i}": cid for i, cid in enumerate(req.candidate_ids)}
+    placeholders = ",".join(f":{k}" for k in id_params.keys())
     rows = await database.fetch_all(
         f"SELECT l.*, s.name AS store_name FROM listings l "
         f"JOIN stores s ON l.store_id = s.store_id "
-        f"WHERE l.listing_id IN ({placeholders}) AND l.quantity_available > 0"
+        f"WHERE l.listing_id IN ({placeholders}) AND l.quantity_available > 0",
+        id_params,
     )
 
     if not rows:
-        return {"feed": [], "total": 0}
+        return {"feed": [], "total": 0, "model_used": model is not None}
 
+    # ── Fallback path: no ranking model loaded ─────────────────────
+    # Instead of 503, return the real listings in the order they were
+    # received. The shopper flow treats this as a valid ranking — it
+    # just isn't reordered. The response shape matches the model path
+    # so the frontend renders identically.
+    if model is None:
+        rows_by_id = {row["listing_id"]: row for row in rows}
+        fallback_feed = []
+        for cid in req.candidate_ids:
+            row = rows_by_id.get(cid)
+            if row is None:
+                continue
+            dist = haversine(req.lat, req.lng, row["lat"], row["lng"])
+            created = _to_datetime(row["created_at"])
+            mins = max((now - created).total_seconds() / 60.0, 0) if created else 0
+            image_url = row["image_url"] if "image_url" in row else None
+            fallback_feed.append({
+                "listing_id": row["listing_id"],
+                "title": row["title"],
+                "price": row["price"],
+                "distance_km": round(dist, 3),
+                "score": 0.5,
+                "minutes_since_listed": round(mins, 1),
+                "title_quality": row["title_quality"] if row["title_quality"] is not None else 0.5,
+                "image_url": image_url,
+                "store_name": row["store_name"] if "store_name" in row else row["store_id"],
+                "store_id": row["store_id"],
+                "fallback": True,
+            })
+            if len(fallback_feed) >= 20:
+                break
+        return {"feed": fallback_feed, "total": len(fallback_feed), "model_used": False}
+
+    # ── Model path: score every candidate and rank ─────────────────
     scored = []
     for row in rows:
         dist = haversine(req.lat, req.lng, row["lat"], row["lng"])
@@ -238,7 +272,7 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
 
     scored.sort(key=lambda x: x["score"], reverse=True)
 
-    # Re‑ranking policies (Diversity & Burst)
+    # Re-ranking policies (Diversity & Burst)
     final_feed = []
     store_counter = {}
     shown_set = set(req.session_items_shown)
@@ -253,13 +287,19 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
         shown_set.add(lid)
         store_counter[sid] = store_counter.get(sid, 0) + 1
 
-    # Fallback
+    # Fill up to 20 items if diversity filtering cut it short
     if len(final_feed) < min(20, len(scored)):
-        final_feed = [item for item in scored if item["listing_id"] not in shown_set][:20]
+        for item in scored:
+            if item["listing_id"] in shown_set:
+                continue
+            final_feed.append(item)
+            shown_set.add(item["listing_id"])
+            if len(final_feed) >= 20:
+                break
 
-    return {"feed": final_feed, "total": len(final_feed)}
+    return {"feed": final_feed, "total": len(final_feed), "model_used": True}
 
-# ==================== RECALL HELPERS (with TEXT→TIMESTAMP casts) ====================
+# ==================== RECALL HELPERS ====================
 async def _geo_recall(lat: float, lng: float, radius_km: float, limit: int):
     lat_diff = radius_km / 111.0
     lng_diff = radius_km / (111.0 * abs(math.cos(math.radians(lat))) + 1e-8)
@@ -371,7 +411,7 @@ async def get_provider_services(provider_id: str):
     )
     return rows
 
-    # ── Helper for agentic SEAI search ───────────────────────────
+# ── Helper for agentic SEAI search ───────────────────────────
 async def search_shopper_items(query: str, lat: float, lng: float, radius_km: float = 10, limit: int = 10):
     """Return up to `limit` items whose title matches the query (ILIKE) and are within `radius_km`."""
     rows = await database.fetch_all(
