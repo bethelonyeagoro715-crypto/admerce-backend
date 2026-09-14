@@ -24,12 +24,11 @@ print(
     flush=True,
 )
 
-# Import the Cloudinary service so its import-time config log fires too
 import app.services.cloudinary_service  # noqa: F401
 
 from app.db.database import engine, sync_engine, Base, database
 
-# ── Models – IMPORT ALL OF THEM so Base.metadata knows about them ────────
+# ── Models ───────────────────────────────────────────────────────────────
 from app.db.service_models import ServiceModel
 from app.db.flipper_models import FlipperListingModel
 from app.db.models import EventModel
@@ -38,7 +37,7 @@ from app.db.wallet_models import WalletModel, EscrowModel
 from app.db.courier_models import CourierModel
 from app.db.user_models import UserModel
 
-# ── Routers (lightweight ones always imported) ───────────────────────────
+# ── Routers ──────────────────────────────────────────────────────────────
 from app.routes.payment import router as payment_router
 from app.routes.storekeeper import router as storekeeper_router
 from app.routes.courier import router as courier_router
@@ -58,7 +57,6 @@ from app.routes.basket import router as basket_router
 from app.routes import settings
 from app.routes.notifications import router as notifications_router
 
-# ✅ Always include shopper_router (it doesn't use heavy models)
 from app.routes.shopper import router as shopper_router
 
 # ── Conditionally import heavy AI routers ────────────────────────────────
@@ -79,6 +77,7 @@ else:
     transcribe_router = None
     businesses_router = None
     print("⚠️ SKIP_MODELS=1 – Heavy AI models disabled")
+
 
 # ── Background task: auto-refund expired escrow ──────────────────────────
 async def _refund_expired_escrows() -> None:
@@ -207,6 +206,33 @@ async def lifespan(app: FastAPI):
                 created_at TIMESTAMP
             )
         """)
+
+        # events (used by app/events.py)
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS events (
+                id                SERIAL PRIMARY KEY,
+                event_type        TEXT NOT NULL,
+                user_id           TEXT,
+                session_id        TEXT,
+                listing_id        TEXT,
+                store_id          TEXT,
+                search_query      TEXT,
+                user_location     TEXT,
+                listing_location  TEXT,
+                position          INTEGER,
+                timestamp         TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        # Ensure the timestamp column exists and is a real TIMESTAMP on old tables
+        conn.exec_driver_sql(
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS timestamp TIMESTAMP DEFAULT NOW()"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_events_listing ON events(listing_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id)"
+        )
 
         # app_settings
         conn.exec_driver_sql("""
@@ -373,11 +399,39 @@ async def lifespan(app: FastAPI):
             created_at  TIMESTAMP DEFAULT NOW()
         )
     """)
-    # Backfill description for tables created before this migration
     await database.execute(
         "ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS description TEXT"
     )
     print("✅ wallet_transactions table ready.")
+
+    # ── service_bookings ─────────────────────────────────────────────────
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS service_bookings (
+            id             SERIAL PRIMARY KEY,
+            booking_id     TEXT UNIQUE NOT NULL,
+            service_id     TEXT NOT NULL,
+            provider_id    TEXT NOT NULL,
+            customer_id    TEXT NOT NULL,
+            scheduled_for  TIMESTAMP,
+            notes          TEXT,
+            location_lat   DOUBLE PRECISION,
+            location_lng   DOUBLE PRECISION,
+            status         TEXT DEFAULT 'pending',
+            amount         NUMERIC DEFAULT 0,
+            created_at     TIMESTAMP DEFAULT NOW(),
+            updated_at     TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    await database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_service_bookings_customer ON service_bookings(customer_id)"
+    )
+    await database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_service_bookings_provider ON service_bookings(provider_id)"
+    )
+    await database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_service_bookings_service ON service_bookings(service_id)"
+    )
+    print("✅ service_bookings table ready.")
 
     await database.execute("""
         CREATE TABLE IF NOT EXISTS user_devices (
