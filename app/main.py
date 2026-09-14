@@ -12,7 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── Cloudinary diagnostic – runs once at import time ─────────────────────
+# ── Cloudinary diagnostic ────────────────────────────────────────────────
 print(
     "🔑 Cloudinary env:",
     {
@@ -59,19 +59,20 @@ from app.routes.notifications import router as notifications_router
 
 from app.routes.shopper import router as shopper_router
 
+# ✅ Always import seai_search — it's pure DB + text ILIKE, no heavy models
+from app.routes.seai_search import router as seai_search_router
+
 # ── Conditionally import heavy AI routers ────────────────────────────────
 SKIP_MODELS = os.getenv("SKIP_MODELS") == "1"
 
 if not SKIP_MODELS:
     from app.routes.ai_tools import router as ai_tools_router
-    from app.routes.seai_search import router as seai_search_router
     from app.routes.seai_ask import router as seai_ask_router
     from app.routes.seai_lens import router as lens_router
     from app.routes.seai_transcribe import router as transcribe_router
     from app.routes.businesses import router as businesses_router
 else:
     ai_tools_router = None
-    seai_search_router = None
     seai_ask_router = None
     lens_router = None
     transcribe_router = None
@@ -223,7 +224,6 @@ async def lifespan(app: FastAPI):
                 timestamp         TIMESTAMP DEFAULT NOW()
             )
         """)
-        # Ensure the timestamp column exists and is a real TIMESTAMP on old tables
         conn.exec_driver_sql(
             "ALTER TABLE events ADD COLUMN IF NOT EXISTS timestamp TIMESTAMP DEFAULT NOW()"
         )
@@ -525,10 +525,9 @@ app.include_router(events_router)
 app.include_router(flipper_router)
 app.include_router(services_router)
 app.include_router(auth_router)
+app.include_router(seai_search_router)         # ✅ always mounted
 if ai_tools_router:
     app.include_router(ai_tools_router)
-if seai_search_router:
-    app.include_router(seai_search_router)
 if seai_ask_router:
     app.include_router(seai_ask_router)
 app.include_router(map_router)
