@@ -1,23 +1,33 @@
-fastapi
-uvicorn[standard]
-python-dotenv
-pydantic
-databases[postgresql]
-asyncpg
-sqlalchemy
-psycopg2-binary
-requests
-passlib[bcrypt]
-python-jose[cryptography]
-firebase-admin
-groq
-sib-api-v3-sdk
-python-multipart
-numpy
-pandas
-scikit-learn
-Pillow
-cloudinary
-groq>=0.11.0
-google-generativeai>=0.8.0
-openai>=1.40.0
+fastapi>=0.115.0,<1.0
+uvicorn[standard]>=0.30.0,<1.0
+python-dotenv>=1.0.0,<2.0
+pydantic>=2.9.0,<3.0
+databases[postgresql]>=0.9.0,<1.0
+asyncpg>=0.29.0,<1.0
+SQLAlchemy>=2.0.30,<3.0
+psycopg2-binary>=2.9.9,<3.0
+requests>=2.32.0,<3.0
+passlib[bcrypt]>=1.7.4,<2.0
+bcrypt>=4.1.0,<5.0
+python-jose[cryptography]>=3.3.0,<4.0
+python-multipart>=0.0.9,<1.0
+
+# Firebase
+firebase-admin>=6.5.0,<7.0
+
+# AI providers
+groq>=0.11.0,<1.0
+google-generativeai>=0.8.0,<1.0
+openai>=1.40.0,<2.0
+
+# Email
+sib-api-v3-sdk>=7.6.0,<8.0
+
+# Media / Cloudinary
+cloudinary>=1.40.0,<2.0
+Pillow>=10.3.0,<12.0
+
+# Data / ML
+numpy>=1.26.0,<3.0
+pandas>=2.2.0,<3.0
+scikit-learn>=1.5.0,<2.0
