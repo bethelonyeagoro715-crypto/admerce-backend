@@ -15,7 +15,9 @@ class Event(BaseModel):
     user_location: Optional[dict] = None
     listing_location: Optional[dict] = None
     position: Optional[int] = None
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Naive UTC to match the TIMESTAMP (without time zone) column.
+    # If the column becomes TIMESTAMPTZ, switch back to datetime.now(timezone.utc).
+    timestamp: datetime = Field(default_factory=lambda: datetime.utcnow())
 
 
 async def log_event(event: Event, db: Database):
@@ -26,16 +28,16 @@ async def log_event(event: Event, db: Database):
             :search_query, :user_location, :listing_location, :position, :timestamp)
     """
 
-    # Pydantic v2 → model_dump. v1 used .dict(), which is deprecated.
     values = event.model_dump()
 
-    # ✅ Pass the datetime object directly — the column is TIMESTAMP.
-    # asyncpg will encode it. Do NOT call .isoformat() here.
-    # (The previous code did `values["timestamp"] = event.timestamp.isoformat()`,
-    #  which fed a str into a TIMESTAMP column and raised:
-    #  TypeError: expected a datetime.date or datetime.datetime instance, got 'str')
+    # Normalise the timestamp: if it's timezone-aware, strip tzinfo so it
+    # matches the naive TIMESTAMP column. This is what was raising:
+    #   DataError: can't subtract offset-naive and offset-aware datetimes
+    ts = values.get("timestamp")
+    if isinstance(ts, datetime) and ts.tzinfo is not None:
+        values["timestamp"] = ts.replace(tzinfo=None)
 
-    # JSON-encode the dict fields — they're stored as TEXT.
+    # JSON-encode the dict fields (stored as TEXT columns)
     values["user_location"] = (
         json.dumps(event.user_location) if event.user_location else None
     )
