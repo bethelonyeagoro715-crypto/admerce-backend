@@ -177,7 +177,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # messages (updated with conversation_id, names, and read)
+        # messages (updated with conversation_id, names, read, audio)
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -256,6 +256,8 @@ async def lifespan(app: FastAPI):
             ("courier_id", "TEXT"),
             ("delivery_fee", "NUMERIC DEFAULT 0"),
             ("item_amount", "NUMERIC DEFAULT 0"),
+            ("unit_price", "NUMERIC DEFAULT 0"),
+            ("quantity", "INTEGER DEFAULT 1"),
             ("total_amount", "NUMERIC DEFAULT 0"),
             ("status", "TEXT DEFAULT 'locked'"),
             ("storekeeper_id", "TEXT"),
