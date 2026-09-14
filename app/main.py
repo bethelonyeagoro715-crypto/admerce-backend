@@ -188,6 +188,7 @@ async def lifespan(app: FastAPI):
                 receiver_name TEXT,
                 text TEXT,
                 image_url TEXT,
+                audio_url TEXT,
                 read BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP
             )
@@ -195,6 +196,7 @@ async def lifespan(app: FastAPI):
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_name TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS receiver_name TEXT")
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS read BOOLEAN DEFAULT FALSE")
 
         # listing_events (for stats)
@@ -245,10 +247,26 @@ async def lifespan(app: FastAPI):
                 f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
-        # escrow expires_at
-        conn.exec_driver_sql(
-            "ALTER TABLE escrow ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP"
-        )
+        # ── escrow columns ───────────────────────────────────────────────
+        # The reserve endpoint in wallet.py inserts into these. If the table
+        # was first created by an older model, some columns may be missing —
+        # this block ensures all of them exist regardless of creation order.
+        for col, dtype in [
+            ("listing_id", "TEXT"),
+            ("courier_id", "TEXT"),
+            ("delivery_fee", "NUMERIC DEFAULT 0"),
+            ("item_amount", "NUMERIC DEFAULT 0"),
+            ("total_amount", "NUMERIC DEFAULT 0"),
+            ("status", "TEXT DEFAULT 'locked'"),
+            ("storekeeper_id", "TEXT"),
+            ("shopper_id", "TEXT"),
+            ("order_id", "TEXT"),
+            ("created_at", "TIMESTAMP DEFAULT NOW()"),
+            ("expires_at", "TIMESTAMP"),
+        ]:
+            conn.exec_driver_sql(
+                f"ALTER TABLE escrow ADD COLUMN IF NOT EXISTS {col} {dtype}"
+            )
 
         # ✅ Fix for "/services/ 500 – column s.is_active does not exist"
         conn.exec_driver_sql(
@@ -283,6 +301,41 @@ async def lifespan(app: FastAPI):
                 created_at      TIMESTAMP DEFAULT NOW()
             )
         """)
+
+        # ✅ Saved items (shopper wishlist)
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS saved_items (
+                user_id    TEXT NOT NULL,
+                listing_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (user_id, listing_id)
+            )
+        """)
+
+        # ✅ Basket tables
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS baskets (
+                user_id    TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS basket_items (
+                id         SERIAL PRIMARY KEY,
+                user_id    TEXT NOT NULL,
+                listing_id TEXT NOT NULL,
+                store_id   TEXT NOT NULL,
+                quantity   INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_basket_items_user ON basket_items(user_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_saved_items_user ON saved_items(user_id)"
+        )
 
     print("✅ Schema migrations complete.")
 
