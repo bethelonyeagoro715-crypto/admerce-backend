@@ -147,7 +147,6 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
     if not wallet:
         raise HTTPException(status_code=404, detail="Wallet not found")
 
-    # ✅ Use bracket notation, not .get()
     withdrawal_pin = wallet["withdrawal_pin"]
     balance = wallet["balance"]
 
@@ -184,9 +183,8 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
         "amount": req.amount,
         "new_balance": new_balance
     }
-    
 
-# ---------- Instant Pickup (Pay in person) – FIXED ----------
+# ---------- Instant Pickup (Pay in person) ----------
 @router.post("/instant-pickup")
 async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
@@ -232,8 +230,7 @@ async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends
 
     return {"message": "Payment successful", "transaction_id": txn_id, "amount": req.amount}
 
-
-# ---------- Reserve – FIXED (with quantity) ----------
+# ---------- Reserve ----------
 @router.post("/reserve")
 async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
@@ -246,7 +243,10 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
     if not wallet:
         raise HTTPException(status_code=400, detail="Wallet not found. Please create a wallet first.")
     if wallet["balance"] < total:
-        raise HTTPException(status_code=400, detail=f"Insufficient balance. Your balance: ₦{wallet['balance']}, required: ₦{total}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient balance. Your balance: ₦{wallet['balance']}, required: ₦{total}"
+        )
 
     existing = await database.fetch_one("SELECT * FROM escrow WHERE order_id = :oid", {"oid": req.order_id})
     if existing:
@@ -258,26 +258,34 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         {"lid": req.listing_id, "oid": req.storekeeper_id}
     )
     if not row:
-        raise HTTPException(status_code=400, detail=f"Listing {req.listing_id} not found or not owned by storekeeper {req.storekeeper_id}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Listing {req.listing_id} not found or not owned by storekeeper {req.storekeeper_id}"
+        )
     listing = dict(row)
 
     if listing.get("quantity_available") is not None and listing["quantity_available"] < req.quantity:
         raise HTTPException(status_code=400, detail=f"Only {listing['quantity_available']} items available")
 
-    await database.execute("UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid", {"amt": total, "uid": shopper_id})
+    await database.execute(
+        "UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid",
+        {"amt": total, "uid": shopper_id}
+    )
 
-    expires_at = datetime.utcnow() + timedelta(hours=2)
-
-    # Convert numeric values to strings if the escrow columns are TEXT
-    item_amount_str = str(req.item_amount)
-    delivery_fee_str = str(req.delivery_fee)
-    total_amount_str = str(total)
+    now = datetime.utcnow()
+    expires_at = now + timedelta(hours=2)
 
     query = """
-    INSERT INTO escrow (order_id, shopper_id, storekeeper_id, courier_id,
-                        listing_id, quantity, item_amount, delivery_fee, total_amount, status, expires_at)
-    VALUES (:order_id, :shopper_id, :storekeeper_id, :courier_id,
-            :listing_id, :quantity, :item_amount, :delivery_fee, :total_amount, 'locked', :expires_at)
+    INSERT INTO escrow (
+        order_id, shopper_id, storekeeper_id, courier_id,
+        listing_id, quantity, item_amount, delivery_fee, total_amount,
+        status, expires_at, created_at
+    )
+    VALUES (
+        :order_id, :shopper_id, :storekeeper_id, :courier_id,
+        :listing_id, :quantity, :item_amount, :delivery_fee, :total_amount,
+        'locked', :expires_at, :created_at
+    )
     """
     await database.execute(query, {
         "order_id": req.order_id,
@@ -286,10 +294,11 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         "courier_id": req.courier_id,
         "listing_id": req.listing_id,
         "quantity": req.quantity,
-        "item_amount": item_amount_str,
-        "delivery_fee": delivery_fee_str,
-        "total_amount": total_amount_str,
-        "expires_at": expires_at.isoformat(),
+        "item_amount": float(req.item_amount),
+        "delivery_fee": float(req.delivery_fee),
+        "total_amount": float(total),
+        "expires_at": expires_at,
+        "created_at": now,
     })
 
     await _log_wallet_transaction(
@@ -479,7 +488,7 @@ async def get_escrows(current_user: dict = Depends(get_current_user)):
     rows = await database.fetch_all(query, {"uid": user_id})
     return [dict(row) for row in rows]
 
-# ---------- Get All Orders (shopper) – FIXED for comma‑separated status ----------
+# ---------- Get All Orders (shopper) ----------
 @router.get("/orders")
 async def get_orders(
     current_user: dict = Depends(get_current_user),
@@ -504,7 +513,7 @@ async def get_orders(
     rows = await database.fetch_all(query, params)
     return [dict(row) for row in rows]
 
-# ---------- Get Order Detail (with customer name and store name) ----------
+# ---------- Get Order Detail ----------
 @router.get("/order/{order_id}")
 async def get_order_detail(order_id: str, current_user: dict = Depends(get_current_user)):
     order = await database.fetch_one(

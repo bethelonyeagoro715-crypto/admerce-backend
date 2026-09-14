@@ -80,12 +80,11 @@ else:
     businesses_router = None
     print("⚠️ SKIP_MODELS=1 – Heavy AI models disabled")
 
-
 # ── Background task: auto-refund expired escrow ──────────────────────────
 async def _refund_expired_escrows() -> None:
     while True:
         try:
-            now = datetime.utcnow()   # ✅ datetime object
+            now = datetime.utcnow()
             expired = await database.fetch_all(
                 "SELECT * FROM escrow WHERE status = 'locked' AND expires_at < :now",
                 {"now": now},
@@ -177,7 +176,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # messages (updated with conversation_id, names, read, audio)
+        # messages
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -199,7 +198,7 @@ async def lifespan(app: FastAPI):
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS read BOOLEAN DEFAULT FALSE")
 
-        # listing_events (for stats)
+        # listing_events
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS listing_events (
                 id SERIAL PRIMARY KEY,
@@ -219,7 +218,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # users columns (ensure existence)
+        # users columns
         for col, dtype in [
             ("verified", "BOOLEAN DEFAULT FALSE"),
             ("nickname", "TEXT"),
@@ -247,10 +246,7 @@ async def lifespan(app: FastAPI):
                 f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
-        # ── escrow columns ───────────────────────────────────────────────
-        # The reserve endpoint in wallet.py inserts into these. If the table
-        # was first created by an older model, some columns may be missing —
-        # this block ensures all of them exist regardless of creation order.
+        # escrow columns
         for col, dtype in [
             ("listing_id", "TEXT"),
             ("courier_id", "TEXT"),
@@ -270,12 +266,12 @@ async def lifespan(app: FastAPI):
                 f"ALTER TABLE escrow ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
-        # ✅ Fix for "/services/ 500 – column s.is_active does not exist"
+        # services.is_active
         conn.exec_driver_sql(
             "ALTER TABLE services ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"
         )
 
-        # ✅ Missing tables referenced by profile.py and chat.py
+        # role_onboardings / user_settings / call_signals
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS role_onboardings (
                 user_id TEXT NOT NULL,
@@ -304,7 +300,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # ✅ Saved items (shopper wishlist)
+        # saved_items
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS saved_items (
                 user_id    TEXT NOT NULL,
@@ -314,7 +310,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # ✅ Basket tables
+        # baskets
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS baskets (
                 user_id    TEXT PRIMARY KEY,
@@ -367,15 +363,20 @@ async def lifespan(app: FastAPI):
 
     await database.execute("""
         CREATE TABLE IF NOT EXISTS wallet_transactions (
-            id         SERIAL PRIMARY KEY,
-            user_id    TEXT NOT NULL,
-            amount     NUMERIC NOT NULL,
-            type       TEXT NOT NULL,
-            reference  TEXT NOT NULL,
-            status     TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
+            id          SERIAL PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            amount      NUMERIC NOT NULL,
+            type        TEXT NOT NULL,
+            description TEXT,
+            reference   TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            created_at  TIMESTAMP DEFAULT NOW()
         )
     """)
+    # Backfill description for tables created before this migration
+    await database.execute(
+        "ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS description TEXT"
+    )
     print("✅ wallet_transactions table ready.")
 
     await database.execute("""
@@ -441,7 +442,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Static file serving (legacy uploads) ─────────────────────────────────
+# ── Static file serving ──────────────────────────────────────────────────
 BASE_DIR = os.getcwd()
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
