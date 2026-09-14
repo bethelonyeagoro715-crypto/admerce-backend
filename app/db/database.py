@@ -23,20 +23,18 @@ else:
     ASYNC_DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     SYNC_DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-# Add statement_cache_size=0 to the async URL for the Database object
-if "?" in ASYNC_DATABASE_URL:
-    ASYNC_DATABASE_URL_FOR_POOL = ASYNC_DATABASE_URL + "&statement_cache_size=0"
-else:
-    ASYNC_DATABASE_URL_FOR_POOL = ASYNC_DATABASE_URL + "?statement_cache_size=0"
-
+# ─── Async engine (used if you ever need SQLAlchemy async sessions) ──────
 engine = create_async_engine(
     ASYNC_DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
     connect_args={"statement_cache_size": 0},   # disable cache for engine
 )
+
+# ─── Sync engine (used only for Base.metadata.create_all + migrations) ───
 sync_engine = create_engine(SYNC_DATABASE_URL, echo=False, pool_pre_ping=True)
 
+# ─── Async session factory ───────────────────────────────────────────────
 AsyncSessionLocal = sessionmaker(
     bind=engine,
     class_=AsyncSession,
@@ -45,6 +43,18 @@ AsyncSessionLocal = sessionmaker(
     expire_on_commit=False,
 )
 
-# Use the modified URL for Database (ensures statement_cache_size=0)
-database = Database(ASYNC_DATABASE_URL_FOR_POOL, min_size=5, max_size=20)
+# ─── Databases pool — the one every route uses ───────────────────────────
+# IMPORTANT: statement_cache_size MUST be a direct kwarg here. Passing it
+# via the URL query string does NOT work — asyncpg silently ignores it.
+# Setting it on the engine alone does NOT propagate to this pool either.
+# This kwarg is what stops InvalidCachedStatementError when ALTER TABLE
+# runs during startup.
+database = Database(
+    ASYNC_DATABASE_URL,
+    min_size=5,
+    max_size=20,
+    statement_cache_size=0,
+)
+
+# ─── Base ────────────────────────────────────────────────────────────────
 Base = declarative_base()
