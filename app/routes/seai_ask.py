@@ -34,74 +34,60 @@ class AskRequest(BaseModel):
     mode: Optional[str] = "gpt"
 
 
+# ════════════════════════════════════════════════════════════
+# SYSTEM PROMPT — reserve_item listed FIRST with explicit examples
+# ════════════════════════════════════════════════════════════
 SYSTEM_PROMPT = """You are SEAI, the AI shopping assistant for Admerce — a hyper-local commerce marketplace in Nigeria.
 
-You are warm, helpful, and conversational. You speak like a knowledgeable friend who knows the local area.
+You have FOUR tools:
 
-You have these tools:
+1. reserve_item(query, quantity)
+   Reserve a physical PRODUCT. Use whenever the user says RESERVE, HOLD, BUY, or GRAB
+   and the thing is a physical product (phone, shoe, tv, shirt, food item, etc.).
+   Pass ONLY the product name as query. DO NOT include the store name.
+   Examples:
+     "reserve this iphone"        → reserve_item(query="iPhone 14")
+     "Reserve an iphone 14 from graham hub" → reserve_item(query="iPhone 14")
+     "hold 2 of those shoes"      → reserve_item(query="shoes", quantity=2)
+     "buy that tv"                → reserve_item(query="TV")
 
-1. search_items(query)
+2. search_items(query)
    Use when the user wants to FIND, SEE, BROWSE, or EXPLORE anything.
    Examples: "find iphone", "show me pizza", "I'm looking for shoes".
 
-2. reserve_item(query, quantity)
-   Use when the user wants to RESERVE, HOLD, or BUY a physical ITEM.
-   The `query` should be the SHORTEST descriptive name of the item — the
-   product name only. Do NOT include the store name unless you cannot
-   identify the product otherwise.
-   Examples: "reserve this iphone" → query="iPhone 14"
-             "hold the iPhone 14" → query="iPhone 14"
-             "reserve this item at Graham Hub" → query="iPhone 14"
-   If the user says "this item" or "the same one", look at the previous
-   messages and extract the product name — but keep it short.
-
 3. book_service(service)
-   Use ONLY for SERVICES — haircuts, repairs, plumbing, catering.
-   NOT for physical products.
+   Use ONLY when the user names a SERVICE that a provider delivers:
+   haircut, phone repair, plumbing, cleaning, catering, photography, etc.
+   NOT for physical products. If they say "reserve" and it's a product, use reserve_item.
+   Examples: "book a haircut", "book phone repair", "schedule a plumber".
 
 4. get_store_info(store)
    Use when the user asks about a specific store by name.
 
 Rules:
-- Never say "I found N results". Write like a person recommending things.
-- Mention travel time or distance naturally when it helps.
+- NEVER say "I found N results". Write like a person recommending things.
+- Mention travel time or distance naturally.
 - Keep responses under 40 words unless asked for detail."""
 
 
 def _tools():
+    # reserve_item listed FIRST so Groq sees it before book_service.
     return [
-        {
-            "type": "function",
-            "function": {
-                "name": "search_items",
-                "description": "Search products, services, and stores near the user.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
         {
             "type": "function",
             "function": {
                 "name": "reserve_item",
                 "description": (
-                    "Reserve a physical ITEM (product). Pass ONLY the product "
-                    "name as the query — do NOT include the store name. "
-                    "Examples: 'iPhone 14', 'Air Jordan 1', 'Samsung TV'."
+                    "Reserve a physical PRODUCT (phone, shoe, tv, shirt, food item). "
+                    "Use whenever the user says reserve, hold, or buy. "
+                    "Pass ONLY the product name — never the store name."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": (
-                                "Short product name only, e.g. 'iPhone 14'. "
-                                "Do NOT include the store name."
-                            ),
+                            "description": "Short product name, e.g. 'iPhone 14'",
                         },
                         "quantity": {
                             "type": "integer",
@@ -116,8 +102,23 @@ def _tools():
         {
             "type": "function",
             "function": {
+                "name": "search_items",
+                "description": "Search products, services, and stores near the user.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "book_service",
-                "description": "Book a service from a provider.",
+                "description": (
+                    "Book a SERVICE delivered by a provider — haircut, repair, "
+                    "plumber, cleaning, catering. NOT for physical products."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {"service": {"type": "string"}},
@@ -129,7 +130,7 @@ def _tools():
             "type": "function",
             "function": {
                 "name": "get_store_info",
-                "description": "Get details about a specific store.",
+                "description": "Get details about a specific store by name.",
                 "parameters": {
                     "type": "object",
                     "properties": {"store": {"type": "string"}},
@@ -168,7 +169,7 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
             tools=_tools(),
             tool_choice="auto",
             max_tokens=400,
-            temperature=0.6,
+            temperature=0.4,           # lower = more deterministic tool picking
         )
         msg = resp.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None)
@@ -185,6 +186,8 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
             args = json.loads(call.function.arguments or "{}")
         except json.JSONDecodeError:
             args = {}
+
+        print(f"🔧 SEAI tool call: {fn}({args})", flush=True)
 
         result = await _execute_agent_function(fn, args, user_id, req.lat, req.lng)
 
@@ -222,6 +225,9 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
         return await _regex_fallback(req, user_id)
 
 
+# ════════════════════════════════════════════════════════════
+# TOOL DISPATCHER — with smart cross-tool fallback
+# ════════════════════════════════════════════════════════════
 async def _execute_agent_function(
     fn_name: str, args: dict, user_id: Optional[str], lat: float, lng: float
 ) -> dict:
@@ -232,14 +238,34 @@ async def _execute_agent_function(
         if fn_name == "reserve_item":
             if not user_id:
                 return {"type": "text", "text": "Please log in first to reserve items."}
+            query = args.get("query", "").strip()
             return await _handle_reserve_item(
-                user_id,
-                args.get("query", "").strip(),
-                int(args.get("quantity", 1) or 1),
+                user_id, query, int(args.get("quantity", 1) or 1)
             )
 
         if fn_name == "book_service":
-            return await handle_book_service(user_id or "", args)
+            result = await handle_book_service(user_id or "", args)
+
+            # ── Fallback: Groq mis-classified a product as a service ──
+            # If the service lookup failed, try reserve_item with the same arg.
+            if (
+                result.get("type") == "text"
+                and "No service found" in result.get("text", "")
+                and user_id
+            ):
+                service_arg = (
+                    args.get("service", "")
+                    or args.get("query", "")
+                    or args.get("service_name", "")
+                ).strip()
+                print(
+                    f"↩️  book_service failed, retrying as reserve_item('{service_arg}')",
+                    flush=True,
+                )
+                reserve_result = await _handle_reserve_item(user_id, service_arg, 1)
+                return reserve_result
+
+            return result
 
         if fn_name == "get_store_info":
             return await handle_get_store_info(args)
@@ -260,26 +286,15 @@ STOP_WORDS = {
 
 
 def _tokenize(text: str) -> list[str]:
-    """Lowercase word list, minus stop words."""
     words = re.findall(r"[a-z0-9]+", text.lower())
     return [w for w in words if w not in STOP_WORDS and len(w) > 1]
 
 
 async def _find_best_listing(query: str) -> Optional[dict]:
-    """
-    Find the best-matching listing for a free-text query.
-
-    Strategy:
-      1. Tokenize the query (strip stop words)
-      2. Match each token against title OR store_name
-      3. Rank by number of matching tokens, then by title length
-      4. Return the top scorer
-    """
     tokens = _tokenize(query)
     if not tokens:
         return None
 
-    # Build OR conditions for each token (word-boundary search)
     or_parts = []
     params: dict = {}
     for i, tok in enumerate(tokens):
@@ -290,7 +305,6 @@ async def _find_best_listing(query: str) -> Optional[dict]:
 
     where = " OR ".join(f"({p})" for p in or_parts)
 
-    # Score = number of tokens found in title + half-score for store name.
     score_terms = []
     for i, tok in enumerate(tokens):
         score_terms.append(f"CASE WHEN LOWER(l.title) LIKE :w{i} THEN 3 ELSE 0 END")
@@ -330,7 +344,6 @@ async def _find_best_listing(query: str) -> Optional[dict]:
 async def _handle_reserve_item(
     user_id: str, query: str, quantity: int = 1
 ) -> dict:
-    """Reserve a physical listing by fuzzy title match."""
     if not query:
         return {"type": "text", "text": "Which item would you like to reserve?"}
 
