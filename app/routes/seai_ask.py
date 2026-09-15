@@ -14,9 +14,11 @@ from app.services.seai_agent import (
     handle_search_items,
     handle_get_store_info,
 )
-from app.services.llm_agent import call_llm, GROQ_ENABLED, GROQ_MODEL
+from app.services.llm_agent import GROQ_ENABLED, GROQ_MODEL
 
 router = APIRouter(prefix="/seai", tags=["SEAI Agent"])
+
+_groq = AsyncGroq(api_key=os.getenv("GROQ_API_KEY")) if os.getenv("GROQ_API_KEY") else None
 
 
 class AskRequest(BaseModel):
@@ -25,20 +27,57 @@ class AskRequest(BaseModel):
     lng: float = 3.3792
     radius_km: float = 10.0
     conversation_history: List[Dict[str, str]] = []
-    mode: Optional[str] = "gpt"   # "gpt" (SEAI) or "agent" (Cortex)
+    mode: Optional[str] = "gpt"
 
 
-# Dedicated client for the agent. Reuses the same env var as llm_agent.
-_groq_agent_client = (
-    AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-    if os.getenv("GROQ_API_KEY")
-    else None
-)
+SYSTEM_PROMPT = """You are SEAI, the AI shopping assistant for Admerce — a hyper-local commerce marketplace.
+
+You are warm, helpful, and conversational. You speak like a knowledgeable friend who knows the local area.
+
+You have these tools:
+- search_items(query)   → find products, services, and stores near the user
+- book_service(service) → book a service
+- get_store_info(store) → get details on a specific store
+
+Rules:
+1. If the user wants to find, see, buy, or explore something — call search_items.
+2. After a search, LOOK at the results before writing. Reference specific
+   store names, prices, and locations from the data.
+3. Never say "I found N results" — write like a person recommending things.
+4. Mention travel time or distance naturally when it helps.
+5. Keep responses under 40 words unless the user asks for detail.
+6. For non-shopping questions, answer helpfully with plain text.
+
+Example good responses:
+  • "Graham Hub has an iPhone 14 for ₦450,000, about 22 minutes from you — worth a look."
+  • "Three shops have what you need. The nearest is FixIt Lagos at 0.8 km."
+  • "Nothing local matches that yet. Want me to keep looking?"
+"""
 
 
-# ════════════════════════════════════════════════════════════
-# MAIN ENDPOINT
-# ════════════════════════════════════════════════════════════
+def _tools():
+    return [
+        {"type": "function", "function": {
+            "name": "search_items",
+            "description": "Search products, services, and stores near the user",
+            "parameters": {"type": "object",
+                "properties": {"query": {"type": "string",
+                    "description": "What to search for"}},
+                "required": ["query"]}}},
+        {"type": "function", "function": {
+            "name": "book_service",
+            "description": "Book a service",
+            "parameters": {"type": "object",
+                "properties": {"service": {"type": "string"}},
+                "required": ["service"]}}},
+        {"type": "function", "function": {
+            "name": "get_store_info",
+            "description": "Get info on a store by name",
+            "parameters": {"type": "object",
+                "properties": {"store": {"type": "string"}},
+                "required": ["store"]}}},
+    ]
+
 
 @router.post("/ask")
 async def seai_ask(
@@ -47,268 +86,189 @@ async def seai_ask(
 ):
     user_id = current_user["id"] if current_user else None
 
-    # ── Agent mode (SEAI Cortex — Groq function calling) ────
     if req.mode == "agent":
-        if not user_id:
+        # Agent mode is the same loop — kept as a flag for future divergence
+        pass
+
+    if not GROQ_ENABLED or _groq is None:
+        # No LLM at all → fall back to regex path
+        return await _regex_fallback(req, user_id)
+
+    return await _groq_agent_loop(req, user_id)
+
+
+async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
+    """Full agentic loop: Groq reasons, calls tools, then writes the response."""
+
+    messages: list = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # Include prior turns for context
+    for m in req.conversation_history[-6:]:
+        role = m.get("role", "user")
+        if role in ("user", "assistant"):
+            messages.append({"role": role, "content": m.get("content", "")})
+
+    messages.append({"role": "user", "content": req.query})
+
+    search_results = None
+    cards_payload: Optional[dict] = None
+
+    try:
+        # ── Step 1: let Groq decide ────────────────────────────
+        resp = await _groq.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            tools=_tools(),
+            tool_choice="auto",
+            max_tokens=400,
+            temperature=0.6,
+        )
+
+        msg = resp.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
+
+        if not tool_calls:
+            # Groq answered directly
             return StreamingResponse(
-                _stream_text("Please log in first to perform actions."),
+                _stream_text(msg.content or "How can I help?"),
                 media_type="text/event-stream",
             )
-        return await _handle_agent_mode(req, user_id)
 
-    # ── GPT mode (SEAI — rule-based + LLM fallback) ─────────
+        # ── Step 2: execute the chosen tool ────────────────────
+        call = tool_calls[0]
+        fn = call.function.name
+        try:
+            args = json.loads(call.function.arguments or "{}")
+        except json.JSONDecodeError:
+            args = {}
+
+        if fn == "search_items":
+            result = await handle_search_items(args, req.lat, req.lng, user_id)
+        elif fn == "book_service":
+            result = await handle_book_service(user_id or "", args)
+        elif fn == "get_store_info":
+            result = await handle_get_store_info(args)
+        else:
+            result = {"type": "text", "text": "I can't do that yet."}
+
+        # If it's a search result, remember the cards
+        if result.get("type") == "action" and result.get("intent") == "search_results":
+            cards_payload = result["data"]
+
+        # ── Step 3: feed results back to Groq for the final reply ─
+        compact = _compact_for_llm(result)
+
+        messages.append(msg)  # the assistant's tool_call message
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": json.dumps(compact),
+        })
+
+        # If no search happened, just return the raw result
+        if cards_payload is None:
+            return _respond_from_result(result)
+
+        # ── Step 4: Groq writes the intro using real data ──────
+        final = await _groq.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            max_tokens=120,
+            temperature=0.7,
+        )
+        intro = (final.choices[0].message.content or "").strip().strip('"')
+
+        if not intro:
+            intro = _fallback_intro(cards_payload["results"])
+
+        return StreamingResponse(
+            _stream_text_and_action(intro, cards_payload),
+            media_type="text/event-stream",
+        )
+
+    except Exception as e:
+        print(f"❌ SEAI agent error: {e}")
+        return await _regex_fallback(req, user_id)
+
+
+def _compact_for_llm(result: dict) -> dict:
+    """Trim the tool result so it fits in the LLM's token budget."""
+    if result.get("type") != "action":
+        return result
+    data = result.get("data", {})
+    items = data.get("results", [])[:6]
+    slim = [{
+        "type": r.get("type"),
+        "title": r.get("title"),
+        "price": r.get("price"),
+        "store_name": r.get("store_name") or r.get("provider_name"),
+        "distance_km": r.get("distance_km"),
+        "travel_minutes": r.get("travel_minutes"),
+        "address": r.get("address"),
+    } for r in items]
+    return {"intent": result.get("intent"), "query": data.get("query"), "results": slim}
+
+
+def _fallback_intro(results: list) -> str:
+    if not results:
+        return "Nothing turned up nearby — want me to keep looking?"
+    if len(results) == 1:
+        r = results[0]
+        bits = [r.get("title") or "One option"]
+        if r.get("store_name") or r.get("provider_name"):
+            bits.append(f"at {r['store_name'] if r.get('store_name') else r['provider_name']}")
+        if r.get("travel_minutes"):
+            bits.append(f"about {r['travel_minutes']} min away")
+        return " ".join(bits) + "."
+    return f"{len(results)} options nearby — the closest is {results[0].get('title', 'first on the list')}."
+
+
+async def _regex_fallback(req: AskRequest, user_id: Optional[str]):
+    """Used only when Groq is unavailable."""
     intent, params = classify_intent(req.query)
-
     if intent == "search":
-        result = await handle_search_items(params, req.lat, req.lng, user_id)
-        return _respond_from_result(result)
-
+        r = await handle_search_items(params, req.lat, req.lng, user_id)
+        return _respond_from_result(r)
     if intent == "book_service":
-        result = await handle_book_service(user_id, params)
-        return _respond_from_result(result)
-
+        r = await handle_book_service(user_id or "", params)
+        return _respond_from_result(r)
     if intent == "get_store_info":
-        result = await handle_get_store_info(params)
-        return _respond_from_result(result)
-
-    # Fallback: ask the LLM (Groq → Gemini → NVIDIA)
-    llm_result = await call_llm(req.query)
-
-    if llm_result["type"] == "action":
-        ai_intent = llm_result["data"]["intent"]
-        ai_params = llm_result["data"].get("params", {})
-
-        if ai_intent == "search":
-            result = await handle_search_items(ai_params, req.lat, req.lng, user_id)
-            return _respond_from_result(result)
-
-        if ai_intent == "book_service":
-            result = await handle_book_service(user_id, ai_params)
-            return _respond_from_result(result)
-
-        if ai_intent == "get_store_info":
-            result = await handle_get_store_info(ai_params)
-            return _respond_from_result(result)
-
+        r = await handle_get_store_info(params)
+        return _respond_from_result(r)
     return StreamingResponse(
-        _stream_text(llm_result.get("text", "Hello!")),
+        _stream_text("I'm offline for a moment. Try again shortly."),
         media_type="text/event-stream",
     )
 
 
 def _respond_from_result(result: dict):
-    """Turn the agent helper's result into the correct StreamingResponse."""
     if result.get("type") == "action":
         return StreamingResponse(
-            _stream_text_and_action(result),
-            media_type="text/event-stream",
-        )
-    if result.get("type") == "text":
-        return StreamingResponse(
-            _stream_text(result["text"]),
-            media_type="text/event-stream",
-        )
-    if result.get("type") == "error":
-        return StreamingResponse(
-            _stream_text(result.get("message", "Something went wrong.")),
+            _stream_text_and_action("", result["data"]),
             media_type="text/event-stream",
         )
     return StreamingResponse(
-        _stream_text("I'm not sure how to help with that."),
+        _stream_text(result.get("text") or "Nothing to show."),
         media_type="text/event-stream",
     )
 
 
-# ════════════════════════════════════════════════════════════
-# SEAI CORTEX — Agent mode with Groq function calling
-# ════════════════════════════════════════════════════════════
-
-AGENT_SYSTEM_PROMPT = """You are SEAI Cortex, the agentic assistant for Admerce — a hyper-local commerce platform.
-
-You can call these functions to help the user:
-- search_items(query): find products, services, and stores near the user
-- book_service(service): reserve a service from a provider
-- get_store_info(store): get details about a specific store
-
-Always call the appropriate function when the user's request matches one.
-Be concise. Confirm what you're doing in one short sentence before the action."""
-
-
-def _groq_agent_tools():
-    """Groq / OpenAI-compatible tool definitions for SEAI Cortex."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "search_items",
-                "description": "Search for items, services, and stores near the user",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "What the user is looking for (e.g. 'iphone', 'pizza', 'plumber')",
-                        }
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "book_service",
-                "description": "Book a service from a provider",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "service": {
-                            "type": "string",
-                            "description": "The service the user wants to book",
-                        }
-                    },
-                    "required": ["service"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_store_info",
-                "description": "Get details about a specific store",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "store": {
-                            "type": "string",
-                            "description": "The name of the store",
-                        }
-                    },
-                    "required": ["store"],
-                },
-            },
-        },
-    ]
-
-
-async def _handle_agent_mode(req: AskRequest, user_id: str):
-    if not GROQ_ENABLED or _groq_agent_client is None:
-        return StreamingResponse(
-            _stream_text(
-                "SEAI Cortex is temporarily unavailable. Please try again shortly."
-            ),
-            media_type="text/event-stream",
-        )
-
-    try:
-        response = await _groq_agent_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-                {"role": "user", "content": req.query},
-            ],
-            tools=_groq_agent_tools(),
-            tool_choice="auto",
-            max_tokens=300,
-            temperature=0.4,
-        )
-
-        msg = response.choices[0].message
-
-        # ── Did the model decide to call a function? ─────────
-        if getattr(msg, "tool_calls", None):
-            call = msg.tool_calls[0]
-            fn_name = call.function.name
-            try:
-                fn_args = json.loads(call.function.arguments or "{}")
-            except json.JSONDecodeError:
-                fn_args = {}
-
-            result = await _execute_agent_function(
-                fn_name, fn_args, user_id, req.lat, req.lng
-            )
-            return _respond_from_result(result)
-
-        # ── Otherwise it responded with text ─────────────────
-        return StreamingResponse(
-            _stream_text(msg.content or "Done."),
-            media_type="text/event-stream",
-        )
-
-    except Exception as e:
-        print(f"❌ Cortex agent error: {e}")
-        return StreamingResponse(
-            _stream_text("I'm having trouble with that request. Please try again."),
-            media_type="text/event-stream",
-        )
-
-
-async def _execute_agent_function(
-    fn_name: str, args: dict, user_id: str, lat: float, lng: float
-) -> dict:
-    try:
-        if fn_name == "search_items":
-            return await handle_search_items(args, lat, lng, user_id)
-
-        if fn_name == "book_service":
-            return await handle_book_service(user_id, args)
-
-        if fn_name == "get_store_info":
-            return await handle_get_store_info(args)
-
-        return {"type": "text", "text": f"Unknown action: {fn_name}"}
-    except Exception as e:
-        print(f"❌ Agent function '{fn_name}' failed: {e}")
-        return {"type": "text", "text": "I couldn't complete that action."}
-
-
-# ════════════════════════════════════════════════════════════
-# Stream generators
-# ════════════════════════════════════════════════════════════
-
 async def _stream_text(text: str):
-    words = text.split()
-    for i, word in enumerate(words):
-        yield f"data: {json.dumps({'text': word + (' ' if i < len(words) - 1 else '')})}\n\n"
+    for i, w in enumerate(text.split()):
+        yield f"data: {json.dumps({'text': w + (' ' if i < len(text.split()) - 1 else '')})}\n\n"
     yield "data: [DONE]\n\n"
 
 
-async def _stream_action(action: dict):
-    yield f"data: {json.dumps({'type': 'action', 'data': action['data']})}\n\n"
+async def _stream_text_and_action(intro: str, data: dict):
+    if intro:
+        words = intro.split()
+        for i, w in enumerate(words):
+            yield f"data: {json.dumps({'text': w + (' ' if i < len(words) - 1 else '')})}\n\n"
+    yield f"data: {json.dumps({'type': 'action', 'intent': 'search_results', 'data': data})}\n\n"
     yield "data: [DONE]\n\n"
 
 
-async def _stream_text_and_action(action: dict):
-    query = action["data"]["query"]
-    results = action["data"]["results"]
-    count = len(results)
-    intro = f"I found {count} result{'s' if count != 1 else ''} matching '{query}':"
-    for word in intro.split():
-        yield f"data: {json.dumps({'text': word + ' '})}\n\n"
-    yield f"data: {json.dumps({'type': 'action', 'intent': 'search_results', 'data': action['data']})}\n\n"
-    yield "data: [DONE]\n\n"
-
-
-# ════════════════════════════════════════════════════════════
-# Backward compatibility — imported by events.py
-# ════════════════════════════════════════════════════════════
-
-async def _process_ask(
-    query: str,
-    lat: float,
-    lng: float,
-    radius_km: float,
-    conversation_history: List[Dict[str, str]],
-    user_id: Optional[str] = None,
-):
-    req = AskRequest(
-        query=query,
-        lat=lat,
-        lng=lng,
-        radius_km=radius_km,
-        conversation_history=conversation_history,
-    )
-    return await seai_ask(
-        req=req,
-        current_user={"id": user_id} if user_id else None,
-    )
+async def _process_ask(query, lat, lng, radius_km, conversation_history, user_id=None):
+    req = AskRequest(query=query, lat=lat, lng=lng,
+                     radius_km=radius_km, conversation_history=conversation_history)
+    return await seai_ask(req=req, current_user={"id": user_id} if user_id else None)
