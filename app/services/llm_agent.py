@@ -20,7 +20,9 @@ except ImportError:
     print("⚠️ groq package not installed. Install with: pip install groq")
 
 # ── Google Gemini (secondary — strongest for agent + tools) ──
-GEMINI_MODEL = "gemini-2.5-flash"
+# Google rotates model names frequently. If you see a 404
+# "no longer available to new users", update this string.
+GEMINI_MODEL = "gemini-3.6-flash"
 try:
     import google.generativeai as genai
     _gemini_key = os.getenv("GEMINI_API_KEY")

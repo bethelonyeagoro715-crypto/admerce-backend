@@ -1,8 +1,11 @@
 import json
+import os
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
+
+from groq import AsyncGroq
 
 from app.routes.auth import get_optional_user
 from app.services.seai_agent import (
@@ -11,8 +14,7 @@ from app.services.seai_agent import (
     handle_search_items,
     handle_get_store_info,
 )
-# ✅ Now also imports GEMINI_MODEL so the agent uses the same model as the chat fallback
-from app.services.llm_agent import call_llm, GEMINI_ENABLED, genai, GEMINI_MODEL
+from app.services.llm_agent import call_llm, GROQ_ENABLED, GROQ_MODEL
 
 router = APIRouter(prefix="/seai", tags=["SEAI Agent"])
 
@@ -26,6 +28,14 @@ class AskRequest(BaseModel):
     mode: Optional[str] = "gpt"   # "gpt" (SEAI) or "agent" (Cortex)
 
 
+# Dedicated client for the agent. Reuses the same env var as llm_agent.
+_groq_agent_client = (
+    AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+    if os.getenv("GROQ_API_KEY")
+    else None
+)
+
+
 # ════════════════════════════════════════════════════════════
 # MAIN ENDPOINT
 # ════════════════════════════════════════════════════════════
@@ -37,7 +47,7 @@ async def seai_ask(
 ):
     user_id = current_user["id"] if current_user else None
 
-    # ── Agent mode (SEAI Cortex — Gemini function calling) ──
+    # ── Agent mode (SEAI Cortex — Groq function calling) ────
     if req.mode == "agent":
         if not user_id:
             return StreamingResponse(
@@ -110,7 +120,7 @@ def _respond_from_result(result: dict):
 
 
 # ════════════════════════════════════════════════════════════
-# SEAI CORTEX — Agent mode with Gemini function calling
+# SEAI CORTEX — Agent mode with Groq function calling
 # ════════════════════════════════════════════════════════════
 
 AGENT_SYSTEM_PROMPT = """You are SEAI Cortex, the agentic assistant for Admerce — a hyper-local commerce platform.
@@ -124,99 +134,106 @@ Always call the appropriate function when the user's request matches one.
 Be concise. Confirm what you're doing in one short sentence before the action."""
 
 
-def _gemini_tools():
-    """Gemini function declarations for SEAI Cortex."""
+def _groq_agent_tools():
+    """Groq / OpenAI-compatible tool definitions for SEAI Cortex."""
     return [
         {
-            "function_declarations": [
-                {
-                    "name": "search_items",
-                    "description": "Search for items, services, and stores near the user",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "What the user is looking for (e.g. 'iphone', 'pizza', 'plumber')",
-                            }
-                        },
-                        "required": ["query"],
+            "type": "function",
+            "function": {
+                "name": "search_items",
+                "description": "Search for items, services, and stores near the user",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "What the user is looking for (e.g. 'iphone', 'pizza', 'plumber')",
+                        }
                     },
+                    "required": ["query"],
                 },
-                {
-                    "name": "book_service",
-                    "description": "Book a service from a provider",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "service": {
-                                "type": "string",
-                                "description": "The service the user wants to book",
-                            }
-                        },
-                        "required": ["service"],
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "book_service",
+                "description": "Book a service from a provider",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "service": {
+                            "type": "string",
+                            "description": "The service the user wants to book",
+                        }
                     },
+                    "required": ["service"],
                 },
-                {
-                    "name": "get_store_info",
-                    "description": "Get details about a specific store",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "store": {
-                                "type": "string",
-                                "description": "The name of the store",
-                            }
-                        },
-                        "required": ["store"],
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_store_info",
+                "description": "Get details about a specific store",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "store": {
+                            "type": "string",
+                            "description": "The name of the store",
+                        }
                     },
+                    "required": ["store"],
                 },
-            ]
-        }
+            },
+        },
     ]
 
 
 async def _handle_agent_mode(req: AskRequest, user_id: str):
-    if not GEMINI_ENABLED or genai is None:
+    if not GROQ_ENABLED or _groq_agent_client is None:
         return StreamingResponse(
             _stream_text(
-                "SEAI Cortex needs a Gemini API key. Ask support to enable it."
+                "SEAI Cortex is temporarily unavailable. Please try again shortly."
             ),
             media_type="text/event-stream",
         )
 
     try:
-        # ✅ Use GEMINI_MODEL ("gemini-2.5-flash") from llm_agent instead of the
-        # deprecated "gemini-1.5-flash" literal.
-        model = genai.GenerativeModel(
-            GEMINI_MODEL,
-            tools=_gemini_tools(),
-            system_instruction=AGENT_SYSTEM_PROMPT,
+        response = await _groq_agent_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+                {"role": "user", "content": req.query},
+            ],
+            tools=_groq_agent_tools(),
+            tool_choice="auto",
+            max_tokens=300,
+            temperature=0.4,
         )
-        chat = model.start_chat()
-        response = chat.send_message(req.query)
 
-        function_call = None
-        response_text = ""
+        msg = response.choices[0].message
 
-        for part in getattr(response, "parts", []):
-            if hasattr(part, "function_call") and part.function_call:
-                function_call = part.function_call
-                break
-            if hasattr(part, "text") and part.text:
-                response_text += part.text
+        # ── Did the model decide to call a function? ─────────
+        if getattr(msg, "tool_calls", None):
+            call = msg.tool_calls[0]
+            fn_name = call.function.name
+            try:
+                fn_args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                fn_args = {}
 
-        if function_call is None:
-            return StreamingResponse(
-                _stream_text(response_text or "Done."),
-                media_type="text/event-stream",
+            result = await _execute_agent_function(
+                fn_name, fn_args, user_id, req.lat, req.lng
             )
+            return _respond_from_result(result)
 
-        fn_name = function_call.name
-        fn_args = dict(function_call.args) if function_call.args else {}
-
-        result = await _execute_agent_function(fn_name, fn_args, user_id, req.lat, req.lng)
-        return _respond_from_result(result)
+        # ── Otherwise it responded with text ─────────────────
+        return StreamingResponse(
+            _stream_text(msg.content or "Done."),
+            media_type="text/event-stream",
+        )
 
     except Exception as e:
         print(f"❌ Cortex agent error: {e}")
