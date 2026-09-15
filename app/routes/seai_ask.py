@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends
@@ -30,12 +31,9 @@ class AskRequest(BaseModel):
     lng: float = 3.3792
     radius_km: float = 10.0
     conversation_history: List[Dict[str, str]] = []
-    mode: Optional[str] = "gpt"   # "gpt" (SEAI) | "agent" (Cortex)
+    mode: Optional[str] = "gpt"
 
 
-# ════════════════════════════════════════════════════════════
-# SYSTEM PROMPT — explicitly maps each intent to a tool
-# ════════════════════════════════════════════════════════════
 SYSTEM_PROMPT = """You are SEAI, the AI shopping assistant for Admerce — a hyper-local commerce marketplace in Nigeria.
 
 You are warm, helpful, and conversational. You speak like a knowledgeable friend who knows the local area.
@@ -44,61 +42,43 @@ You have these tools:
 
 1. search_items(query)
    Use when the user wants to FIND, SEE, BROWSE, or EXPLORE anything.
-   Examples: "find iphone", "show me pizza", "I'm looking for shoes",
-   "what's trending", "find me a plumber".
+   Examples: "find iphone", "show me pizza", "I'm looking for shoes".
 
 2. reserve_item(query, quantity)
-   Use when the user wants to RESERVE, HOLD, or BUY a physical ITEM
-   (a product listing, not a service).
-   Examples: "reserve this iphone", "hold the iPhone 14", "buy 2 of those",
-   "reserve this item at Graham Hub".
-   The `query` should be a descriptive name of the item — include the store
-   name if you know it, e.g. "iPhone 14 Graham Hub". If the user says
-   "this item" or "the same one", look at the previous messages and use
-   the item name from there.
+   Use when the user wants to RESERVE, HOLD, or BUY a physical ITEM.
+   The `query` should be the SHORTEST descriptive name of the item — the
+   product name only. Do NOT include the store name unless you cannot
+   identify the product otherwise.
+   Examples: "reserve this iphone" → query="iPhone 14"
+             "hold the iPhone 14" → query="iPhone 14"
+             "reserve this item at Graham Hub" → query="iPhone 14"
+   If the user says "this item" or "the same one", look at the previous
+   messages and extract the product name — but keep it short.
 
 3. book_service(service)
-   Use ONLY for SERVICES that a provider delivers — haircuts, repairs,
-   plumbing, catering, photography, cleaning. NOT for physical products.
-   Examples: "book a haircut", "book phone repair", "schedule a plumber".
+   Use ONLY for SERVICES — haircuts, repairs, plumbing, catering.
+   NOT for physical products.
 
 4. get_store_info(store)
    Use when the user asks about a specific store by name.
-   Examples: "tell me about Graham Hub", "what does Best Buy sell".
 
 Rules:
-- After a search, LOOK at the results before writing your reply.
-  Reference real store names, prices, and locations.
 - Never say "I found N results". Write like a person recommending things.
 - Mention travel time or distance naturally when it helps.
-- Keep responses under 40 words unless asked for detail.
-- For non-shopping questions, answer helpfully with plain text.
-
-Good examples:
-  "Graham Hub has an iPhone 14 for ₦350,000, about 30 min from you — worth a look."
-  "Three shops have what you need. The nearest is FixIt Lagos at 0.8 km."
-  "✅ Reserved 1× iPhone 14 at Graham Hub for ₦350,000. Pick up within 2 hours."
-"""
+- Keep responses under 40 words unless asked for detail."""
 
 
 def _tools():
-    """Groq / OpenAI-compatible tool definitions."""
     return [
         {
             "type": "function",
             "function": {
                 "name": "search_items",
-                "description": (
-                    "Search for products, services, and stores near the user. "
-                    "Use when the user wants to find, see, or browse anything."
-                ),
+                "description": "Search products, services, and stores near the user.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "What the user is looking for (e.g. 'iphone', 'pizza', 'plumber')",
-                        }
+                        "query": {"type": "string"},
                     },
                     "required": ["query"],
                 },
@@ -109,10 +89,9 @@ def _tools():
             "function": {
                 "name": "reserve_item",
                 "description": (
-                    "Reserve a physical ITEM (product) for the user. Only for "
-                    "products, not services. If the user says 'this item' or "
-                    "'the same one', look at the conversation history and use "
-                    "the item name from there."
+                    "Reserve a physical ITEM (product). Pass ONLY the product "
+                    "name as the query — do NOT include the store name. "
+                    "Examples: 'iPhone 14', 'Air Jordan 1', 'Samsung TV'."
                 ),
                 "parameters": {
                     "type": "object",
@@ -120,8 +99,8 @@ def _tools():
                         "query": {
                             "type": "string",
                             "description": (
-                                "Descriptive name of the item to reserve. "
-                                "Include store name if known (e.g. 'iPhone 14 Graham Hub')."
+                                "Short product name only, e.g. 'iPhone 14'. "
+                                "Do NOT include the store name."
                             ),
                         },
                         "quantity": {
@@ -138,18 +117,10 @@ def _tools():
             "type": "function",
             "function": {
                 "name": "book_service",
-                "description": (
-                    "Book a SERVICE delivered by a provider — haircut, repair, "
-                    "plumber, cleaning, catering. NOT for physical products."
-                ),
+                "description": "Book a service from a provider.",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "service": {
-                            "type": "string",
-                            "description": "The service the user wants to book",
-                        }
-                    },
+                    "properties": {"service": {"type": "string"}},
                     "required": ["service"],
                 },
             },
@@ -158,15 +129,10 @@ def _tools():
             "type": "function",
             "function": {
                 "name": "get_store_info",
-                "description": "Get details about a specific store by name.",
+                "description": "Get details about a specific store.",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "store": {
-                            "type": "string",
-                            "description": "The name of the store",
-                        }
-                    },
+                    "properties": {"store": {"type": "string"}},
                     "required": ["store"],
                 },
             },
@@ -174,42 +140,28 @@ def _tools():
     ]
 
 
-# ════════════════════════════════════════════════════════════
-# MAIN ENDPOINT
-# ════════════════════════════════════════════════════════════
 @router.post("/ask")
 async def seai_ask(
     req: AskRequest,
     current_user: Optional[dict] = Depends(get_optional_user),
 ):
     user_id = current_user["id"] if current_user else None
-
-    # Agent mode and GPT mode now share the same agentic loop.
-    # (The frontend toggles the label; the backend is the same.)
     if not GROQ_ENABLED or _groq is None:
         return await _regex_fallback(req, user_id)
-
     return await _groq_agent_loop(req, user_id)
 
 
 async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
-    """Groq reasons → picks a tool → sees results → writes the final reply."""
-
     messages: list = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    # Include prior turns for context — needed for "this item" resolution
     for m in req.conversation_history[-8:]:
         role = m.get("role", "user")
         if role in ("user", "assistant") and m.get("content"):
             messages.append({"role": role, "content": m["content"]})
-
     messages.append({"role": "user", "content": req.query})
 
-    search_results_holder: dict = {}
     cards_payload: Optional[dict] = None
 
     try:
-        # ── Step 1: Groq decides ────────────────────────────
         resp = await _groq.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
@@ -218,7 +170,6 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
             max_tokens=400,
             temperature=0.6,
         )
-
         msg = resp.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None)
 
@@ -228,7 +179,6 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
                 media_type="text/event-stream",
             )
 
-        # ── Step 2: Execute the chosen tool ─────────────────
         call = tool_calls[0]
         fn = call.function.name
         try:
@@ -236,22 +186,16 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
         except json.JSONDecodeError:
             args = {}
 
-        result = await _execute_agent_function(
-            fn, args, user_id, req.lat, req.lng
-        )
+        result = await _execute_agent_function(fn, args, user_id, req.lat, req.lng)
 
-        # If it was a search, remember the cards for the final stream
         if result.get("type") == "action" and result.get("intent") == "search_results":
             cards_payload = result["data"]
 
-        # ── Step 3: If not a search, stream the result directly ──
         if cards_payload is None:
             return _respond_from_result(result)
 
-        # ── Step 4: Groq writes the intro using real data ──
         compact = _compact_for_llm(result)
-
-        messages.append(msg)                        # the tool_call message
+        messages.append(msg)
         messages.append({
             "role": "tool",
             "tool_call_id": call.id,
@@ -265,7 +209,6 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
             temperature=0.7,
         )
         intro = (final.choices[0].message.content or "").strip().strip('"')
-
         if not intro:
             intro = _fallback_intro(cards_payload.get("results", []))
 
@@ -279,9 +222,6 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
         return await _regex_fallback(req, user_id)
 
 
-# ════════════════════════════════════════════════════════════
-# TOOL DISPATCHER
-# ════════════════════════════════════════════════════════════
 async def _execute_agent_function(
     fn_name: str, args: dict, user_id: Optional[str], lat: float, lng: float
 ) -> dict:
@@ -291,8 +231,7 @@ async def _execute_agent_function(
 
         if fn_name == "reserve_item":
             if not user_id:
-                return {"type": "text",
-                        "text": "Please log in first to reserve items."}
+                return {"type": "text", "text": "Please log in first to reserve items."}
             return await _handle_reserve_item(
                 user_id,
                 args.get("query", "").strip(),
@@ -306,49 +245,109 @@ async def _execute_agent_function(
             return await handle_get_store_info(args)
 
         return {"type": "text", "text": f"Unknown action: {fn_name}"}
-
     except Exception as e:
         print(f"❌ Agent function '{fn_name}' failed: {e}")
-        return {"type": "text",
-                "text": "I couldn't complete that action. Please try again."}
+        return {"type": "text", "text": "I couldn't complete that action."}
 
 
 # ════════════════════════════════════════════════════════════
-# RESERVE HANDLER — self-contained, uses the DB directly
+# RESERVE HANDLER — token-based fuzzy match
 # ════════════════════════════════════════════════════════════
+STOP_WORDS = {
+    "the", "a", "an", "of", "for", "this", "that", "at",
+    "in", "on", "and", "or", "to", "with", "from", "my",
+}
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase word list, minus stop words."""
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return [w for w in words if w not in STOP_WORDS and len(w) > 1]
+
+
+async def _find_best_listing(query: str) -> Optional[dict]:
+    """
+    Find the best-matching listing for a free-text query.
+
+    Strategy:
+      1. Tokenize the query (strip stop words)
+      2. Match each token against title OR store_name
+      3. Rank by number of matching tokens, then by title length
+      4. Return the top scorer
+    """
+    tokens = _tokenize(query)
+    if not tokens:
+        return None
+
+    # Build OR conditions for each token (word-boundary search)
+    or_parts = []
+    params: dict = {}
+    for i, tok in enumerate(tokens):
+        or_parts.append(
+            f"LOWER(l.title) LIKE :w{i} OR LOWER(COALESCE(s.name, '')) LIKE :w{i}"
+        )
+        params[f"w{i}"] = f"%{tok}%"
+
+    where = " OR ".join(f"({p})" for p in or_parts)
+
+    # Score = number of tokens found in title + half-score for store name.
+    score_terms = []
+    for i, tok in enumerate(tokens):
+        score_terms.append(f"CASE WHEN LOWER(l.title) LIKE :w{i} THEN 3 ELSE 0 END")
+        score_terms.append(
+            f"CASE WHEN LOWER(COALESCE(s.name, '')) LIKE :w{i} THEN 1 ELSE 0 END"
+        )
+    score_expr = " + ".join(score_terms)
+
+    sql = f"""
+        SELECT
+            l.listing_id,
+            l.title,
+            l.price,
+            l.quantity_available,
+            l.store_id,
+            s.owner_id,
+            s.name AS store_name,
+            ({score_expr}) AS score
+        FROM listings l
+        LEFT JOIN stores s ON l.store_id = s.store_id
+        WHERE ({where})
+          AND (l.quantity_available IS NULL OR l.quantity_available > 0)
+        ORDER BY score DESC, LENGTH(l.title) ASC, l.created_at DESC
+        LIMIT 5
+    """
+
+    rows = await database.fetch_all(sql, params)
+    if not rows:
+        return None
+
+    top = dict(rows[0])
+    if top.get("score", 0) <= 0:
+        return None
+    return top
+
+
 async def _handle_reserve_item(
     user_id: str, query: str, quantity: int = 1
 ) -> dict:
-    """Reserve a physical listing by title match. Returns text on success/failure."""
+    """Reserve a physical listing by fuzzy title match."""
     if not query:
-        return {"type": "text",
-                "text": "Which item would you like to reserve?"}
+        return {"type": "text", "text": "Which item would you like to reserve?"}
 
     if quantity < 1:
         quantity = 1
 
-    # 1. Find the listing
-    rows = await database.fetch_all(
-        """
-        SELECT l.listing_id, l.title, l.price, l.quantity_available,
-               l.store_id, s.owner_id, s.name AS store_name
-        FROM listings l
-        LEFT JOIN stores s ON l.store_id = s.store_id
-        WHERE LOWER(l.title) LIKE :q
-          AND (l.quantity_available IS NULL OR l.quantity_available > 0)
-        ORDER BY l.created_at DESC
-        LIMIT 5
-        """,
-        {"q": f"%{query.lower()}%"},
-    )
+    listing = await _find_best_listing(query)
 
-    if not rows:
+    if not listing:
         return {
             "type": "text",
-            "text": f"I couldn't find an item matching '{query}'. Try describing it differently.",
+            "text": (
+                f"I couldn't find an item matching '{query}'. "
+                "Try the exact product name, like 'iPhone 14'."
+            ),
         }
 
-    listing = dict(rows[0])
     listing_id = listing["listing_id"]
     storekeeper_id = listing.get("owner_id")
     store_name = listing.get("store_name") or "the store"
@@ -364,16 +363,13 @@ async def _handle_reserve_item(
         return {"type": "text",
                 "text": "That's your own listing — you can't reserve it."}
 
-    # 2. Check stock
     available = listing.get("quantity_available")
     if available is not None and available < quantity:
         return {"type": "text",
                 "text": f"Only {available} left in stock for '{title}'."}
 
-    # 3. Check wallet balance
     wallet = await database.fetch_one(
-        "SELECT balance FROM wallets WHERE user_id = :uid",
-        {"uid": user_id},
+        "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": user_id}
     )
     if not wallet:
         return {"type": "text",
@@ -389,18 +385,15 @@ async def _handle_reserve_item(
             ),
         }
 
-    # 4. Create escrow + deduct wallet atomically-ish
     order_id = f"ord_{uuid.uuid4().hex[:8]}"
     now = datetime.utcnow()
     expires_at = now + timedelta(hours=2)
 
-    # Deduct funds
     await database.execute(
         "UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid",
         {"amt": total, "uid": user_id},
     )
 
-    # Insert escrow
     await database.execute(
         """
         INSERT INTO escrow (
@@ -427,7 +420,6 @@ async def _handle_reserve_item(
         },
     )
 
-    # Log the transaction
     try:
         await database.execute(
             """
@@ -447,7 +439,6 @@ async def _handle_reserve_item(
     except Exception as e:
         print(f"⚠️  wallet_transactions insert failed: {e}")
 
-    # Decrement listing quantity if tracked
     if available is not None:
         await database.execute(
             "UPDATE listings SET quantity_available = quantity_available - :q "
@@ -464,11 +455,7 @@ async def _handle_reserve_item(
     }
 
 
-# ════════════════════════════════════════════════════════════
-# HELPERS
-# ════════════════════════════════════════════════════════════
 def _compact_for_llm(result: dict) -> dict:
-    """Trim a tool result so it fits the LLM token budget."""
     if result.get("type") != "action":
         return result
     data = result.get("data", {})
@@ -485,11 +472,7 @@ def _compact_for_llm(result: dict) -> dict:
         }
         for r in items
     ]
-    return {
-        "intent": result.get("intent"),
-        "query": data.get("query"),
-        "results": slim,
-    }
+    return {"intent": result.get("intent"), "query": data.get("query"), "results": slim}
 
 
 def _fallback_intro(results: list) -> str:
@@ -504,16 +487,11 @@ def _fallback_intro(results: list) -> str:
         if r.get("travel_minutes"):
             bits.append(f"~{r['travel_minutes']} min away")
         return " ".join(bits) + "."
-    return (
-        f"{len(results)} options nearby — the closest is "
-        f"{results[0].get('title', 'the first one')}."
-    )
+    return f"{len(results)} options nearby — the closest is {results[0].get('title', 'the first one')}."
 
 
 async def _regex_fallback(req: AskRequest, user_id: Optional[str]):
-    """Used only when Groq is unavailable."""
     intent, params = classify_intent(req.query)
-
     if intent == "search":
         r = await handle_search_items(params, req.lat, req.lng, user_id)
         return _respond_from_result(r)
@@ -535,7 +513,6 @@ async def _regex_fallback(req: AskRequest, user_id: Optional[str]):
     if intent == "get_store_info":
         r = await handle_get_store_info(params)
         return _respond_from_result(r)
-
     return StreamingResponse(
         _stream_text("I'm offline for a moment. Try again shortly."),
         media_type="text/event-stream",
@@ -554,9 +531,6 @@ def _respond_from_result(result: dict):
     )
 
 
-# ════════════════════════════════════════════════════════════
-# STREAM GENERATORS
-# ════════════════════════════════════════════════════════════
 async def _stream_text(text: str):
     words = text.split()
     for i, w in enumerate(words):
@@ -573,9 +547,6 @@ async def _stream_text_and_action(intro: str, data: dict):
     yield "data: [DONE]\n\n"
 
 
-# ════════════════════════════════════════════════════════════
-# BACKWARD COMPAT — imported by events.py
-# ════════════════════════════════════════════════════════════
 async def _process_ask(
     query: str,
     lat: float,
