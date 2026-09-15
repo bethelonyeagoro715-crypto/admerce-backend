@@ -1,15 +1,17 @@
 import os
 import json
+import asyncio
 from typing import Optional
 
 # ── Groq (primary — fastest, best free tier for chat) ────────
+GROQ_MODEL = "openai/gpt-oss-120b"
 try:
-    from groq import Groq
+    from groq import AsyncGroq
     _groq_key = os.getenv("GROQ_API_KEY")
-    _groq_client = Groq(api_key=_groq_key) if _groq_key else None
+    _groq_client = AsyncGroq(api_key=_groq_key) if _groq_key else None
     GROQ_ENABLED = _groq_client is not None
     if GROQ_ENABLED:
-        print("✅ Groq enabled (llama-3.3-70b-versatile)")
+        print(f"✅ Groq enabled ({GROQ_MODEL})")
     else:
         print("⚠️ GROQ_API_KEY not set. Groq disabled.")
 except ImportError:
@@ -18,13 +20,14 @@ except ImportError:
     print("⚠️ groq package not installed. Install with: pip install groq")
 
 # ── Google Gemini (secondary — strongest for agent + tools) ──
+GEMINI_MODEL = "gemini-2.5-flash"
 try:
     import google.generativeai as genai
     _gemini_key = os.getenv("GEMINI_API_KEY")
     if _gemini_key:
         genai.configure(api_key=_gemini_key)
         GEMINI_ENABLED = True
-        print("✅ Gemini enabled (gemini-1.5-flash)")
+        print(f"✅ Gemini enabled ({GEMINI_MODEL})")
     else:
         GEMINI_ENABLED = False
         print("⚠️ GEMINI_API_KEY not set. Gemini disabled.")
@@ -32,17 +35,18 @@ except ImportError:
     GEMINI_ENABLED = False
     print("⚠️ google-generativeai not installed. Install with: pip install google-generativeai")
 
-# ── NVIDIA NIM (tertiary — OpenAI-compatible, hosts Llama/Nemotron/DeepSeek) ──
+# ── NVIDIA NIM (tertiary — OpenAI-compatible) ────────────────
+NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 try:
-    from openai import OpenAI
+    from openai import AsyncOpenAI
     _nvidia_key = os.getenv("NVIDIA_API_KEY")
     if _nvidia_key:
-        _nvidia_client = OpenAI(
+        _nvidia_client = AsyncOpenAI(
             api_key=_nvidia_key,
             base_url="https://integrate.api.nvidia.com/v1",
         )
         NVIDIA_ENABLED = True
-        print("✅ NVIDIA NIM enabled (meta/llama-3.3-70b-instruct)")
+        print(f"✅ NVIDIA NIM enabled ({NVIDIA_MODEL})")
     else:
         _nvidia_client = None
         NVIDIA_ENABLED = False
@@ -53,7 +57,6 @@ except ImportError:
     print("⚠️ openai package not installed. Install with: pip install openai")
 
 
-# ── System prompt (shared across providers) ──────────────────
 SYSTEM_PROMPT = """You are SEAI, the AI assistant for Admerce, a hyper-local commerce platform.
 You can help users with these actions:
 - search for items near them (intent: search, params: {"query": "..."})
@@ -67,13 +70,10 @@ Keep responses brief and helpful (max 2 sentences)."""
 
 
 def _parse_response(content: str) -> dict:
-    """Turn an LLM's raw text into either an action dict or a text reply."""
     if not content:
         return {"type": "text", "text": "..."}
 
     cleaned = content.strip()
-
-    # Strip markdown code fences if present
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`").strip()
         if cleaned.lower().startswith("json"):
@@ -89,14 +89,12 @@ def _parse_response(content: str) -> dict:
     return {"type": "text", "text": cleaned}
 
 
-# ── Provider implementations ─────────────────────────────────
-
 async def _call_groq(user_query: str) -> Optional[dict]:
     if not GROQ_ENABLED:
         return None
     try:
-        response = _groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        response = await _groq_client.chat.completions.create(
+            model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_query},
@@ -115,10 +113,13 @@ async def _call_gemini(user_query: str) -> Optional[dict]:
     if not GEMINI_ENABLED:
         return None
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(
-            f"{SYSTEM_PROMPT}\n\nUser: {user_query}\nSEAI:"
-        )
+        # google.generativeai is sync; offload to a thread so it doesn't block
+        def _sync_call():
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            return model.generate_content(
+                f"{SYSTEM_PROMPT}\n\nUser: {user_query}\nSEAI:"
+            )
+        response = await asyncio.to_thread(_sync_call)
         content = getattr(response, "text", "") or ""
         return _parse_response(content)
     except Exception as e:
@@ -130,8 +131,8 @@ async def _call_nvidia(user_query: str) -> Optional[dict]:
     if not NVIDIA_ENABLED:
         return None
     try:
-        response = _nvidia_client.chat.completions.create(
-            model="meta/llama-3.3-70b-instruct",
+        response = await _nvidia_client.chat.completions.create(
+            model=NVIDIA_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_query},
@@ -146,13 +147,8 @@ async def _call_nvidia(user_query: str) -> Optional[dict]:
         return None
 
 
-# ── Public entry point ───────────────────────────────────────
-
 async def call_llm(user_query: str) -> dict:
-    """
-    Try providers in order: Groq → Gemini → NVIDIA NIM.
-    Returns {"type": "action", "data": {...}} or {"type": "text", "text": "..."}.
-    """
+    """Try providers in order: Groq → Gemini → NVIDIA."""
     for provider_fn in (_call_groq, _call_gemini, _call_nvidia):
         result = await provider_fn(user_query)
         if result is not None:
@@ -164,5 +160,4 @@ async def call_llm(user_query: str) -> dict:
     }
 
 
-# Backward-compat alias — anything still importing `call_claude` keeps working
 call_claude = call_llm

@@ -16,17 +16,31 @@ INTENT_PATTERNS = [
     ("book_service", [
         r"(book|schedule|reserve)\s+(a|an)?\s*(?P<service>.+?)(\s+for\s+(?P<date>.+))?",
         r"i\s*want\s*to\s*book\s+(?P<service>.+)",
+        r"i'?d\s+like\s+to\s+book\s+(?P<service>.+)",
     ]),
     ("search", [
+        # Direct verbs
         r"(search|find|look\s+for|show\s+me)\s+(?P<query>.+)",
+
+        # Natural language: "I'm looking for X", "I want X", "I need X"
+        r"i\s*(?:am|'?m)\s+looking\s+for\s+(?P<query>.+)",
+        r"i\s+want\s+(?:to\s+(?:see|buy|find)\s+)?(?P<query>.+)",
+        r"i\s+need\s+(?:to\s+(?:see|buy|find)\s+)?(?P<query>.+)",
+        r"i'?d\s+like\s+(?:to\s+)?(?:see|find|buy)\s+(?P<query>.+)",
+
+        # Contextual
         r"(near|around)\s+(me|here)\s*(?P<query>.+)?",
         r"(new|latest|fresh)\s*(?P<query>.+)?",
         r"(popular|trending|hot)\s*(?P<query>.+)?",
         r"(following|followed|saved)\s*(?P<query>.+)?",
+
+        # Short questions
+        r"(?:can\s+i\s+see|do\s+you\s+have|where\s+can\s+i\s+(?:get|find|buy))\s+(?P<query>.+)",
     ]),
     ("get_store_info", [
         r"(info|details)\s+(of|about)\s+(store\s+)?(?P<store>.+)",
         r"what\s+does\s+(?P<store>.+?)\s+(sell|offer|have)",
+        r"tell\s+me\s+about\s+(store\s+)?(?P<store>.+)",
     ]),
     # Agent intents
     ("reserve_item", [
@@ -49,6 +63,7 @@ INTENT_PATTERNS = [
     ]),
 ]
 
+
 def classify_intent(text: str) -> Tuple[str, Dict[str, Any]]:
     text_lower = text.lower()
     for intent, patterns in INTENT_PATTERNS:
@@ -59,6 +74,7 @@ def classify_intent(text: str) -> Tuple[str, Dict[str, Any]]:
                 params = {k: v.strip() for k, v in params.items() if v}
                 return intent, params
     return "general_qa", {}
+
 
 def _infer_recall_strategy(query: str) -> str:
     query_lower = query.lower()
@@ -71,6 +87,7 @@ def _infer_recall_strategy(query: str) -> str:
     if any(w in query_lower for w in ["following", "followed", "my stores", "saved"]):
         return "following"
     return "geo"
+
 
 # ── Service recall ─────────────────────────────────────────────
 async def _service_recall(query: str, lat: float, lng: float, radius_km: float, limit: int = 5):
@@ -101,6 +118,7 @@ async def _service_recall(query: str, lat: float, lng: float, radius_km: float, 
     results.sort(key=lambda x: x["distance_km"])
     return results[:limit]
 
+
 # ── Store recall ───────────────────────────────────────────────
 async def _store_recall(query: str, lat: float, lng: float, radius_km: float, limit: int = 5):
     rows = await database.fetch_all(
@@ -127,11 +145,12 @@ async def _store_recall(query: str, lat: float, lng: float, radius_km: float, li
     results.sort(key=lambda x: x["distance_km"])
     return results[:limit]
 
+
 # ── Unified search (items + services + stores) ─────────────────
 async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, user_id: str = None) -> dict:
-    query = params.get("query", "")
+    query = params.get("query", "").strip()
     if not query:
-        return {"type": "error", "message": "What are you looking for?"}
+        return {"type": "text", "text": "What are you looking for?"}
 
     strategy = _infer_recall_strategy(query)
 
@@ -201,7 +220,7 @@ async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, 
     top = all_results[:10]
 
     if not top:
-        return {"type": "text", "text": "I couldn't find any items, services, or stores matching that."}
+        return {"type": "text", "text": f"I couldn't find anything matching '{query}'."}
 
     return {
         "type": "action",
@@ -212,11 +231,12 @@ async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, 
         }
     }
 
+
 # ── Book a service (GPT) ───────────────────────────────────────
 async def handle_book_service(user_id: str, params: dict) -> dict:
     service_name = params.get("service", "")
     if not service_name:
-        return {"type": "error", "message": "I need to know which service you want to book."}
+        return {"type": "text", "text": "I need to know which service you want to book."}
     rows = await database.fetch_all(
         "SELECT s.service_id, s.title, s.price, u.business_name "
         "FROM services s JOIN users u ON s.provider_id = u.id "
@@ -224,7 +244,7 @@ async def handle_book_service(user_id: str, params: dict) -> dict:
         {"name": f"%{service_name}%"}
     )
     if not rows:
-        return {"type": "error", "message": f"No service found matching '{service_name}'."}
+        return {"type": "text", "text": f"No service found matching '{service_name}'."}
     service = dict(rows[0])
     return {
         "type": "action",
@@ -239,11 +259,12 @@ async def handle_book_service(user_id: str, params: dict) -> dict:
         }
     }
 
+
 # ── Get store info (GPT) ───────────────────────────────────────
 async def handle_get_store_info(params: dict) -> dict:
     store_name = params.get("store", "")
     if not store_name:
-        return {"type": "error", "message": "Which store are you asking about?"}
+        return {"type": "text", "text": "Which store are you asking about?"}
     store = await database.fetch_one(
         "SELECT store_id, name, description, address, store_image_url "
         "FROM stores WHERE name ILIKE :name LIMIT 1",
@@ -265,9 +286,11 @@ async def handle_get_store_info(params: dict) -> dict:
         }
     }
 
-# Placeholder recall helpers (unused but kept for compatibility)
+
+# Placeholder recall helpers (kept for compatibility)
 async def _embedding_recall(user_id: str, lat: float, lng: float, radius_km: float, limit: int):
     return []
+
 
 async def _collab_recall(user_id: str, lat: float, lng: float, radius_km: float, limit: int):
     return []

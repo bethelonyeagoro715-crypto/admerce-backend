@@ -11,7 +11,8 @@ from app.services.seai_agent import (
     handle_search_items,
     handle_get_store_info,
 )
-from app.services.llm_agent import call_llm, GEMINI_ENABLED, genai
+# ✅ Now also imports GEMINI_MODEL so the agent uses the same model as the chat fallback
+from app.services.llm_agent import call_llm, GEMINI_ENABLED, genai, GEMINI_MODEL
 
 router = APIRouter(prefix="/seai", tags=["SEAI Agent"])
 
@@ -185,15 +186,16 @@ async def _handle_agent_mode(req: AskRequest, user_id: str):
         )
 
     try:
+        # ✅ Use GEMINI_MODEL ("gemini-2.5-flash") from llm_agent instead of the
+        # deprecated "gemini-1.5-flash" literal.
         model = genai.GenerativeModel(
-            "gemini-1.5-flash",
+            GEMINI_MODEL,
             tools=_gemini_tools(),
             system_instruction=AGENT_SYSTEM_PROMPT,
         )
         chat = model.start_chat()
         response = chat.send_message(req.query)
 
-        # Walk through the response parts looking for a function call
         function_call = None
         response_text = ""
 
@@ -204,7 +206,6 @@ async def _handle_agent_mode(req: AskRequest, user_id: str):
             if hasattr(part, "text") and part.text:
                 response_text += part.text
 
-        # No function call → just return the text
         if function_call is None:
             return StreamingResponse(
                 _stream_text(response_text or "Done."),
@@ -228,7 +229,6 @@ async def _handle_agent_mode(req: AskRequest, user_id: str):
 async def _execute_agent_function(
     fn_name: str, args: dict, user_id: str, lat: float, lng: float
 ) -> dict:
-    """Execute whatever function Gemini decided to call."""
     try:
         if fn_name == "search_items":
             return await handle_search_items(args, lat, lng, user_id)
@@ -246,7 +246,7 @@ async def _execute_agent_function(
 
 
 # ════════════════════════════════════════════════════════════
-# Stream generators (unchanged interface — frontend already handles)
+# Stream generators
 # ════════════════════════════════════════════════════════════
 
 async def _stream_text(text: str):
@@ -268,12 +268,12 @@ async def _stream_text_and_action(action: dict):
     intro = f"I found {count} result{'s' if count != 1 else ''} matching '{query}':"
     for word in intro.split():
         yield f"data: {json.dumps({'text': word + ' '})}\n\n"
-    yield f"data: {json.dumps({'type': 'action', 'data': action['data']})}\n\n"
+    yield f"data: {json.dumps({'type': 'action', 'intent': 'search_results', 'data': action['data']})}\n\n"
     yield "data: [DONE]\n\n"
 
 
 # ════════════════════════════════════════════════════════════
-# Backward compatibility — imported by events.py and legacy callers
+# Backward compatibility — imported by events.py
 # ════════════════════════════════════════════════════════════
 
 async def _process_ask(
@@ -284,10 +284,6 @@ async def _process_ask(
     conversation_history: List[Dict[str, str]],
     user_id: Optional[str] = None,
 ):
-    """
-    Legacy entry point. Some modules (e.g. app/routes/events.py) still
-    import this. Delegates to seai_ask() with a wrapped request object.
-    """
     req = AskRequest(
         query=query,
         lat=lat,
