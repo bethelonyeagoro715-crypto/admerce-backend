@@ -42,11 +42,11 @@ class InstantPickupRequest(BaseModel):
     storekeeper_id: str
     amount: float
 
-# ---------- Helper to insert into wallet_transactions ----------
+# ---------- Helper ----------
 async def _log_wallet_transaction(
     user_id: str,
     amount: float,
-    type: str,           # 'credit' or 'debit'
+    type: str,
     description: str,
     reference: str,
     status: str = 'completed'
@@ -156,16 +156,15 @@ async def set_pin(req: SetPinRequest, current_user: dict = Depends(get_current_u
 async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
 
-    # ✅ Explicit column list. If a column is missing from the table, Postgres
-    #    will raise "column does not exist" instead of a silent KeyError.
-    wallet = await database.fetch_one(
+    row = await database.fetch_one(
         "SELECT balance, withdrawal_pin FROM wallets WHERE user_id = :uid",
         {"uid": user_id},
     )
-    if not wallet:
+    if not row:
         raise HTTPException(status_code=404, detail="Wallet not found")
 
-    # ✅ .get() instead of [] — defensive against future column renames.
+    # ✅ Convert Record → plain dict so .get() works
+    wallet = dict(row)
     withdrawal_pin = wallet.get("withdrawal_pin")
     balance = float(wallet.get("balance") or 0)
 
@@ -378,7 +377,7 @@ async def accept_reservation(req: AcceptRequest, current_user: dict = Depends(ge
 
     return {"order_id": req.order_id, "status": "accepted", "message": "Reservation accepted"}
 
-# ---------- Confirm (mark picked up) ----------
+# ---------- Confirm ----------
 @router.post("/confirm")
 async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
@@ -459,8 +458,9 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
     if escrow["status"] not in ("locked", "accepted"):
         raise HTTPException(status_code=400, detail="Order must be in 'locked' or 'accepted' state to return")
 
-    listing_id = escrow.get("listing_id")
-    quantity = escrow.get("quantity")
+    escrow_d = dict(escrow)
+    listing_id = escrow_d.get("listing_id")
+    quantity = escrow_d.get("quantity")
 
     if listing_id and quantity:
         listing = await database.fetch_one(
@@ -522,7 +522,7 @@ async def get_escrows(current_user: dict = Depends(get_current_user)):
     )
     return [dict(row) for row in rows]
 
-# ---------- Get Orders (shopper) ----------
+# ---------- Get Orders ----------
 @router.get("/orders")
 async def get_orders(
     current_user: dict = Depends(get_current_user),
@@ -547,7 +547,7 @@ async def get_orders(
     rows = await database.fetch_all(query, params)
     return [dict(row) for row in rows]
 
-# ---------- Get Order Detail (with fallbacks) ----------
+# ---------- Get Order Detail ----------
 @router.get("/order/{order_id}")
 async def get_order_detail(order_id: str, current_user: dict = Depends(get_current_user)):
     order = await database.fetch_one(
