@@ -79,7 +79,6 @@ else:
     businesses_router = None
     print("⚠️ SKIP_MODELS=1 – Heavy AI models disabled")
 
-
 # ── Background task: auto-refund expired escrow ──────────────────────────
 async def _refund_expired_escrows() -> None:
     while True:
@@ -377,6 +376,7 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ provider_availability table ready.")
 
+    # ── wallets (with backfill for the withdrawal_pin column) ────────────
     await database.execute("""
         CREATE TABLE IF NOT EXISTS wallets (
             user_id        TEXT PRIMARY KEY,
@@ -385,6 +385,11 @@ async def lifespan(app: FastAPI):
             created_at     TIMESTAMP DEFAULT NOW()
         )
     """)
+    # ✅ Backfill: if the wallets table was created by an older main.py that
+    #    didn't have withdrawal_pin, this adds it without a full drop/recreate.
+    await database.execute(
+        "ALTER TABLE wallets ADD COLUMN IF NOT EXISTS withdrawal_pin TEXT"
+    )
     print("✅ wallets table ready.")
 
     await database.execute("""
