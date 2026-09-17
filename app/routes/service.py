@@ -3,11 +3,9 @@ from pydantic import BaseModel
 from typing import Optional
 from app.db.database import database
 from app.utils.security import get_current_user
+from app.services.cloudinary_service import upload_image, upload_video   # ✅ Cloudinary
 import uuid
-import shutil
-import os
-from datetime import datetime, date, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/services", tags=["Services"])
 
@@ -31,26 +29,7 @@ class ToggleAvailabilityRequest(BaseModel):
     is_available: bool
 
 # ---------- Helpers ----------
-UPLOAD_DIR = "uploads/services"
-Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
-
-def save_uploaded_file(upload: UploadFile, service_id: str, file_type: str) -> str:
-    ext = Path(upload.filename).suffix
-    if not ext:
-        ext = ".jpg" if file_type == "image" else ".mp4"
-    filename = f"{service_id}_{file_type}{ext}"
-    file_path = Path(UPLOAD_DIR) / filename
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(upload.file, buffer)
-    return f"/uploads/services/{filename}"
-
-
 def _parse_iso_datetime(value):
-    """
-    Accept ISO 8601 strings, datetime objects, or None.
-    Returns a datetime object or None. Used before inserting into TIMESTAMP
-    columns so we never pass a str to asyncpg.
-    """
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -62,12 +41,10 @@ def _parse_iso_datetime(value):
             return None
     return None
 
-
 # ============================================================
-# STATIC ROUTES (MUST COME BEFORE DYNAMIC {service_id})
+# STATIC ROUTES
 # ============================================================
 
-# ---------- Get provider's own services ----------
 @router.get("/provider")
 async def get_provider_services(current_user: dict = Depends(get_current_user)):
     provider_id = current_user["id"]
@@ -77,8 +54,6 @@ async def get_provider_services(current_user: dict = Depends(get_current_user)):
     )
     return [dict(row) for row in rows]
 
-
-# ---------- Get provider's bookings ----------
 @router.get("/bookings/provider")
 async def get_provider_bookings(current_user: dict = Depends(get_current_user)):
     provider_id = current_user["id"]
@@ -92,8 +67,6 @@ async def get_provider_bookings(current_user: dict = Depends(get_current_user)):
 
     placeholders = ",".join([f":sid{i}" for i in range(len(service_id_list))])
     params = {f"sid{i}": sid for i, sid in enumerate(service_id_list)}
-
-    # ✅ customer_id, not client_id
     query = f"""
         SELECT sb.*, s.title AS service_title,
                COALESCE(
@@ -112,14 +85,10 @@ async def get_provider_bookings(current_user: dict = Depends(get_current_user)):
     rows = await database.fetch_all(query, params)
     return [dict(row) for row in rows]
 
-
-# ---------- Get provider stats ----------
 @router.get("/providers/stats")
 async def get_provider_stats(current_user: dict = Depends(get_current_user)):
     provider_id = current_user["id"]
 
-    # ✅ Use timedelta for the day-boundary arithmetic, and pass datetimes
-    #    (not strings) to the query.
     today = datetime.utcnow().date()
     start_dt = datetime(today.year, today.month, today.day)
     end_dt = start_dt + timedelta(days=1)
@@ -147,7 +116,6 @@ async def get_provider_stats(current_user: dict = Depends(get_current_user)):
         {"pid": provider_id},
     )
 
-    # ✅ reviews table may not exist yet — fail soft rather than 500
     rating = 0.0
     try:
         rating = await database.fetch_val(
@@ -168,15 +136,13 @@ async def get_provider_stats(current_user: dict = Depends(get_current_user)):
         "rating": float(rating),
     }
 
-
-# ---------- Toggle provider availability ----------
 @router.put("/providers/availability")
 async def update_provider_availability(
     req: ToggleAvailabilityRequest,
     current_user: dict = Depends(get_current_user),
 ):
     provider_id = current_user["id"]
-    now = datetime.utcnow()   # ✅ datetime, not isoformat()
+    now = datetime.utcnow()
     await database.execute(
         """
         INSERT INTO provider_availability (user_id, is_available, updated_at)
@@ -189,8 +155,6 @@ async def update_provider_availability(
     )
     return {"user_id": provider_id, "is_available": req.is_available}
 
-
-# ---------- Toggle service active status ----------
 @router.post("/{service_id}/toggle")
 async def toggle_service_active(
     service_id: str,
@@ -211,8 +175,6 @@ async def toggle_service_active(
     )
     return {"service_id": service_id, "is_active": new_state}
 
-
-# ---------- Delete service ----------
 @router.delete("/{service_id}")
 async def delete_service(service_id: str, current_user: dict = Depends(get_current_user)):
     service = await database.fetch_one(
@@ -228,13 +190,10 @@ async def delete_service(service_id: str, current_user: dict = Depends(get_curre
     )
     return {"message": "Service permanently deleted"}
 
-
-# ---------- Get bookings for logged-in user ----------
 @router.get("/bookings")
 async def get_bookings(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
     rows = await database.fetch_all(
-        # ✅ customer_id, not client_id
         "SELECT * FROM service_bookings "
         "WHERE customer_id = :uid OR provider_id = :uid2 "
         "ORDER BY created_at DESC",
@@ -242,8 +201,6 @@ async def get_bookings(current_user: dict = Depends(get_current_user)):
     )
     return [dict(row) for row in rows]
 
-
-# ---------- Get single booking ----------
 @router.get("/bookings/{booking_id}")
 async def get_booking(booking_id: str, current_user: dict = Depends(get_current_user)):
     row = await database.fetch_one(
@@ -253,7 +210,7 @@ async def get_booking(booking_id: str, current_user: dict = Depends(get_current_
     if not row:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-    booking = dict(row)  # ✅ so .get() works
+    booking = dict(row)
     if (
         booking.get("customer_id") != current_user["id"]
         and booking.get("provider_id") != current_user["id"]
@@ -261,8 +218,6 @@ async def get_booking(booking_id: str, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=403, detail="Access denied")
     return booking
 
-
-# ---------- Provider confirms job done ----------
 @router.post("/bookings/{booking_id}/confirm")
 async def confirm_booking(
     booking_id: str,
@@ -284,7 +239,6 @@ async def confirm_booking(
     if booking.get("status") != "locked":
         raise HTTPException(status_code=400, detail="Booking already processed")
 
-    # ✅ updated_at (not completed_at — the schema uses updated_at)
     await database.execute(
         "UPDATE service_bookings SET status = 'completed', updated_at = :now "
         "WHERE booking_id = :bid",
@@ -300,8 +254,6 @@ async def confirm_booking(
         "message": "Job marked complete, funds released.",
     }
 
-
-# ---------- Client releases funds ----------
 @router.post("/bookings/{booking_id}/complete")
 async def complete_booking(
     booking_id: str,
@@ -335,12 +287,10 @@ async def complete_booking(
         "message": "Funds released to provider.",
     }
 
-
 # ============================================================
-# DYNAMIC ROUTES (must come AFTER all static paths)
+# DYNAMIC ROUTES
 # ============================================================
 
-# ---------- Create service ----------
 @router.post("/")
 async def create_service(
     req: CreateServiceRequest, current_user: dict = Depends(get_current_user)
@@ -372,8 +322,6 @@ async def create_service(
     )
     return {"service_id": service_id, "message": "Service created"}
 
-
-# ---------- List all services (public) ----------
 @router.get("/")
 async def list_services():
     rows = await database.fetch_all(
@@ -387,8 +335,7 @@ async def list_services():
     )
     return [dict(row) for row in rows]
 
-
-# ---------- Upload service image ----------
+# ---------- Upload service image (Cloudinary) ----------
 @router.post("/{service_id}/image")
 async def upload_service_image(
     service_id: str,
@@ -404,15 +351,23 @@ async def upload_service_image(
     if service["provider_id"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    image_url = save_uploaded_file(image, service_id, "image")
+    image_bytes = await image.read()
+    print(f"📤 Uploading service image: {len(image_bytes)} bytes", flush=True)
+
+    try:
+        image_url = upload_image(image_bytes, folder="service_images")
+        print(f"✅ Cloudinary returned: {image_url}", flush=True)
+    except Exception as e:
+        print(f"❌ Cloudinary upload failed: {e!r}", flush=True)
+        raise HTTPException(status_code=500, detail="Image upload failed")
+
     await database.execute(
         "UPDATE services SET image_url = :url WHERE service_id = :sid",
         {"url": image_url, "sid": service_id},
     )
     return {"image_url": image_url}
 
-
-# ---------- Upload service video ----------
+# ---------- Upload service video (Cloudinary) ----------
 @router.post("/{service_id}/video")
 async def upload_service_video(
     service_id: str,
@@ -428,15 +383,22 @@ async def upload_service_video(
     if service["provider_id"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    video_url = save_uploaded_file(video, service_id, "video")
+    video_bytes = await video.read()
+    print(f"📤 Uploading service video: {len(video_bytes)} bytes", flush=True)
+
+    try:
+        video_url = upload_video(video_bytes, folder="service_videos")
+        print(f"✅ Cloudinary returned: {video_url}", flush=True)
+    except Exception as e:
+        print(f"❌ Cloudinary video upload failed: {e!r}", flush=True)
+        raise HTTPException(status_code=500, detail="Video upload failed")
+
     await database.execute(
         "UPDATE services SET video_url = :url WHERE service_id = :sid",
         {"url": video_url, "sid": service_id},
     )
     return {"video_url": video_url}
 
-
-# ---------- Get single service ----------
 @router.get("/{service_id}")
 async def get_service(service_id: str):
     row = await database.fetch_one(
@@ -452,8 +414,6 @@ async def get_service(service_id: str):
         raise HTTPException(status_code=404, detail="Service not found")
     return dict(row)
 
-
-# ---------- Book a service ----------
 @router.post("/{service_id}/book")
 async def book_service(
     service_id: str,
@@ -491,8 +451,6 @@ async def book_service(
 
     booking_id = uuid.uuid4().hex[:8]
     now = datetime.utcnow()
-
-    # ✅ customer_id, and parse scheduled_for to a datetime
     scheduled_dt = _parse_iso_datetime(req.scheduled_for)
 
     await database.execute(
@@ -526,8 +484,6 @@ async def book_service(
         "message": "Service booked. Funds held in escrow.",
     }
 
-
-# ---------- Get services by provider (public) ----------
 @router.get("/provider/{provider_id}")
 async def get_provider_services_by_user(provider_id: str):
     rows = await database.fetch_all(

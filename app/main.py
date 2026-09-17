@@ -12,7 +12,6 @@ from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── Cloudinary diagnostic ────────────────────────────────────────────────
 print(
     "🔑 Cloudinary env:",
     {
@@ -28,7 +27,6 @@ import app.services.cloudinary_service  # noqa: F401
 
 from app.db.database import engine, sync_engine, Base, database
 
-# ── Models ───────────────────────────────────────────────────────────────
 from app.db.service_models import ServiceModel
 from app.db.flipper_models import FlipperListingModel
 from app.db.models import EventModel
@@ -37,7 +35,6 @@ from app.db.wallet_models import WalletModel, EscrowModel
 from app.db.courier_models import CourierModel
 from app.db.user_models import UserModel
 
-# ── Routers ──────────────────────────────────────────────────────────────
 from app.routes.payment import router as payment_router
 from app.routes.storekeeper import router as storekeeper_router
 from app.routes.courier import router as courier_router
@@ -59,10 +56,8 @@ from app.routes.notifications import router as notifications_router
 
 from app.routes.shopper import router as shopper_router
 
-# ✅ Always import seai_search — it's pure DB + text ILIKE, no heavy models
 from app.routes.seai_search import router as seai_search_router
 
-# ── Conditionally import heavy AI routers ────────────────────────────────
 SKIP_MODELS = os.getenv("SKIP_MODELS") == "1"
 
 if not SKIP_MODELS:
@@ -79,7 +74,7 @@ else:
     businesses_router = None
     print("⚠️ SKIP_MODELS=1 – Heavy AI models disabled")
 
-# ── Background task: auto-refund expired escrow ──────────────────────────
+
 async def _refund_expired_escrows() -> None:
     while True:
         try:
@@ -106,13 +101,11 @@ async def _refund_expired_escrows() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── 1. Create tables from models ─────────────────────────────────────
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
 
-    # ── 2. Run schema migrations (raw SQL) ───────────────────────────────
     with sync_engine.connect() as conn:
-        # otp_codes
+        # ── otp_codes ────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS otp_codes (
                 id SERIAL PRIMARY KEY,
@@ -124,7 +117,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # stores
+        # ── stores ────────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS stores (
                 store_id TEXT PRIMARY KEY,
@@ -145,7 +138,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # listings
+        # ── listings ──────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS listings (
                 listing_id TEXT PRIMARY KEY,
@@ -165,7 +158,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # favorites
+        # ── favorites ────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS favorites (
                 user_id TEXT,
@@ -175,7 +168,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # messages
+        # ── messages ──────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -197,7 +190,7 @@ async def lifespan(app: FastAPI):
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS read BOOLEAN DEFAULT FALSE")
 
-        # listing_events
+        # ── listing_events ───────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS listing_events (
                 id SERIAL PRIMARY KEY,
@@ -207,7 +200,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # events (used by app/events.py)
+        # ── events ────────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS events (
                 id                SERIAL PRIMARY KEY,
@@ -233,7 +226,7 @@ async def lifespan(app: FastAPI):
             "CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id)"
         )
 
-        # app_settings
+        # ── app_settings ─────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
@@ -243,7 +236,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # users columns
+        # ── users columns ────────────────────────────────────
         for col, dtype in [
             ("verified", "BOOLEAN DEFAULT FALSE"),
             ("nickname", "TEXT"),
@@ -271,7 +264,7 @@ async def lifespan(app: FastAPI):
                 f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
-        # escrow columns
+        # ── escrow columns ───────────────────────────────────
         for col, dtype in [
             ("listing_id", "TEXT"),
             ("courier_id", "TEXT"),
@@ -291,12 +284,45 @@ async def lifespan(app: FastAPI):
                 f"ALTER TABLE escrow ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
-        # services.is_active
-        conn.exec_driver_sql(
-            "ALTER TABLE services ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"
-        )
+        # ── services columns (NEW — fixes the image_url 500) ─
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS services (
+                service_id TEXT PRIMARY KEY,
+                provider_id TEXT,
+                title TEXT,
+                category TEXT,
+                description TEXT,
+                price DOUBLE PRECISION,
+                duration_minutes INTEGER DEFAULT 60,
+                lat DOUBLE PRECISION,
+                lng DOUBLE PRECISION,
+                image_url TEXT,
+                video_url TEXT,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        for col, dtype in [
+            ("provider_id", "TEXT"),
+            ("title", "TEXT"),
+            ("category", "TEXT"),
+            ("description", "TEXT"),
+            ("price", "DOUBLE PRECISION"),
+            ("duration_minutes", "INTEGER DEFAULT 60"),
+            ("lat", "DOUBLE PRECISION"),
+            ("lng", "DOUBLE PRECISION"),
+            ("image_url", "TEXT"),            # ← the missing column
+            ("video_url", "TEXT"),            # ← the other missing column
+            ("is_active", "BOOLEAN DEFAULT TRUE"),
+            ("created_at", "TIMESTAMP DEFAULT NOW()"),
+            ("updated_at", "TIMESTAMP DEFAULT NOW()"),
+        ]:
+            conn.exec_driver_sql(
+                f"ALTER TABLE services ADD COLUMN IF NOT EXISTS {col} {dtype}"
+            )
 
-        # role_onboardings / user_settings / call_signals
+        # ── role_onboardings / user_settings / call_signals ──
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS role_onboardings (
                 user_id TEXT NOT NULL,
@@ -325,7 +351,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # saved_items
+        # ── saved_items ──────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS saved_items (
                 user_id    TEXT NOT NULL,
@@ -335,7 +361,7 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # baskets
+        # ── baskets ──────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS baskets (
                 user_id    TEXT PRIMARY KEY,
@@ -362,11 +388,9 @@ async def lifespan(app: FastAPI):
 
     print("✅ Schema migrations complete.")
 
-    # ── 3. Connect async database pool ───────────────────────────────────
     await database.connect()
     print("✅ Async database pool connected.")
 
-    # ── 4. Create other necessary tables (async) ─────────────────────────
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
             user_id      TEXT    PRIMARY KEY,
@@ -376,7 +400,6 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ provider_availability table ready.")
 
-    # ── wallets (with backfill for the withdrawal_pin column) ────────────
     await database.execute("""
         CREATE TABLE IF NOT EXISTS wallets (
             user_id        TEXT PRIMARY KEY,
@@ -385,8 +408,6 @@ async def lifespan(app: FastAPI):
             created_at     TIMESTAMP DEFAULT NOW()
         )
     """)
-    # ✅ Backfill: if the wallets table was created by an older main.py that
-    #    didn't have withdrawal_pin, this adds it without a full drop/recreate.
     await database.execute(
         "ALTER TABLE wallets ADD COLUMN IF NOT EXISTS withdrawal_pin TEXT"
     )
@@ -409,7 +430,6 @@ async def lifespan(app: FastAPI):
     )
     print("✅ wallet_transactions table ready.")
 
-    # ── service_bookings ─────────────────────────────────────────────────
     await database.execute("""
         CREATE TABLE IF NOT EXISTS service_bookings (
             id             SERIAL PRIMARY KEY,
@@ -427,6 +447,21 @@ async def lifespan(app: FastAPI):
             updated_at     TIMESTAMP DEFAULT NOW()
         )
     """)
+    # Backfill columns on old installs
+    for col, dtype in [
+        ("customer_id", "TEXT"),
+        ("client_id", "TEXT"),
+        ("scheduled_for", "TIMESTAMP"),
+        ("notes", "TEXT"),
+        ("location_lat", "DOUBLE PRECISION"),
+        ("location_lng", "DOUBLE PRECISION"),
+        ("status", "TEXT DEFAULT 'pending'"),
+        ("amount", "NUMERIC DEFAULT 0"),
+        ("updated_at", "TIMESTAMP DEFAULT NOW()"),
+    ]:
+        await database.execute(
+            f"ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS {col} {dtype}"
+        )
     await database.execute(
         "CREATE INDEX IF NOT EXISTS idx_service_bookings_customer ON service_bookings(customer_id)"
     )
@@ -477,7 +512,6 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ cards table ready.")
 
-    # ── 5. Start background task ─────────────────────────────────────────
     task = asyncio.create_task(_refund_expired_escrows())
     print("✅ Server is ready.")
     yield
@@ -490,7 +524,6 @@ async def lifespan(app: FastAPI):
     print("🛑 Server shut down cleanly.")
 
 
-# ── FastAPI app ──────────────────────────────────────────────────────────
 app = FastAPI(title="SEAI - Admerce Backend (Multi-Role)", lifespan=lifespan)
 
 app.add_middleware(
@@ -501,7 +534,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Static file serving ──────────────────────────────────────────────────
 BASE_DIR = os.getcwd()
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -518,7 +550,6 @@ async def serve_service_media(filename: str):
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-# ── Include all routers ──────────────────────────────────────────────────
 app.include_router(payment_router)
 app.include_router(shopper_router)
 app.include_router(storekeeper_router)
@@ -530,7 +561,7 @@ app.include_router(events_router)
 app.include_router(flipper_router)
 app.include_router(services_router)
 app.include_router(auth_router)
-app.include_router(seai_search_router)         # ✅ always mounted
+app.include_router(seai_search_router)
 if ai_tools_router:
     app.include_router(ai_tools_router)
 if seai_ask_router:
