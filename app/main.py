@@ -12,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
 load_dotenv()
 
+# ── Cloudinary diagnostic ────────────────────────────────────────────────
 print(
     "🔑 Cloudinary env:",
     {
@@ -27,6 +28,7 @@ import app.services.cloudinary_service  # noqa: F401
 
 from app.db.database import engine, sync_engine, Base, database
 
+# ── Models ───────────────────────────────────────────────────────────────
 from app.db.service_models import ServiceModel
 from app.db.flipper_models import FlipperListingModel
 from app.db.models import EventModel
@@ -35,6 +37,7 @@ from app.db.wallet_models import WalletModel, EscrowModel
 from app.db.courier_models import CourierModel
 from app.db.user_models import UserModel
 
+# ── Routers ──────────────────────────────────────────────────────────────
 from app.routes.payment import router as payment_router
 from app.routes.storekeeper import router as storekeeper_router
 from app.routes.courier import router as courier_router
@@ -56,8 +59,10 @@ from app.routes.notifications import router as notifications_router
 
 from app.routes.shopper import router as shopper_router
 
+# ✅ Always import seai_search — it's pure DB + text ILIKE, no heavy models
 from app.routes.seai_search import router as seai_search_router
 
+# ── Conditionally import heavy AI routers ────────────────────────────────
 SKIP_MODELS = os.getenv("SKIP_MODELS") == "1"
 
 if not SKIP_MODELS:
@@ -75,6 +80,7 @@ else:
     print("⚠️ SKIP_MODELS=1 – Heavy AI models disabled")
 
 
+# ── Background task: auto-refund expired escrow ──────────────────────────
 async def _refund_expired_escrows() -> None:
     while True:
         try:
@@ -101,9 +107,11 @@ async def _refund_expired_escrows() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── 1. Create tables from models ─────────────────────────────────────
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
 
+    # ── 2. Run schema migrations (raw SQL) ───────────────────────────────
     with sync_engine.connect() as conn:
         # ── otp_codes ────────────────────────────────────────
         conn.exec_driver_sql("""
@@ -284,7 +292,7 @@ async def lifespan(app: FastAPI):
                 f"ALTER TABLE escrow ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
-        # ── services columns (NEW — fixes the image_url 500) ─
+        # ── services columns ─────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS services (
                 service_id TEXT PRIMARY KEY,
@@ -312,8 +320,8 @@ async def lifespan(app: FastAPI):
             ("duration_minutes", "INTEGER DEFAULT 60"),
             ("lat", "DOUBLE PRECISION"),
             ("lng", "DOUBLE PRECISION"),
-            ("image_url", "TEXT"),            # ← the missing column
-            ("video_url", "TEXT"),            # ← the other missing column
+            ("image_url", "TEXT"),
+            ("video_url", "TEXT"),
             ("is_active", "BOOLEAN DEFAULT TRUE"),
             ("created_at", "TIMESTAMP DEFAULT NOW()"),
             ("updated_at", "TIMESTAMP DEFAULT NOW()"),
@@ -360,6 +368,34 @@ async def lifespan(app: FastAPI):
                 PRIMARY KEY (user_id, listing_id)
             )
         """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_saved_items_user ON saved_items(user_id)"
+        )
+
+        # ── wanted_alerts ────────────────────────────────────
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS wanted_alerts (
+                id          SERIAL PRIMARY KEY,
+                user_id     TEXT NOT NULL,
+                title       TEXT NOT NULL,
+                notes       TEXT,
+                category    TEXT,
+                budget      NUMERIC,
+                lat         DOUBLE PRECISION,
+                lng         DOUBLE PRECISION,
+                is_active   BOOLEAN DEFAULT TRUE,
+                created_at  TIMESTAMP DEFAULT NOW(),
+                expires_at  TIMESTAMP
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_wanted_alerts_user "
+            "ON wanted_alerts(user_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_wanted_alerts_active "
+            "ON wanted_alerts(is_active, expires_at)"
+        )
 
         # ── baskets ──────────────────────────────────────────
         conn.exec_driver_sql("""
@@ -382,15 +418,14 @@ async def lifespan(app: FastAPI):
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_basket_items_user ON basket_items(user_id)"
         )
-        conn.exec_driver_sql(
-            "CREATE INDEX IF NOT EXISTS idx_saved_items_user ON saved_items(user_id)"
-        )
 
     print("✅ Schema migrations complete.")
 
+    # ── 3. Connect async database pool ───────────────────────────────────
     await database.connect()
     print("✅ Async database pool connected.")
 
+    # ── 4. Create other necessary tables (async) ─────────────────────────
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
             user_id      TEXT    PRIMARY KEY,
@@ -447,7 +482,6 @@ async def lifespan(app: FastAPI):
             updated_at     TIMESTAMP DEFAULT NOW()
         )
     """)
-    # Backfill columns on old installs
     for col, dtype in [
         ("customer_id", "TEXT"),
         ("client_id", "TEXT"),
@@ -512,6 +546,7 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ cards table ready.")
 
+    # ── 5. Start background task ─────────────────────────────────────────
     task = asyncio.create_task(_refund_expired_escrows())
     print("✅ Server is ready.")
     yield
@@ -524,6 +559,7 @@ async def lifespan(app: FastAPI):
     print("🛑 Server shut down cleanly.")
 
 
+# ── FastAPI app ──────────────────────────────────────────────────────────
 app = FastAPI(title="SEAI - Admerce Backend (Multi-Role)", lifespan=lifespan)
 
 app.add_middleware(
@@ -534,6 +570,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Static file serving (legacy uploads) ─────────────────────────────────
 BASE_DIR = os.getcwd()
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -550,6 +587,7 @@ async def serve_service_media(filename: str):
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
+# ── Include all routers ──────────────────────────────────────────────────
 app.include_router(payment_router)
 app.include_router(shopper_router)
 app.include_router(storekeeper_router)
