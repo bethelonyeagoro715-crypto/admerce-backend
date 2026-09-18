@@ -398,17 +398,33 @@ async def lifespan(app: FastAPI):
         )
 
         # ── baskets ──────────────────────────────────────────
+        # ✅ basket_id added so basket.py's queries (by basket_id) work.
+        #    Populated from user_id for existing rows.
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS baskets (
                 user_id    TEXT PRIMARY KEY,
+                basket_id  TEXT,
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        conn.exec_driver_sql(
+            "ALTER TABLE baskets ADD COLUMN IF NOT EXISTS basket_id TEXT"
+        )
+        conn.exec_driver_sql(
+            "UPDATE baskets SET basket_id = user_id WHERE basket_id IS NULL"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_baskets_basket_id "
+            "ON baskets(basket_id)"
+        )
+
+        # ── basket_items ─────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS basket_items (
                 id         SERIAL PRIMARY KEY,
                 user_id    TEXT NOT NULL,
+                basket_id  TEXT,
                 listing_id TEXT NOT NULL,
                 store_id   TEXT NOT NULL,
                 quantity   INTEGER DEFAULT 1,
@@ -416,7 +432,18 @@ async def lifespan(app: FastAPI):
             )
         """)
         conn.exec_driver_sql(
-            "CREATE INDEX IF NOT EXISTS idx_basket_items_user ON basket_items(user_id)"
+            "ALTER TABLE basket_items ADD COLUMN IF NOT EXISTS basket_id TEXT"
+        )
+        conn.exec_driver_sql(
+            "UPDATE basket_items SET basket_id = user_id WHERE basket_id IS NULL"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_basket_items_user "
+            "ON basket_items(user_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_basket_items_basket_id "
+            "ON basket_items(basket_id)"
         )
 
     print("✅ Schema migrations complete.")
