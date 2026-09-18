@@ -1,7 +1,7 @@
 import math
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 from app.db.database import database
@@ -40,6 +40,28 @@ class RankRequest(BaseModel):
     lng: float
     candidate_ids: List[str]
     session_items_shown: List[str] = []
+
+# ✅ New models for wanted alerts
+class WantedAlertCreate(BaseModel):
+    title: str = Field(..., min_length=2, max_length=120)
+    notes: Optional[str] = Field(None, max_length=500)
+    category: Optional[str] = Field(None, max_length=50)
+    budget: Optional[float] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+class WantedAlertResponse(BaseModel):
+    id: int
+    user_id: str
+    title: str
+    notes: Optional[str] = None
+    category: Optional[str] = None
+    budget: Optional[float] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    is_active: bool = True
+    created_at: Optional[str] = None
+    expires_at: Optional[str] = None
 
 # ---------- Existing ranking endpoint (legacy) ----------
 @router.post("/feed")
@@ -198,7 +220,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
         return {"feed": [], "total": 0, "model_used": model is not None}
 
     now = datetime.utcnow()
-    # Safe parameter binding instead of string-interpolated placeholders.
     id_params = {f"id_{i}": cid for i, cid in enumerate(req.candidate_ids)}
     placeholders = ",".join(f":{k}" for k in id_params.keys())
     rows = await database.fetch_all(
@@ -211,11 +232,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
     if not rows:
         return {"feed": [], "total": 0, "model_used": model is not None}
 
-    # ── Fallback path: no ranking model loaded ─────────────────────
-    # Instead of 503, return the real listings in the order they were
-    # received. The shopper flow treats this as a valid ranking — it
-    # just isn't reordered. The response shape matches the model path
-    # so the frontend renders identically.
     if model is None:
         rows_by_id = {row["listing_id"]: row for row in rows}
         fallback_feed = []
@@ -244,7 +260,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
                 break
         return {"feed": fallback_feed, "total": len(fallback_feed), "model_used": False}
 
-    # ── Model path: score every candidate and rank ─────────────────
     scored = []
     for row in rows:
         dist = haversine(req.lat, req.lng, row["lat"], row["lng"])
@@ -272,7 +287,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
 
     scored.sort(key=lambda x: x["score"], reverse=True)
 
-    # Re-ranking policies (Diversity & Burst)
     final_feed = []
     store_counter = {}
     shown_set = set(req.session_items_shown)
@@ -287,7 +301,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
         shown_set.add(lid)
         store_counter[sid] = store_counter.get(sid, 0) + 1
 
-    # Fill up to 20 items if diversity filtering cut it short
     if len(final_feed) < min(20, len(scored)):
         for item in scored:
             if item["listing_id"] in shown_set:
@@ -345,11 +358,9 @@ async def _following_recall(user_id: str, lat: float, lng: float, radius_km: flo
     return [dict(row) for row in rows]
 
 async def _embedding_recall(user_id: str, lat: float, lng: float, radius_km: float, limit: int):
-    # PLACEHOLDER – implement when user embeddings are stored
     return []
 
 async def _collab_recall(user_id: str, lat: float, lng: float, radius_km: float, limit: int):
-    # PLACEHOLDER – requires collaborative filtering model
     return []
 
 # ==================== FOLLOW / UNFOLLOW STORE ====================
@@ -401,6 +412,131 @@ async def get_save_status(listing_id: str, current_user: dict = Depends(get_curr
         {"uid": current_user["id"], "lid": listing_id}
     )
     return {"saved": row is not None}
+
+# ==================== SAVED ITEMS LIST ====================
+@router.get("/saved")
+async def get_saved_items(current_user: dict = Depends(get_current_user)):
+    """
+    Return the current user's saved listings, joined with listing + store
+    details so the frontend has everything it needs to render cards.
+    """
+    user_id = current_user["id"]
+    rows = await database.fetch_all(
+        """
+        SELECT
+            si.listing_id,
+            si.created_at AS saved_at,
+            l.title,
+            l.price,
+            l.image_url,
+            l.store_id,
+            s.name AS store_name
+        FROM saved_items si
+        LEFT JOIN listings l ON si.listing_id = l.listing_id
+        LEFT JOIN stores   s ON l.store_id     = s.store_id
+        WHERE si.user_id = :uid
+        ORDER BY si.created_at DESC
+        """,
+        {"uid": user_id},
+    )
+    return [dict(row) for row in rows]
+
+# ==================== WANTED ALERTS ====================
+@router.get("/wanted")
+async def list_wanted_alerts(current_user: dict = Depends(get_current_user)):
+    """
+    Return the current user's own wanted alerts (things they posted that
+    they want to buy). Active first, then newest.
+    """
+    rows = await database.fetch_all(
+        """
+        SELECT id, user_id, title, notes, category, budget, lat, lng,
+               is_active, created_at, expires_at
+        FROM wanted_alerts
+        WHERE user_id = :uid
+        ORDER BY is_active DESC, created_at DESC
+        """,
+        {"uid": current_user["id"]},
+    )
+    return [dict(row) for row in rows]
+
+@router.post("/wanted", status_code=201)
+async def create_wanted_alert(
+    req: WantedAlertCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a wanted alert. Auto-expires after 30 days."""
+    if req.budget is not None and req.budget < 0:
+        raise HTTPException(status_code=400, detail="Budget cannot be negative")
+
+    now = datetime.utcnow()
+    expires_at = now + timedelta(days=30)
+
+    row = await database.fetch_one(
+        """
+        INSERT INTO wanted_alerts
+            (user_id, title, notes, category, budget, lat, lng, is_active, created_at, expires_at)
+        VALUES
+            (:uid, :title, :notes, :cat, :budget, :lat, :lng, TRUE, :now, :expires)
+        RETURNING id, user_id, title, notes, category, budget, lat, lng,
+                  is_active, created_at, expires_at
+        """,
+        {
+            "uid": current_user["id"],
+            "title": req.title.strip(),
+            "notes": req.notes.strip() if req.notes else None,
+            "cat": req.category.strip() if req.category else None,
+            "budget": req.budget,
+            "lat": req.lat,
+            "lng": req.lng,
+            "now": now,
+            "expires": expires_at,
+        },
+    )
+    return dict(row) if row else {"message": "Created"}
+
+@router.delete("/wanted/{alert_id}")
+async def delete_wanted_alert(
+    alert_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete one of the user's own wanted alerts."""
+    row = await database.fetch_one(
+        "SELECT user_id FROM wanted_alerts WHERE id = :aid",
+        {"aid": alert_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    if row["user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not your alert")
+
+    await database.execute(
+        "DELETE FROM wanted_alerts WHERE id = :aid",
+        {"aid": alert_id},
+    )
+    return {"message": "Deleted", "id": alert_id}
+
+@router.patch("/wanted/{alert_id}/toggle")
+async def toggle_wanted_alert(
+    alert_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Toggle active/paused for one of the user's own wanted alerts."""
+    row = await database.fetch_one(
+        "SELECT user_id, is_active FROM wanted_alerts WHERE id = :aid",
+        {"aid": alert_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    if row["user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not your alert")
+
+    new_state = not row["is_active"]
+    await database.execute(
+        "UPDATE wanted_alerts SET is_active = :state WHERE id = :aid",
+        {"state": new_state, "aid": alert_id},
+    )
+    return {"id": alert_id, "is_active": new_state}
 
 # ==================== PROVIDER SERVICES (public) ====================
 @router.get("/provider/{provider_id}")
