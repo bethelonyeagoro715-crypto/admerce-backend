@@ -287,6 +287,9 @@ async def lifespan(app: FastAPI):
             ("order_id", "TEXT"),
             ("created_at", "TIMESTAMP DEFAULT NOW()"),
             ("expires_at", "TIMESTAMP"),
+            # ✅ FIX: basket.py writes this column but it never existed.
+            #    Matches order_stores.id (SERIAL → INTEGER).
+            ("order_store_id", "INTEGER"),
         ]:
             conn.exec_driver_sql(
                 f"ALTER TABLE escrow ADD COLUMN IF NOT EXISTS {col} {dtype}"
@@ -398,8 +401,6 @@ async def lifespan(app: FastAPI):
         )
 
         # ── baskets ──────────────────────────────────────────
-        # ✅ basket_id added so basket.py's queries (by basket_id) work.
-        #    Populated from user_id for existing rows.
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS baskets (
                 user_id    TEXT PRIMARY KEY,
@@ -444,6 +445,83 @@ async def lifespan(app: FastAPI):
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_basket_items_basket_id "
             "ON basket_items(basket_id)"
+        )
+
+        # ══════════════════════════════════════════════════════
+        # ✅ ORDERS + ORDER_ITEMS + ORDER_STORES
+        #    These were referenced by basket.py's checkout flow but
+        #    never created — so every checkout attempt has 500'd at
+        #    the first INSERT. Creating them here makes the flow work.
+        # ══════════════════════════════════════════════════════
+
+        # ── orders ───────────────────────────────────────────
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id      TEXT PRIMARY KEY,
+                user_id       TEXT NOT NULL,
+                total_amount  NUMERIC DEFAULT 0,
+                status        TEXT DEFAULT 'pending',
+                created_at    TIMESTAMP DEFAULT NOW(),
+                updated_at    TIMESTAMP DEFAULT NOW(),
+                expires_at    TIMESTAMP
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC)"
+        )
+
+        # ── order_stores ─────────────────────────────────────
+        # One row per (order, store). A basket with items from 3 stores
+        # creates 3 order_stores rows for a single order.
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS order_stores (
+                id                SERIAL PRIMARY KEY,
+                order_id          TEXT NOT NULL,
+                store_id          TEXT NOT NULL,
+                escrow_id         TEXT,
+                subtotal          NUMERIC DEFAULT 0,
+                delivery_fee      NUMERIC DEFAULT 0,
+                fulfillment_type  TEXT DEFAULT 'pickup',
+                status            TEXT DEFAULT 'pending',
+                created_at        TIMESTAMP DEFAULT NOW(),
+                updated_at        TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_order_stores_order "
+            "ON order_stores(order_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_order_stores_store "
+            "ON order_stores(store_id)"
+        )
+
+        # ── order_items ──────────────────────────────────────
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS order_items (
+                id          SERIAL PRIMARY KEY,
+                order_id    TEXT NOT NULL,
+                store_id    TEXT,
+                listing_id  TEXT NOT NULL,
+                quantity    INTEGER NOT NULL,
+                price       NUMERIC NOT NULL,
+                subtotal    NUMERIC NOT NULL,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_order_items_order "
+            "ON order_items(order_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_order_items_listing "
+            "ON order_items(listing_id)"
         )
 
     print("✅ Schema migrations complete.")
