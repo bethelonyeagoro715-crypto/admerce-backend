@@ -59,10 +59,8 @@ from app.routes.notifications import router as notifications_router
 
 from app.routes.shopper import router as shopper_router
 
-# ✅ Always import seai_search — it's pure DB + text ILIKE, no heavy models
 from app.routes.seai_search import router as seai_search_router
 
-# ── Conditionally import heavy AI routers ────────────────────────────────
 SKIP_MODELS = os.getenv("SKIP_MODELS") == "1"
 
 if not SKIP_MODELS:
@@ -107,11 +105,9 @@ async def _refund_expired_escrows() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── 1. Create tables from models ─────────────────────────────────────
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
 
-    # ── 2. Run schema migrations (raw SQL) ───────────────────────────────
     with sync_engine.connect() as conn:
         # ── otp_codes ────────────────────────────────────────
         conn.exec_driver_sql("""
@@ -197,6 +193,36 @@ async def lifespan(app: FastAPI):
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS receiver_name TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS read BOOLEAN DEFAULT FALSE")
+        # ✅ NEW — WhatsApp/Telegram-style chat features
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER")
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP")
+        conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP")
+        conn.exec_driver_sql(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_for_everyone BOOLEAN DEFAULT FALSE"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_messages_conversation_created "
+            "ON messages(conversation_id, created_at DESC)"
+        )
+
+        # ── message_deletions ────────────────────────────────
+        # ✅ NEW — per-user "delete for me". Hides a message from one user
+        #    without removing it for the other participant.
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS message_deletions (
+                user_id     TEXT NOT NULL,
+                message_id  INTEGER NOT NULL,
+                deleted_at  TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (user_id, message_id)
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_message_deletions_user "
+            "ON message_deletions(user_id)"
+        )
 
         # ── listing_events ───────────────────────────────────
         conn.exec_driver_sql("""
@@ -287,8 +313,6 @@ async def lifespan(app: FastAPI):
             ("order_id", "TEXT"),
             ("created_at", "TIMESTAMP DEFAULT NOW()"),
             ("expires_at", "TIMESTAMP"),
-            # ✅ FIX: basket.py writes this column but it never existed.
-            #    Matches order_stores.id (SERIAL → INTEGER).
             ("order_store_id", "INTEGER"),
         ]:
             conn.exec_driver_sql(
@@ -448,13 +472,8 @@ async def lifespan(app: FastAPI):
         )
 
         # ══════════════════════════════════════════════════════
-        # ✅ ORDERS + ORDER_ITEMS + ORDER_STORES
-        #    These were referenced by basket.py's checkout flow but
-        #    never created — so every checkout attempt has 500'd at
-        #    the first INSERT. Creating them here makes the flow work.
+        # ORDERS + ORDER_ITEMS + ORDER_STORES
         # ══════════════════════════════════════════════════════
-
-        # ── orders ───────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS orders (
                 order_id      TEXT PRIMARY KEY,
@@ -476,9 +495,6 @@ async def lifespan(app: FastAPI):
             "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC)"
         )
 
-        # ── order_stores ─────────────────────────────────────
-        # One row per (order, store). A basket with items from 3 stores
-        # creates 3 order_stores rows for a single order.
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS order_stores (
                 id                SERIAL PRIMARY KEY,
@@ -502,7 +518,6 @@ async def lifespan(app: FastAPI):
             "ON order_stores(store_id)"
         )
 
-        # ── order_items ──────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS order_items (
                 id          SERIAL PRIMARY KEY,
@@ -530,7 +545,7 @@ async def lifespan(app: FastAPI):
     await database.connect()
     print("✅ Async database pool connected.")
 
-    # ── 4. Create other necessary tables (async) ─────────────────────────
+    # ── 4. Async tables ──────────────────────────────────────────────────
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
             user_id      TEXT    PRIMARY KEY,
@@ -651,7 +666,7 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ cards table ready.")
 
-    # ── 5. Start background task ─────────────────────────────────────────
+    # ── 5. Background task ───────────────────────────────────────────────
     task = asyncio.create_task(_refund_expired_escrows())
     print("✅ Server is ready.")
     yield
@@ -675,7 +690,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Static file serving (legacy uploads) ─────────────────────────────────
 BASE_DIR = os.getcwd()
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -692,7 +706,6 @@ async def serve_service_media(filename: str):
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-# ── Include all routers ──────────────────────────────────────────────────
 app.include_router(payment_router)
 app.include_router(shopper_router)
 app.include_router(storekeeper_router)
