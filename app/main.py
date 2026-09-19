@@ -12,7 +12,6 @@ from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── Cloudinary diagnostic ────────────────────────────────────────────────
 print(
     "🔑 Cloudinary env:",
     {
@@ -28,7 +27,6 @@ import app.services.cloudinary_service  # noqa: F401
 
 from app.db.database import engine, sync_engine, Base, database
 
-# ── Models ───────────────────────────────────────────────────────────────
 from app.db.service_models import ServiceModel
 from app.db.flipper_models import FlipperListingModel
 from app.db.models import EventModel
@@ -37,7 +35,6 @@ from app.db.wallet_models import WalletModel, EscrowModel
 from app.db.courier_models import CourierModel
 from app.db.user_models import UserModel
 
-# ── Routers ──────────────────────────────────────────────────────────────
 from app.routes.payment import router as payment_router
 from app.routes.storekeeper import router as storekeeper_router
 from app.routes.courier import router as courier_router
@@ -78,7 +75,6 @@ else:
     print("⚠️ SKIP_MODELS=1 – Heavy AI models disabled")
 
 
-# ── Background task: auto-refund expired escrow ──────────────────────────
 async def _refund_expired_escrows() -> None:
     while True:
         try:
@@ -108,8 +104,12 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
 
-    with sync_engine.connect() as conn:
-        # ── otp_codes ────────────────────────────────────────
+    # ✅ FIX: `sync_engine.begin()` commits the DDL on block exit.
+    #    `sync_engine.connect()` in SQLAlchemy 2.0 rolls back on exit, so every
+    #    CREATE TABLE / ALTER TABLE in this block was being silently discarded.
+    #    This is why message_deletions, orders, order_items, and order_stores
+    #    never appeared in the database.
+    with sync_engine.begin() as conn:
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS otp_codes (
                 id SERIAL PRIMARY KEY,
@@ -121,7 +121,6 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # ── stores ────────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS stores (
                 store_id TEXT PRIMARY KEY,
@@ -142,7 +141,6 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # ── listings ──────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS listings (
                 listing_id TEXT PRIMARY KEY,
@@ -162,7 +160,6 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # ── favorites ────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS favorites (
                 user_id TEXT,
@@ -172,7 +169,6 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # ── messages ──────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -193,7 +189,6 @@ async def lifespan(app: FastAPI):
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS receiver_name TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS read BOOLEAN DEFAULT FALSE")
-        # ✅ NEW — WhatsApp/Telegram-style chat features
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP")
         conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP")
@@ -208,9 +203,6 @@ async def lifespan(app: FastAPI):
             "ON messages(conversation_id, created_at DESC)"
         )
 
-        # ── message_deletions ────────────────────────────────
-        # ✅ NEW — per-user "delete for me". Hides a message from one user
-        #    without removing it for the other participant.
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS message_deletions (
                 user_id     TEXT NOT NULL,
@@ -224,7 +216,6 @@ async def lifespan(app: FastAPI):
             "ON message_deletions(user_id)"
         )
 
-        # ── listing_events ───────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS listing_events (
                 id SERIAL PRIMARY KEY,
@@ -234,7 +225,6 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # ── events ────────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS events (
                 id                SERIAL PRIMARY KEY,
@@ -260,7 +250,6 @@ async def lifespan(app: FastAPI):
             "CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id)"
         )
 
-        # ── app_settings ─────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
@@ -270,7 +259,6 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # ── users columns ────────────────────────────────────
         for col, dtype in [
             ("verified", "BOOLEAN DEFAULT FALSE"),
             ("nickname", "TEXT"),
@@ -298,7 +286,6 @@ async def lifespan(app: FastAPI):
                 f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
-        # ── escrow columns ───────────────────────────────────
         for col, dtype in [
             ("listing_id", "TEXT"),
             ("courier_id", "TEXT"),
@@ -319,7 +306,6 @@ async def lifespan(app: FastAPI):
                 f"ALTER TABLE escrow ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
-        # ── services columns ─────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS services (
                 service_id TEXT PRIMARY KEY,
@@ -357,7 +343,6 @@ async def lifespan(app: FastAPI):
                 f"ALTER TABLE services ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
-        # ── role_onboardings / user_settings / call_signals ──
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS role_onboardings (
                 user_id TEXT NOT NULL,
@@ -386,7 +371,6 @@ async def lifespan(app: FastAPI):
             )
         """)
 
-        # ── saved_items ──────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS saved_items (
                 user_id    TEXT NOT NULL,
@@ -399,7 +383,6 @@ async def lifespan(app: FastAPI):
             "CREATE INDEX IF NOT EXISTS idx_saved_items_user ON saved_items(user_id)"
         )
 
-        # ── wanted_alerts ────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS wanted_alerts (
                 id          SERIAL PRIMARY KEY,
@@ -424,7 +407,6 @@ async def lifespan(app: FastAPI):
             "ON wanted_alerts(is_active, expires_at)"
         )
 
-        # ── baskets ──────────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS baskets (
                 user_id    TEXT PRIMARY KEY,
@@ -444,7 +426,6 @@ async def lifespan(app: FastAPI):
             "ON baskets(basket_id)"
         )
 
-        # ── basket_items ─────────────────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS basket_items (
                 id         SERIAL PRIMARY KEY,
@@ -471,9 +452,6 @@ async def lifespan(app: FastAPI):
             "ON basket_items(basket_id)"
         )
 
-        # ══════════════════════════════════════════════════════
-        # ORDERS + ORDER_ITEMS + ORDER_STORES
-        # ══════════════════════════════════════════════════════
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS orders (
                 order_id      TEXT PRIMARY KEY,
@@ -541,11 +519,9 @@ async def lifespan(app: FastAPI):
 
     print("✅ Schema migrations complete.")
 
-    # ── 3. Connect async database pool ───────────────────────────────────
     await database.connect()
     print("✅ Async database pool connected.")
 
-    # ── 4. Async tables ──────────────────────────────────────────────────
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
             user_id      TEXT    PRIMARY KEY,
@@ -666,7 +642,6 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ cards table ready.")
 
-    # ── 5. Background task ───────────────────────────────────────────────
     task = asyncio.create_task(_refund_expired_escrows())
     print("✅ Server is ready.")
     yield
@@ -679,7 +654,6 @@ async def lifespan(app: FastAPI):
     print("🛑 Server shut down cleanly.")
 
 
-# ── FastAPI app ──────────────────────────────────────────────────────────
 app = FastAPI(title="SEAI - Admerce Backend (Multi-Role)", lifespan=lifespan)
 
 app.add_middleware(
