@@ -36,7 +36,7 @@ INTENT_PATTERNS = [
         r"(add|create|list)\s+(a|an)?\s*(new\s+)?listing\s+(for\s+)?(?P<title>.+?)\s*(₦|price\s*)?(?P<price>\d+)",
     ]),
     ("create_service", [
-        r"(add|create|set up)\s+(a|an)?\s*(new\s+)?service\s+(for\s+)?(?P<title>.+?)\s*(₦|price\s*)?(?P<price>\d+)",
+        r"(add|create|set\s+up)\s+(a|an)?\s*(new\s+)?service\s+(for\s+)?(?P<title>.+?)\s*(₦|price\s*)?(?P<price>\d+)",
     ]),
     ("message_storekeeper", [
         r"(message|chat|text)\s+(with\s+)?(?P<storekeeper_id>.+)",
@@ -46,7 +46,15 @@ INTENT_PATTERNS = [
     ]),
 ]
 
-STOP_WORDS = {"me", "a", "an", "the", "for", "some", "any", "please"}
+STOP_WORDS = {
+    "me", "a", "an", "the", "for", "some", "any", "please",
+    # Verbs/fillers that would pollute the search filter
+    "i", "you", "need", "want", "looking", "look", "find", "show",
+    "search", "see", "buy", "get", "give", "help", "can", "could",
+    "would", "have", "has", "is", "are", "was", "were", "be",
+    "to", "of", "in", "on", "at", "with", "from", "my", "your",
+    "and", "or", "but", "if", "as", "so",
+}
 
 
 def _clean_query(q: str) -> str:
@@ -67,17 +75,10 @@ def classify_intent(text: str) -> Tuple[str, Dict[str, Any]]:
     return "general_qa", {}
 
 
-def _infer_recall_strategy(query: str) -> str:
-    ql = query.lower()
-    if any(w in ql for w in ["near", "close", "around", "proximity", "nearby"]):
-        return "geo"
-    if any(w in ql for w in ["new", "latest", "fresh", "just arrived", "recent"]):
-        return "forage"
-    if any(w in ql for w in ["popular", "trending", "hot", "top", "best"]):
-        return "trending"
-    if any(w in ql for w in ["following", "followed", "my stores", "saved"]):
-        return "following"
-    return "geo"
+def _tokenize(text: str) -> list[str]:
+    """Extract meaningful tokens for filtering a search query."""
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return [w for w in words if w not in STOP_WORDS and len(w) > 1]
 
 
 def _travel_minutes(distance_km: float) -> int:
@@ -98,15 +99,48 @@ def _directions_url(lat: float, lng: float, label: str = "") -> str:
     return url
 
 
-async def _enrich_items(listing_ids: list[str]) -> Dict[str, dict]:
-    if not listing_ids:
-        return {}
+# ════════════════════════════════════════════════════════════
+# ✅ NEW — direct query-relevant item search
+# Filters by the user's actual query FIRST, then ranks by
+# (relevance, distance). Only returns items the user asked for.
+# ════════════════════════════════════════════════════════════
+async def _query_relevant_items(
+    query: str,
+    lat: float,
+    lng: float,
+    radius_km: float = 50.0,
+    limit: int = 5,
+) -> list[dict]:
+    tokens = _tokenize(query)
+    if not tokens:
+        return []
 
-    id_params = {f"id_{i}": lid for i, lid in enumerate(listing_ids)}
-    placeholders = ",".join(f":{k}" for k in id_params.keys())
+    # Build OR conditions across title / category / store name
+    or_parts = []
+    params: dict = {}
+    for i, tok in enumerate(tokens):
+        or_parts.append(
+            f"LOWER(l.title) LIKE :w{i} "
+            f"OR LOWER(COALESCE(l.category, '')) LIKE :w{i} "
+            f"OR LOWER(COALESCE(s.name, '')) LIKE :w{i}"
+        )
+        params[f"w{i}"] = f"%{tok}%"
 
-    rows = await database.fetch_all(
-        f"""
+    where = " OR ".join(f"({p})" for p in or_parts)
+
+    # Relevance score — title match weights 3, category 2, store name 1
+    score_terms = []
+    for i, tok in enumerate(tokens):
+        score_terms.append(f"CASE WHEN LOWER(l.title) LIKE :w{i} THEN 3 ELSE 0 END")
+        score_terms.append(
+            f"CASE WHEN LOWER(COALESCE(l.category, '')) LIKE :w{i} THEN 2 ELSE 0 END"
+        )
+        score_terms.append(
+            f"CASE WHEN LOWER(COALESCE(s.name, '')) LIKE :w{i} THEN 1 ELSE 0 END"
+        )
+    score_expr = " + ".join(score_terms)
+
+    sql = f"""
         SELECT
             l.listing_id,
             l.title,
@@ -119,55 +153,127 @@ async def _enrich_items(listing_ids: list[str]) -> Dict[str, dict]:
             s.store_image_url AS store_image_url,
             s.address        AS store_address,
             s.latitude       AS store_lat,
-            s.longitude      AS store_lng
+            s.longitude      AS store_lng,
+            ({score_expr})   AS relevance
         FROM listings l
         LEFT JOIN stores s ON l.store_id = s.store_id
-        WHERE l.listing_id IN ({placeholders})
-        """,
-        id_params,
-    )
-    return {row["listing_id"]: dict(row) for row in rows}
+        WHERE ({where})
+          AND (l.quantity_available IS NULL OR l.quantity_available > 0)
+        LIMIT 100
+    """
+
+    try:
+        rows = await database.fetch_all(sql, params)
+    except Exception as e:
+        print(f"⚠️  _query_relevant_items sql error: {e}")
+        return []
+
+    scored = []
+    for row in rows:
+        d = dict(row)
+        relevance = int(d.get("relevance") or 0)
+        if relevance <= 0:
+            continue
+
+        item_lat = d.get("store_lat") if d.get("store_lat") is not None else d.get("listing_lat")
+        item_lng = d.get("store_lng") if d.get("store_lng") is not None else d.get("listing_lng")
+
+        if item_lat is None or item_lng is None:
+            # No coords — can't compute distance. Rank it last but keep it.
+            d["distance_km"] = 9999.0
+        else:
+            dist = haversine(lat, lng, item_lat, item_lng)
+            if dist > radius_km:
+                continue
+            d["distance_km"] = dist
+
+        # ✅ Combined score — relevance dominates (×100), distance breaks ties
+        d["_score"] = relevance * 100 - d["distance_km"]
+        scored.append(d)
+
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+    return scored[:limit]
 
 
-async def _service_recall(query: str, lat: float, lng: float, radius_km: float, limit: int = 5):
+# ════════════════════════════════════════════════════════════
+# Service recall — unchanged but capped at 3
+# ════════════════════════════════════════════════════════════
+async def _service_recall(query: str, lat: float, lng: float, radius_km: float, limit: int = 3):
+    tokens = _tokenize(query)
+    if not tokens:
+        return []
+
+    or_parts = []
+    params: dict = {}
+    for i, tok in enumerate(tokens):
+        or_parts.append(f"LOWER(s.title) LIKE :w{i}")
+        params[f"w{i}"] = f"%{tok}%"
+
+    where = " OR ".join(f"({p})" for p in or_parts)
+
     rows = await database.fetch_all(
-        "SELECT s.service_id, s.title, s.price, s.lat, s.lng, s.image_url, s.provider_id, "
-        "s.address, "
-        "u.business_name, u.business_image_url "
-        "FROM services s JOIN users u ON s.provider_id = u.id "
-        "WHERE s.is_active = TRUE AND s.title ILIKE :q "
-        "ORDER BY s.created_at DESC LIMIT 100",
-        {"q": f"%{query}%"}
+        f"""
+        SELECT s.service_id, s.title, s.price, s.lat, s.lng, s.image_url,
+               s.provider_id, s.address,
+               u.business_name, u.business_image_url
+        FROM services s
+        JOIN users u ON s.provider_id = u.id
+        WHERE s.is_active = TRUE
+          AND ({where})
+        LIMIT 50
+        """,
+        params,
     )
     results = []
     for row in rows:
         d = dict(row)
+        if d["lat"] is None or d["lng"] is None:
+            continue
         dist = haversine(lat, lng, d["lat"], d["lng"])
-        if dist <= radius_km:
-            results.append({
-                "type": "service",
-                "id": d["service_id"],
-                "title": d["title"],
-                "price": d["price"],
-                "distance_km": round(dist, 3),
-                "image_url": d["image_url"],
-                "business_name": d["business_name"] or "Service Provider",
-                "business_image_url": d["business_image_url"],
-                "provider_id": d["provider_id"],
-                "lat": d["lat"],
-                "lng": d["lng"],
-                "address": d.get("address"),
-            })
+        if dist > radius_km:
+            continue
+        results.append({
+            "type": "service",
+            "id": d["service_id"],
+            "title": d["title"],
+            "price": d["price"],
+            "distance_km": round(dist, 2),
+            "image_url": d["image_url"],
+            "business_name": d["business_name"] or "Service Provider",
+            "business_image_url": d["business_image_url"],
+            "provider_id": d["provider_id"],
+            "lat": d["lat"],
+            "lng": d["lng"],
+            "address": d.get("address"),
+        })
     results.sort(key=lambda x: x["distance_km"])
     return results[:limit]
 
 
-async def _store_recall(query: str, lat: float, lng: float, radius_km: float, limit: int = 5):
+# ════════════════════════════════════════════════════════════
+# Store recall — capped at 3
+# ════════════════════════════════════════════════════════════
+async def _store_recall(query: str, lat: float, lng: float, radius_km: float, limit: int = 3):
+    tokens = _tokenize(query)
+    if not tokens:
+        return []
+
+    or_parts = []
+    params: dict = {}
+    for i, tok in enumerate(tokens):
+        or_parts.append(f"LOWER(name) LIKE :w{i}")
+        params[f"w{i}"] = f"%{tok}%"
+
+    where = " OR ".join(f"({p})" for p in or_parts)
+
     rows = await database.fetch_all(
-        "SELECT store_id, name, description, address, latitude, longitude, store_image_url "
-        "FROM stores WHERE name ILIKE :q "
-        "ORDER BY name LIMIT 100",
-        {"q": f"%{query}%"}
+        f"""
+        SELECT store_id, name, description, address, latitude, longitude, store_image_url
+        FROM stores
+        WHERE ({where})
+        LIMIT 50
+        """,
+        params,
     )
     results = []
     for row in rows:
@@ -175,86 +281,72 @@ async def _store_recall(query: str, lat: float, lng: float, radius_km: float, li
         if d["latitude"] is None or d["longitude"] is None:
             continue
         dist = haversine(lat, lng, d["latitude"], d["longitude"])
-        if dist <= radius_km:
-            results.append({
-                "type": "store",
-                "id": d["store_id"],
-                "title": d["name"],
-                "distance_km": round(dist, 3),
-                "image_url": d["store_image_url"],
-                "description": d.get("description", ""),
-                "address": d.get("address"),
-                "lat": d["latitude"],
-                "lng": d["longitude"],
-            })
+        if dist > radius_km:
+            continue
+        results.append({
+            "type": "store",
+            "id": d["store_id"],
+            "title": d["name"],
+            "distance_km": round(dist, 2),
+            "image_url": d["store_image_url"],
+            "description": d.get("description", ""),
+            "address": d.get("address"),
+            "lat": d["latitude"],
+            "lng": d["longitude"],
+        })
     results.sort(key=lambda x: x["distance_km"])
     return results[:limit]
 
 
-async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, user_id: str = None) -> dict:
+# ════════════════════════════════════════════════════════════
+# ✅ REWRITTEN — strict query filter, tiered fallback, capped output
+# ════════════════════════════════════════════════════════════
+async def handle_search_items(
+    params: dict,
+    lat: float = 6.5,
+    lng: float = 3.4,
+    user_id: str = None,
+) -> dict:
     query = params.get("query", "").strip()
     if not query:
         return {"type": "text", "text": "What are you looking for?"}
 
-    strategy = _infer_recall_strategy(query)
+    # ── Tier 1: items matching the query ─────────────────────
+    items = await _query_relevant_items(query, lat, lng, radius_km=50, limit=5)
 
-    try:
-        if strategy == "geo":
-            items = await _geo_recall(lat, lng, radius_km=50, limit=10)
-        elif strategy == "forage":
-            items = await _forage_recall(lat, lng, radius_km=50, limit=10)
-        elif strategy == "trending":
-            items = await _trending_recall(lat, lng, radius_km=50, limit=10)
-        elif strategy == "following" and user_id:
-            items = await _following_recall(user_id, lat, lng, radius_km=50, limit=10)
-        else:
-            items = await _geo_recall(lat, lng, radius_km=50, limit=10)
-    except Exception:
-        items = []
+    # ── Tier 2 (only if no items): services matching the query
+    services = []
+    if not items:
+        try:
+            services = await _service_recall(query, lat, lng, radius_km=50, limit=3)
+        except Exception:
+            services = []
 
-    try:
-        enriched = await _enrich_items([it["listing_id"] for it in items])
-    except Exception as e:
-        print(f"⚠️  enrich error: {e}")
-        enriched = {}
+    # ── Tier 3 (only if no items AND no services): stores
+    stores = []
+    if not items and not services:
+        try:
+            stores = await _store_recall(query, lat, lng, radius_km=50, limit=3)
+        except Exception:
+            stores = []
 
-    try:
-        services = await _service_recall(query, lat, lng, radius_km=50, limit=5)
-    except Exception:
-        services = []
+    all_results: list[dict] = []
 
-    try:
-        stores = await _store_recall(query, lat, lng, radius_km=50, limit=5)
-    except Exception:
-        stores = []
-
-    all_results = []
-
-    for it in items:
-        lid = it["listing_id"]
-        meta = enriched.get(lid, {})
-
-        r_lat = meta.get("store_lat") if meta.get("store_lat") is not None else meta.get("listing_lat")
-        r_lng = meta.get("store_lng") if meta.get("store_lng") is not None else meta.get("listing_lng")
-
-        if r_lat is not None and r_lng is not None:
-            dist = haversine(lat, lng, r_lat, r_lng)
-        else:
-            dist = it.get("distance_km", 0)
-            r_lat, r_lng = None, None
-
+    for d in items:
+        r_lat = d.get("store_lat") if d.get("store_lat") is not None else d.get("listing_lat")
+        r_lng = d.get("store_lng") if d.get("store_lng") is not None else d.get("listing_lng")
         all_results.append({
             "type": "item",
-            "listing_id": lid,
-            "title": meta.get("title") or it.get("title") or "No Title",
-            "price": meta.get("price"),
-            "distance_km": round(dist, 2),
-            "travel_minutes": _travel_minutes(dist),
-            "image_url": meta.get("image_url"),
-            "store_name": meta.get("store_name") or "Local Store",
-            "store_id": meta.get("store_id") or it.get("store_id"),
-            "store_image_url": meta.get("store_image_url"),
-            "address": meta.get("store_address"),
+            "listing_id": d["listing_id"],
+            "title": d["title"] or "No Title",
+            "price": d["price"],
+            "distance_km": round(d["distance_km"], 2),
+            "travel_minutes": _travel_minutes(d["distance_km"]),
+            "image_url": d.get("image_url"),
+            "store_name": d.get("store_name") or "Local Store",
+            "store_id": d.get("store_id"),
+            "store_image_url": d.get("store_image_url"),
+            "address": d.get("store_address"),
             "latitude": r_lat,
             "longitude": r_lng,
             "directions_url": _directions_url(r_lat, r_lng) if r_lat and r_lng else None,
@@ -275,7 +367,10 @@ async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, 
             "address": sv.get("address"),
             "latitude": sv.get("lat"),
             "longitude": sv.get("lng"),
-            "directions_url": _directions_url(sv["lat"], sv["lng"]) if sv.get("lat") and sv.get("lng") else None,
+            "directions_url": (
+                _directions_url(sv["lat"], sv["lng"])
+                if sv.get("lat") and sv.get("lng") else None
+            ),
         })
 
     for st in stores:
@@ -290,18 +385,22 @@ async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, 
             "address": st.get("address"),
             "latitude": st.get("latitude"),
             "longitude": st.get("longitude"),
-            "directions_url": _directions_url(st["latitude"], st["longitude"]) if st.get("latitude") and st.get("longitude") else None,
+            "directions_url": (
+                _directions_url(st["latitude"], st["longitude"])
+                if st.get("latitude") and st.get("longitude") else None
+            ),
         })
 
-    all_results.sort(key=lambda x: x["distance_km"])
-    top = all_results[:10]
+    # Cap at 5 — even across the tiers
+    top = all_results[:5]
 
     if not top:
         return {
             "type": "text",
             "text": (
                 f"Nothing near you currently matches '{query}'. "
-                "Try a broader term, or ask me to post a wanted alert so you're notified when one is listed."
+                "Try a broader term, or ask me to post a wanted alert so "
+                "you're notified when one is listed."
             ),
         }
 
@@ -312,6 +411,7 @@ async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, 
     }
 
 
+# ── Book service ───────────────────────────────────────────────
 async def handle_book_service(user_id: str, params: dict) -> dict:
     service_name = params.get("service", "")
     if not service_name:
@@ -320,7 +420,7 @@ async def handle_book_service(user_id: str, params: dict) -> dict:
         "SELECT s.service_id, s.title, s.price, u.business_name "
         "FROM services s JOIN users u ON s.provider_id = u.id "
         "WHERE s.is_active = TRUE AND s.title ILIKE :name LIMIT 1",
-        {"name": f"%{service_name}%"}
+        {"name": f"%{service_name}%"},
     )
     if not rows:
         return {"type": "text", "text": f"No service found matching '{service_name}'."}
@@ -338,6 +438,7 @@ async def handle_book_service(user_id: str, params: dict) -> dict:
     }
 
 
+# ── Store info ─────────────────────────────────────────────────
 async def handle_get_store_info(params: dict) -> dict:
     name = params.get("store", "")
     if not name:
@@ -361,11 +462,15 @@ async def handle_get_store_info(params: dict) -> dict:
             "image_url": st["store_image_url"],
             "latitude": st["latitude"],
             "longitude": st["longitude"],
-            "directions_url": _directions_url(st["latitude"], st["longitude"]) if st["latitude"] and st["longitude"] else None,
+            "directions_url": (
+                _directions_url(st["latitude"], st["longitude"])
+                if st["latitude"] and st["longitude"] else None
+            ),
         },
     }
 
 
+# ── Placeholder recall functions (kept for import compatibility) ─
 async def _embedding_recall(user_id, lat, lng, radius_km, limit):
     return []
 

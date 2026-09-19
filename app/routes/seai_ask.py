@@ -34,9 +34,6 @@ class AskRequest(BaseModel):
     mode: Optional[str] = "gpt"
 
 
-# ════════════════════════════════════════════════════════════
-# SYSTEM PROMPT — "item" only. Never "product."
-# ════════════════════════════════════════════════════════════
 SYSTEM_PROMPT = """You are SEAI, the AI shopping assistant for Admerce — a hyper-local commerce marketplace in Nigeria.
 
 You have FOUR tools:
@@ -81,6 +78,13 @@ You have FOUR tools:
 For these, respond CONVERSATIONALLY using the previous turn as context.
 NEVER re-call the previous tool for a follow-up question.
 
+### When you have search results:
+The tools already return ONLY the closest, most relevant matches for the query.
+- Mention the CLOSEST ONE or TWO results — never list them all.
+- Lead with distance ("Just 2 min away…", "Right around the corner at…").
+- Say the store name and price naturally.
+- Do NOT enumerate more than 2 items unless the user asked to see everything.
+
 ### Explaining empty results:
 If your previous search found nothing and the user asks why, explain clearly:
 - "I searched listings and services in your area and none matched '<query>'."
@@ -88,6 +92,7 @@ If your previous search found nothing and the user asks why, explain clearly:
 
 ### Never:
 - Say "product" — always "item"
+- Dump every result the tool returned — pick the best 1–2
 - Repeat the previous response verbatim
 - Say "I found N results"
 - Call search_items as a reflex for conversational messages
@@ -551,10 +556,11 @@ async def _handle_reserve_item(
 
 
 def _compact_for_llm(result: dict) -> dict:
+    """✅ Cap at 3 — enough for the LLM to pick the top 1–2, not enough to dump."""
     if result.get("type") != "action":
         return result
     data = result.get("data", {})
-    items = data.get("results", [])[:6]
+    items = data.get("results", [])[:3]
     slim = [
         {
             "type": r.get("type"),
