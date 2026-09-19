@@ -20,8 +20,6 @@ class UpdateBasketItemRequest(BaseModel):
     quantity: int
 
 class CheckoutRequest(BaseModel):
-    # Currently we set fulfillment type per store, but we'll use default 'pickup'
-    # Later we can extend to per-store.
     pass
 
 # ---------- Helper: Get or Create Basket ----------
@@ -34,7 +32,6 @@ async def get_or_create_basket(user_id: str) -> str:
         return basket["basket_id"]
 
     basket_id = f"basket_{uuid.uuid4().hex[:12]}"
-    # ✅ FIX: pass datetime object directly — asyncpg rejects ISO strings for TIMESTAMP
     now = datetime.utcnow()
     await database.execute(
         "INSERT INTO baskets (basket_id, user_id, created_at, updated_at) "
@@ -52,13 +49,22 @@ async def add_to_basket(
     user_id = current_user["id"]
     basket_id = await get_or_create_basket(user_id)
 
-    # Get listing details
+    # Get listing details (we need price for validation & basket_items lookup,
+    # but price is NOT stored on basket_items — it lives on listings)
     listing = await database.fetch_one(
-        "SELECT price FROM listings WHERE listing_id = :lid",
+        "SELECT price, store_id FROM listings WHERE listing_id = :lid",
         {"lid": req.listing_id}
     )
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
+
+    # ✅ Validate that the client-supplied store_id matches the listing's real store.
+    # Prevents polluting the basket with a wrong store_id.
+    if listing["store_id"] and req.store_id and listing["store_id"] != req.store_id:
+        raise HTTPException(
+            status_code=400,
+            detail="store_id does not match the listing's actual store."
+        )
 
     # Check if item already in basket
     existing = await database.fetch_one(
@@ -66,7 +72,6 @@ async def add_to_basket(
         {"bid": basket_id, "lid": req.listing_id}
     )
 
-    # ✅ FIX: datetime object, not .isoformat()
     now = datetime.utcnow()
     if existing:
         new_qty = existing["quantity"] + req.quantity
@@ -75,17 +80,18 @@ async def add_to_basket(
             {"qty": new_qty, "now": now, "id": existing["id"]}
         )
     else:
+        # ✅ FIX: removed `price` column — it does not exist on basket_items.
+        # Price is always read from `listings` via JOIN.
         await database.execute(
             """
-            INSERT INTO basket_items (basket_id, listing_id, store_id, quantity, price, added_at)
-            VALUES (:bid, :lid, :sid, :qty, :price, :now)
+            INSERT INTO basket_items (basket_id, listing_id, store_id, quantity, added_at)
+            VALUES (:bid, :lid, :sid, :qty, :now)
             """,
             {
                 "bid": basket_id,
                 "lid": req.listing_id,
                 "sid": req.store_id,
                 "qty": req.quantity,
-                "price": listing["price"],
                 "now": now
             }
         )
@@ -134,13 +140,15 @@ async def get_basket(current_user: dict = Depends(get_current_user)):
                 "items": [],
                 "subtotal": 0
             }
-        subtotal = item["quantity"] * item["price"]
+        # ✅ FIX: use `current_price` (from listings JOIN), not `price`
+        unit_price = item["current_price"]
+        subtotal = item["quantity"] * unit_price
         store_groups[store_id]["items"].append({
             "id": item["id"],
             "listing_id": item["listing_id"],
             "name": item["product_name"],
             "quantity": item["quantity"],
-            "price": item["price"],
+            "price": unit_price,
             "subtotal": subtotal
         })
         store_groups[store_id]["subtotal"] += subtotal
@@ -253,7 +261,6 @@ async def checkout(
     total_order = 0
 
     for item in items:
-        # Check stock
         if item["quantity_available"] is not None and item["quantity_available"] < item["quantity"]:
             raise HTTPException(
                 status_code=400,
@@ -267,13 +274,15 @@ async def checkout(
                 "items": [],
                 "subtotal": 0,
                 "delivery_fee": 0,
-                "fulfillment_type": "pickup"  # could be made per-store later
+                "fulfillment_type": "pickup"
             }
-        subtotal = item["quantity"] * item["price"]
+        # ✅ FIX: use `current_price` from listings JOIN
+        unit_price = item["current_price"]
+        subtotal = item["quantity"] * unit_price
         store_totals[store_id]["items"].append({
             "listing_id": item["listing_id"],
             "quantity": item["quantity"],
-            "price": item["price"],
+            "price": unit_price,
             "subtotal": subtotal
         })
         store_totals[store_id]["subtotal"] += subtotal
@@ -289,7 +298,6 @@ async def checkout(
 
     # 4. Create order
     order_id = f"ord_{uuid.uuid4().hex[:12]}"
-    # ✅ FIX: datetime objects, not .isoformat()
     now = datetime.utcnow()
     expires_at = datetime.utcnow() + timedelta(hours=2)
 
@@ -303,7 +311,6 @@ async def checkout(
 
     # 5. Create order items & order stores + escrow per store
     for store_id, store_data in store_totals.items():
-        # Create order_store
         store_order_id = f"so_{uuid.uuid4().hex[:10]}"
         await database.execute(
             """
@@ -319,14 +326,12 @@ async def checkout(
                 "now": now
             }
         )
-        # Get the order_store id
         order_store_row = await database.fetch_one(
             "SELECT id FROM order_stores WHERE order_id = :oid AND store_id = :sid",
             {"oid": order_id, "sid": store_id}
         )
         order_store_id = order_store_row["id"]
 
-        # Create order items for this store
         for item in store_data["items"]:
             await database.execute(
                 """
@@ -343,20 +348,16 @@ async def checkout(
                 }
             )
 
-            # Reduce stock
             await database.execute(
                 "UPDATE listings SET quantity_available = quantity_available - :qty WHERE listing_id = :lid",
                 {"qty": item["quantity"], "lid": item["listing_id"]}
             )
 
-        # Create escrow for this store
-        # We need storekeeper_id
         storekeeper_row = await database.fetch_one(
             "SELECT owner_id FROM stores WHERE store_id = :sid",
             {"sid": store_id}
         )
         if not storekeeper_row:
-            # If store not found, skip (shouldn't happen)
             continue
         storekeeper_id = storekeeper_row["owner_id"]
 
@@ -372,7 +373,7 @@ async def checkout(
                 "osid": order_store_id,
                 "sid": user_id,
                 "skid": storekeeper_id,
-                "lid": store_data["items"][0]["listing_id"],  # simplified, we could store multiple
+                "lid": store_data["items"][0]["listing_id"],
                 "qty": sum(item["quantity"] for item in store_data["items"]),
                 "item_amt": store_data["subtotal"],
                 "dfee": store_data.get("delivery_fee", 0),
@@ -381,7 +382,6 @@ async def checkout(
             }
         )
 
-        # Update order_store with escrow_id
         await database.execute(
             "UPDATE order_stores SET escrow_id = :eid WHERE id = :osid",
             {"eid": escrow_id, "osid": order_store_id}
@@ -399,7 +399,7 @@ async def checkout(
         {"bid": basket["basket_id"]}
     )
 
-    # 8. Notify storekeepers (for each store)
+    # 8. Notify storekeepers
     for store_id in store_totals.keys():
         store = await database.fetch_one(
             "SELECT owner_id FROM stores WHERE store_id = :sid",
