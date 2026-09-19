@@ -69,28 +69,26 @@ async def add_to_basket(
 
     if existing:
         new_qty = existing["quantity"] + req.quantity
-        # ✅ FIX: dropped `added_at` — column does not exist on basket_items.
         await database.execute(
             "UPDATE basket_items SET quantity = :qty WHERE id = :id",
             {"qty": new_qty, "id": existing["id"]}
         )
     else:
-        # ✅ FIX: dropped `added_at` from INSERT. Schema only has:
-        # basket_id, listing_id, store_id, quantity (plus id, maybe created_at default).
+        # ✅ FIX: include `user_id` — NOT NULL column on basket_items.
         await database.execute(
             """
-            INSERT INTO basket_items (basket_id, listing_id, store_id, quantity)
-            VALUES (:bid, :lid, :sid, :qty)
+            INSERT INTO basket_items (basket_id, user_id, listing_id, store_id, quantity)
+            VALUES (:bid, :uid, :lid, :sid, :qty)
             """,
             {
                 "bid": basket_id,
+                "uid": user_id,
                 "lid": req.listing_id,
                 "sid": req.store_id,
                 "qty": req.quantity
             }
         )
 
-    # Update basket timestamp (this one is fine — baskets HAS updated_at)
     await database.execute(
         "UPDATE baskets SET updated_at = :now WHERE basket_id = :bid",
         {"now": datetime.utcnow(), "bid": basket_id}
