@@ -49,8 +49,6 @@ async def add_to_basket(
     user_id = current_user["id"]
     basket_id = await get_or_create_basket(user_id)
 
-    # Get listing details (we need price for validation & basket_items lookup,
-    # but price is NOT stored on basket_items — it lives on listings)
     listing = await database.fetch_one(
         "SELECT price, store_id FROM listings WHERE listing_id = :lid",
         {"lid": req.listing_id}
@@ -58,48 +56,44 @@ async def add_to_basket(
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
 
-    # ✅ Validate that the client-supplied store_id matches the listing's real store.
-    # Prevents polluting the basket with a wrong store_id.
     if listing["store_id"] and req.store_id and listing["store_id"] != req.store_id:
         raise HTTPException(
             status_code=400,
             detail="store_id does not match the listing's actual store."
         )
 
-    # Check if item already in basket
     existing = await database.fetch_one(
         "SELECT id, quantity FROM basket_items WHERE basket_id = :bid AND listing_id = :lid",
         {"bid": basket_id, "lid": req.listing_id}
     )
 
-    now = datetime.utcnow()
     if existing:
         new_qty = existing["quantity"] + req.quantity
+        # ✅ FIX: dropped `added_at` — column does not exist on basket_items.
         await database.execute(
-            "UPDATE basket_items SET quantity = :qty, added_at = :now WHERE id = :id",
-            {"qty": new_qty, "now": now, "id": existing["id"]}
+            "UPDATE basket_items SET quantity = :qty WHERE id = :id",
+            {"qty": new_qty, "id": existing["id"]}
         )
     else:
-        # ✅ FIX: removed `price` column — it does not exist on basket_items.
-        # Price is always read from `listings` via JOIN.
+        # ✅ FIX: dropped `added_at` from INSERT. Schema only has:
+        # basket_id, listing_id, store_id, quantity (plus id, maybe created_at default).
         await database.execute(
             """
-            INSERT INTO basket_items (basket_id, listing_id, store_id, quantity, added_at)
-            VALUES (:bid, :lid, :sid, :qty, :now)
+            INSERT INTO basket_items (basket_id, listing_id, store_id, quantity)
+            VALUES (:bid, :lid, :sid, :qty)
             """,
             {
                 "bid": basket_id,
                 "lid": req.listing_id,
                 "sid": req.store_id,
-                "qty": req.quantity,
-                "now": now
+                "qty": req.quantity
             }
         )
 
-    # Update basket timestamp
+    # Update basket timestamp (this one is fine — baskets HAS updated_at)
     await database.execute(
         "UPDATE baskets SET updated_at = :now WHERE basket_id = :bid",
-        {"now": now, "bid": basket_id}
+        {"now": datetime.utcnow(), "bid": basket_id}
     )
 
     return {
@@ -129,7 +123,6 @@ async def get_basket(current_user: dict = Depends(get_current_user)):
         {"bid": basket["basket_id"]}
     )
 
-    # Group by store
     store_groups = {}
     total = 0
     for item in items:
@@ -140,7 +133,6 @@ async def get_basket(current_user: dict = Depends(get_current_user)):
                 "items": [],
                 "subtotal": 0
             }
-        # ✅ FIX: use `current_price` (from listings JOIN), not `price`
         unit_price = item["current_price"]
         subtotal = item["quantity"] * unit_price
         store_groups[store_id]["items"].append({
@@ -234,7 +226,6 @@ async def checkout(
 ):
     user_id = current_user["id"]
 
-    # 1. Get basket
     basket = await database.fetch_one(
         "SELECT basket_id FROM baskets WHERE user_id = :uid",
         {"uid": user_id}
@@ -256,7 +247,6 @@ async def checkout(
     if not items:
         raise HTTPException(status_code=400, detail="Basket is empty")
 
-    # 2. Validate stock & calculate totals
     store_totals = {}
     total_order = 0
 
@@ -276,7 +266,6 @@ async def checkout(
                 "delivery_fee": 0,
                 "fulfillment_type": "pickup"
             }
-        # ✅ FIX: use `current_price` from listings JOIN
         unit_price = item["current_price"]
         subtotal = item["quantity"] * unit_price
         store_totals[store_id]["items"].append({
@@ -288,7 +277,6 @@ async def checkout(
         store_totals[store_id]["subtotal"] += subtotal
         total_order += subtotal
 
-    # 3. Check wallet balance
     wallet = await database.fetch_one(
         "SELECT balance FROM wallets WHERE user_id = :uid",
         {"uid": user_id}
@@ -296,7 +284,6 @@ async def checkout(
     if not wallet or wallet["balance"] < total_order:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    # 4. Create order
     order_id = f"ord_{uuid.uuid4().hex[:12]}"
     now = datetime.utcnow()
     expires_at = datetime.utcnow() + timedelta(hours=2)
@@ -309,7 +296,6 @@ async def checkout(
         {"oid": order_id, "uid": user_id, "total": total_order, "now": now, "exp": expires_at}
     )
 
-    # 5. Create order items & order stores + escrow per store
     for store_id, store_data in store_totals.items():
         store_order_id = f"so_{uuid.uuid4().hex[:10]}"
         await database.execute(
@@ -387,19 +373,16 @@ async def checkout(
             {"eid": escrow_id, "osid": order_store_id}
         )
 
-    # 6. Deduct total from wallet
     await database.execute(
         "UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid",
         {"amt": total_order, "uid": user_id}
     )
 
-    # 7. Clear basket
     await database.execute(
         "DELETE FROM basket_items WHERE basket_id = :bid",
         {"bid": basket["basket_id"]}
     )
 
-    # 8. Notify storekeepers
     for store_id in store_totals.keys():
         store = await database.fetch_one(
             "SELECT owner_id FROM stores WHERE store_id = :sid",
