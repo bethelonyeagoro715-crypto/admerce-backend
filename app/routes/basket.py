@@ -34,7 +34,8 @@ async def get_or_create_basket(user_id: str) -> str:
         return basket["basket_id"]
 
     basket_id = f"basket_{uuid.uuid4().hex[:12]}"
-    now = datetime.utcnow().isoformat()
+    # ✅ FIX: pass datetime object directly — asyncpg rejects ISO strings for TIMESTAMP
+    now = datetime.utcnow()
     await database.execute(
         "INSERT INTO baskets (basket_id, user_id, created_at, updated_at) "
         "VALUES (:bid, :uid, :now, :now)",
@@ -65,7 +66,8 @@ async def add_to_basket(
         {"bid": basket_id, "lid": req.listing_id}
     )
 
-    now = datetime.utcnow().isoformat()
+    # ✅ FIX: datetime object, not .isoformat()
+    now = datetime.utcnow()
     if existing:
         new_qty = existing["quantity"] + req.quantity
         await database.execute(
@@ -287,8 +289,9 @@ async def checkout(
 
     # 4. Create order
     order_id = f"ord_{uuid.uuid4().hex[:12]}"
-    now = datetime.utcnow().isoformat()
-    expires_at = (datetime.utcnow() + timedelta(hours=2)).isoformat()
+    # ✅ FIX: datetime objects, not .isoformat()
+    now = datetime.utcnow()
+    expires_at = datetime.utcnow() + timedelta(hours=2)
 
     await database.execute(
         """
