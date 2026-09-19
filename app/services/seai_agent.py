@@ -99,10 +99,6 @@ def _directions_url(lat: float, lng: float, label: str = "") -> str:
 
 
 async def _enrich_items(listing_ids: list[str]) -> Dict[str, dict]:
-    """
-    Fetch full details for a batch of listing IDs — image, price, address,
-    coordinates, store name, store image. Single query, LEFT JOIN stores.
-    """
     if not listing_ids:
         return {}
 
@@ -133,7 +129,6 @@ async def _enrich_items(listing_ids: list[str]) -> Dict[str, dict]:
     return {row["listing_id"]: dict(row) for row in rows}
 
 
-# ── Service recall ─────────────────────────────────────────────
 async def _service_recall(query: str, lat: float, lng: float, radius_km: float, limit: int = 5):
     rows = await database.fetch_all(
         "SELECT s.service_id, s.title, s.price, s.lat, s.lng, s.image_url, s.provider_id, "
@@ -167,7 +162,6 @@ async def _service_recall(query: str, lat: float, lng: float, radius_km: float, 
     return results[:limit]
 
 
-# ── Store recall ───────────────────────────────────────────────
 async def _store_recall(query: str, lat: float, lng: float, radius_km: float, limit: int = 5):
     rows = await database.fetch_all(
         "SELECT store_id, name, description, address, latitude, longitude, store_image_url "
@@ -197,7 +191,6 @@ async def _store_recall(query: str, lat: float, lng: float, radius_km: float, li
     return results[:limit]
 
 
-# ── Unified search ─────────────────────────────────────────────
 async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, user_id: str = None) -> dict:
     query = params.get("query", "").strip()
     if not query:
@@ -241,7 +234,6 @@ async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, 
         lid = it["listing_id"]
         meta = enriched.get(lid, {})
 
-        # Prefer store coords; fall back to listing coords
         r_lat = meta.get("store_lat") if meta.get("store_lat") is not None else meta.get("listing_lat")
         r_lng = meta.get("store_lng") if meta.get("store_lng") is not None else meta.get("listing_lng")
 
@@ -305,7 +297,13 @@ async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, 
     top = all_results[:10]
 
     if not top:
-        return {"type": "text", "text": f"I couldn't find anything matching '{query}'."}
+        return {
+            "type": "text",
+            "text": (
+                f"Nothing near you currently matches '{query}'. "
+                "Try a broader term, or ask me to post a wanted alert so you're notified when one is listed."
+            ),
+        }
 
     return {
         "type": "action",
@@ -314,7 +312,6 @@ async def handle_search_items(params: dict, lat: float = 6.5, lng: float = 3.4, 
     }
 
 
-# ── Book service ───────────────────────────────────────────────
 async def handle_book_service(user_id: str, params: dict) -> dict:
     service_name = params.get("service", "")
     if not service_name:
@@ -341,7 +338,6 @@ async def handle_book_service(user_id: str, params: dict) -> dict:
     }
 
 
-# ── Store info ─────────────────────────────────────────────────
 async def handle_get_store_info(params: dict) -> dict:
     name = params.get("store", "")
     if not name:

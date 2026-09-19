@@ -35,59 +35,83 @@ class AskRequest(BaseModel):
 
 
 # ════════════════════════════════════════════════════════════
-# SYSTEM PROMPT — reserve_item listed FIRST with explicit examples
+# SYSTEM PROMPT — "item" only. Never "product."
 # ════════════════════════════════════════════════════════════
 SYSTEM_PROMPT = """You are SEAI, the AI shopping assistant for Admerce — a hyper-local commerce marketplace in Nigeria.
 
 You have FOUR tools:
 
 1. reserve_item(query, quantity)
-   Reserve a physical PRODUCT. Use whenever the user says RESERVE, HOLD, BUY, or GRAB
-   and the thing is a physical product (phone, shoe, tv, shirt, food item, etc.).
-   Pass ONLY the product name as query. DO NOT include the store name.
+   Reserve a physical ITEM. Use when the user says RESERVE, HOLD, BUY, GRAB
+   and the thing is a physical item (phone, shoe, tv, shirt, food).
+   Pass ONLY the item name — never the store name.
    Examples:
-     "reserve this iphone"        → reserve_item(query="iPhone 14")
+     "reserve this iphone"                  → reserve_item(query="iPhone 14")
      "Reserve an iphone 14 from graham hub" → reserve_item(query="iPhone 14")
-     "hold 2 of those shoes"      → reserve_item(query="shoes", quantity=2)
-     "buy that tv"                → reserve_item(query="TV")
+     "hold 2 of those shoes"                → reserve_item(query="shoes", quantity=2)
 
 2. search_items(query)
-   Use when the user wants to FIND, SEE, BROWSE, or EXPLORE anything.
+   Use ONLY when the user wants to FIND, SEE, BROWSE, or EXPLORE an item.
    Examples: "find iphone", "show me pizza", "I'm looking for shoes".
 
 3. book_service(service)
-   Use ONLY when the user names a SERVICE that a provider delivers:
-   haircut, phone repair, plumbing, cleaning, catering, photography, etc.
-   NOT for physical products. If they say "reserve" and it's a product, use reserve_item.
-   Examples: "book a haircut", "book phone repair", "schedule a plumber".
+   Use ONLY when the user names a SERVICE (haircut, phone repair, plumbing,
+   cleaning, catering, photography). NOT for physical items.
 
 4. get_store_info(store)
    Use when the user asks about a specific store by name.
 
-Rules:
-- NEVER say "I found N results". Write like a person recommending things.
-- Mention travel time or distance naturally.
-- Keep responses under 40 words unless asked for detail."""
+## LANGUAGE RULES
+- Always say "item" or "items". NEVER say "product" or "products".
+- Match Admerce vocabulary: item, listing, store, service.
+
+## CRITICAL RULES
+
+### When to use a tool:
+- User names or implies an ITEM to find/buy/reserve → search_items or reserve_item
+- User wants to BOOK a service → book_service
+- User asks about a specific store by name → get_store_info
+
+### When NOT to use a tool:
+- Follow-up questions: "but why", "why not", "how come", "hmm", "ok", "tell me more"
+- Greetings: "hi", "hello", "hey"
+- Meta questions: "what can you do", "how does this work", "are you sure"
+- Thanks: "thanks", "thank you", "nice"
+
+For these, respond CONVERSATIONALLY using the previous turn as context.
+NEVER re-call the previous tool for a follow-up question.
+
+### Explaining empty results:
+If your previous search found nothing and the user asks why, explain clearly:
+- "I searched listings and services in your area and none matched '<query>'."
+- Suggest a next step: "Try a broader term" or "Want a wanted alert so you're notified when one is posted?"
+
+### Never:
+- Say "product" — always "item"
+- Repeat the previous response verbatim
+- Say "I found N results"
+- Call search_items as a reflex for conversational messages
+
+Keep responses under 60 words unless asked for detail."""
 
 
 def _tools():
-    # reserve_item listed FIRST so Groq sees it before book_service.
     return [
         {
             "type": "function",
             "function": {
                 "name": "reserve_item",
                 "description": (
-                    "Reserve a physical PRODUCT (phone, shoe, tv, shirt, food item). "
+                    "Reserve a physical ITEM (phone, shoe, tv, shirt, food item). "
                     "Use whenever the user says reserve, hold, or buy. "
-                    "Pass ONLY the product name — never the store name."
+                    "Pass ONLY the item name — never the store name."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Short product name, e.g. 'iPhone 14'",
+                            "description": "Short item name, e.g. 'iPhone 14'",
                         },
                         "quantity": {
                             "type": "integer",
@@ -103,7 +127,7 @@ def _tools():
             "type": "function",
             "function": {
                 "name": "search_items",
-                "description": "Search products, services, and stores near the user.",
+                "description": "Search items, services, and stores near the user.",
                 "parameters": {
                     "type": "object",
                     "properties": {"query": {"type": "string"}},
@@ -117,7 +141,7 @@ def _tools():
                 "name": "book_service",
                 "description": (
                     "Book a SERVICE delivered by a provider — haircut, repair, "
-                    "plumber, cleaning, catering. NOT for physical products."
+                    "plumber, cleaning, catering. NOT for physical items."
                 ),
                 "parameters": {
                     "type": "object",
@@ -141,6 +165,46 @@ def _tools():
     ]
 
 
+_CONVERSATIONAL_PATTERNS = [
+    r"^(but\s+)?why(\s+not)?[\?\.!]*$",
+    r"^how\s+come[\?\.!]*$",
+    r"^hmm+[\?\.!]*$",
+    r"^ok(ay)?[\?\.!]*$",
+    r"^thanks?( you)?[\?\.!]*$",
+    r"^hi+[\?\.!]*$",
+    r"^hey+[\?\.!]*$",
+    r"^hello+[\?\.!]*$",
+    r"^yes[\?\.!]*$",
+    r"^no[\?\.!]*$",
+    r"^really[\?\.!]*$",
+    r"^are\s+you\s+sure[\?\.!]*$",
+    r"^what[\?\.!]+$",
+    r"^what\s+do\s+you\s+mean[\?\.!]*$",
+    r"^tell\s+me\s+more[\?\.!]*$",
+    r"^more[\?\.!]*$",
+    r"^what\s+can\s+you\s+do[\?\.!]*$",
+    r"^are\s+there\s+any[\?\.!]*$",
+]
+
+
+def _is_conversational(text: str) -> bool:
+    t = text.strip().lower()
+    if len(t) > 60:
+        return False
+    return any(re.match(p, t) for p in _CONVERSATIONAL_PATTERNS)
+
+
+def _is_empty_result(result: dict) -> bool:
+    if result.get("type") != "text":
+        return False
+    text = (result.get("text") or "").strip()
+    return (
+        text.startswith("I couldn't find")
+        or text.startswith("No ")
+        or text.startswith("Nothing ")
+    )
+
+
 @router.post("/ask")
 async def seai_ask(
     req: AskRequest,
@@ -160,6 +224,8 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
             messages.append({"role": role, "content": m["content"]})
     messages.append({"role": "user", "content": req.query})
 
+    conversational = _is_conversational(req.query)
+
     cards_payload: Optional[dict] = None
 
     try:
@@ -167,9 +233,9 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
             model=GROQ_MODEL,
             messages=messages,
             tools=_tools(),
-            tool_choice="auto",
+            tool_choice="none" if conversational else "auto",
             max_tokens=400,
-            temperature=0.4,           # lower = more deterministic tool picking
+            temperature=0.4,
         )
         msg = resp.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None)
@@ -193,6 +259,30 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
 
         if result.get("type") == "action" and result.get("intent") == "search_results":
             cards_payload = result["data"]
+
+        if cards_payload is None and _is_empty_result(result):
+            messages.append(msg)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": json.dumps(result),
+            })
+            try:
+                final = await _groq.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=messages,
+                    max_tokens=160,
+                    temperature=0.6,
+                )
+                refined = (final.choices[0].message.content or "").strip().strip('"')
+                if refined:
+                    return StreamingResponse(
+                        _stream_text(refined),
+                        media_type="text/event-stream",
+                    )
+            except Exception as e:
+                print(f"⚠️  Empty-result refinement failed: {e}")
+            return _respond_from_result(result)
 
         if cards_payload is None:
             return _respond_from_result(result)
@@ -225,9 +315,6 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
         return await _regex_fallback(req, user_id)
 
 
-# ════════════════════════════════════════════════════════════
-# TOOL DISPATCHER — with smart cross-tool fallback
-# ════════════════════════════════════════════════════════════
 async def _execute_agent_function(
     fn_name: str, args: dict, user_id: Optional[str], lat: float, lng: float
 ) -> dict:
@@ -246,8 +333,6 @@ async def _execute_agent_function(
         if fn_name == "book_service":
             result = await handle_book_service(user_id or "", args)
 
-            # ── Fallback: Groq mis-classified a product as a service ──
-            # If the service lookup failed, try reserve_item with the same arg.
             if (
                 result.get("type") == "text"
                 and "No service found" in result.get("text", "")
@@ -276,9 +361,6 @@ async def _execute_agent_function(
         return {"type": "text", "text": "I couldn't complete that action."}
 
 
-# ════════════════════════════════════════════════════════════
-# RESERVE HANDLER — token-based fuzzy match
-# ════════════════════════════════════════════════════════════
 STOP_WORDS = {
     "the", "a", "an", "of", "for", "this", "that", "at",
     "in", "on", "and", "or", "to", "with", "from", "my",
@@ -357,7 +439,7 @@ async def _handle_reserve_item(
             "type": "text",
             "text": (
                 f"I couldn't find an item matching '{query}'. "
-                "Try the exact product name, like 'iPhone 14'."
+                "Try the exact item name, like 'iPhone 14'."
             ),
         }
 
@@ -504,6 +586,13 @@ def _fallback_intro(results: list) -> str:
 
 
 async def _regex_fallback(req: AskRequest, user_id: Optional[str]):
+    if _is_conversational(req.query):
+        return StreamingResponse(
+            _stream_text(
+                "I'm here — ask me to find an item or book a service and I'll take it from there."
+            ),
+            media_type="text/event-stream",
+        )
     intent, params = classify_intent(req.query)
     if intent == "search":
         r = await handle_search_items(params, req.lat, req.lng, user_id)
