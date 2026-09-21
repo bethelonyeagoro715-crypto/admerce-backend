@@ -211,8 +211,6 @@ async def delete_service(service_id: str, current_user: dict = Depends(get_curre
 @router.get("/bookings")
 async def get_bookings(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
-    # ✅ Name joins — every booking row now carries customer_name and
-    #    provider_name so the frontend can render without extra lookups.
     rows = await database.fetch_all(
         """
         SELECT sb.*,
@@ -242,7 +240,6 @@ async def get_bookings(current_user: dict = Depends(get_current_user)):
 # ============================================================
 @router.get("/bookings/{booking_id}")
 async def get_booking(booking_id: str, current_user: dict = Depends(get_current_user)):
-    # ✅ Name joins — receipt page relies on customer_name / provider_name
     row = await database.fetch_one(
         """
         SELECT sb.*,
@@ -276,7 +273,111 @@ async def get_booking(booking_id: str, current_user: dict = Depends(get_current_
     return booking
 
 # ============================================================
-# BOOKINGS — CONFIRM (provider marks done)
+# ACCEPT (provider accepts a locked booking)
+# ============================================================
+@router.post("/bookings/{booking_id}/accept")
+async def accept_booking(
+    booking_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    row = await database.fetch_one(
+        "SELECT * FROM service_bookings WHERE booking_id = :bid",
+        {"bid": booking_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking = dict(row)
+    if booking.get("provider_id") != current_user["id"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the service provider can accept this booking",
+        )
+
+    current_status = (booking.get("status") or "").lower()
+    if current_status != "locked":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot accept a booking with status '{current_status}'. "
+                "Only pending bookings can be accepted."
+            ),
+        )
+
+    await database.execute(
+        """
+        UPDATE service_bookings
+        SET status = 'accepted', updated_at = :now
+        WHERE booking_id = :bid AND status = 'locked'
+        """,
+        {"now": datetime.utcnow(), "bid": booking_id},
+    )
+
+    return {
+        "booking_id": booking_id,
+        "status": "accepted",
+        "message": "Booking accepted. The customer has been notified.",
+    }
+
+# ============================================================
+# DECLINE (provider declines a locked booking)
+# ============================================================
+@router.post("/bookings/{booking_id}/decline")
+async def decline_booking(
+    booking_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    row = await database.fetch_one(
+        "SELECT * FROM service_bookings WHERE booking_id = :bid",
+        {"bid": booking_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking = dict(row)
+    if booking.get("provider_id") != current_user["id"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the service provider can decline this booking",
+        )
+
+    current_status = (booking.get("status") or "").lower()
+    if current_status != "locked":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot decline a booking with status '{current_status}'. "
+                "Only pending bookings can be declined."
+            ),
+        )
+
+    amount = _as_float(booking.get("amount"))
+    customer_id = booking.get("customer_id")
+
+    if amount > 0 and customer_id:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": amount, "uid": customer_id},
+        )
+
+    await database.execute(
+        """
+        UPDATE service_bookings
+        SET status = 'declined', updated_at = :now
+        WHERE booking_id = :bid AND status = 'locked'
+        """,
+        {"now": datetime.utcnow(), "bid": booking_id},
+    )
+
+    return {
+        "booking_id": booking_id,
+        "status": "declined",
+        "refunded": amount,
+        "message": f"Booking declined. ₦{amount:,.0f} returned to the customer.",
+    }
+
+# ============================================================
+# CONFIRM (provider marks done)
 # ============================================================
 @router.post("/bookings/{booking_id}/confirm")
 async def confirm_booking(
@@ -296,7 +397,9 @@ async def confirm_booking(
             status_code=403,
             detail="Only the service provider can confirm completion",
         )
-    if booking.get("status") != "locked":
+
+    current_status = (booking.get("status") or "").lower()
+    if current_status not in ("locked", "accepted"):
         raise HTTPException(status_code=400, detail="Booking already processed")
 
     await database.execute(
@@ -318,7 +421,7 @@ async def confirm_booking(
     }
 
 # ============================================================
-# BOOKINGS — COMPLETE (customer releases funds)
+# COMPLETE (customer releases funds)
 # ============================================================
 @router.post("/bookings/{booking_id}/complete")
 async def complete_booking(
@@ -335,7 +438,9 @@ async def complete_booking(
     booking = dict(row)
     if booking.get("customer_id") != current_user["id"]:
         raise HTTPException(status_code=403, detail="Only the client can release funds")
-    if booking.get("status") != "locked":
+
+    current_status = (booking.get("status") or "").lower()
+    if current_status not in ("locked", "accepted"):
         raise HTTPException(status_code=400, detail="Booking already processed")
 
     await database.execute(
@@ -357,14 +462,15 @@ async def complete_booking(
     }
 
 # ============================================================
-# ✅ NEW — CANCEL (either party, while locked)
+# CANCEL — either party, from `locked` OR `accepted`
 # ============================================================
-# Rules:
-#   - Only when status = 'locked' (no work started yet)
-#   - Either the customer OR the provider can cancel
-#   - Customer's wallet is refunded in full
-#   - Booking status becomes 'cancelled'
-#   - Once 'accepted', cancellation is off — that path becomes a dispute
+# ✅ UPDATED: now allows cancellation from `accepted` as well as `locked`.
+#    Real-world services allow this — you can call a plumber back and say
+#    "actually never mind." Full refund, no penalty.
+#
+#    Blocks only from terminal states (completed, cancelled, declined,
+#    expired). Those are done deals; a problem there is a dispute, not
+#    a cancellation.
 @router.post("/bookings/{booking_id}/cancel")
 async def cancel_booking(
     booking_id: str,
@@ -380,37 +486,35 @@ async def cancel_booking(
     booking = dict(row)
     user_id = current_user["id"]
 
-    # Must be either the customer or the provider
     if user_id not in (booking.get("customer_id"), booking.get("provider_id")):
         raise HTTPException(status_code=403, detail="Access denied")
 
     current_status = (booking.get("status") or "").lower()
-    if current_status != "locked":
+    if current_status not in ("locked", "accepted"):
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Cannot cancel a booking with status '{current_status}'. "
-                "Only pending bookings can be cancelled."
+                "Only pending or accepted bookings can be cancelled. "
+                "If the job has already been completed, please contact support."
             ),
         )
 
     amount = _as_float(booking.get("amount"))
     customer_id = booking.get("customer_id")
 
-    # 1) Refund the customer's wallet (if anything was locked)
     if amount > 0 and customer_id:
         await database.execute(
             "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
             {"amt": amount, "uid": customer_id},
         )
 
-    # 2) Flip the status — guard against a race where the booking was
-    #    completed between the read above and this write.
+    # Race-safe: only flip if still cancellable
     await database.execute(
         """
         UPDATE service_bookings
         SET status = 'cancelled', updated_at = :now
-        WHERE booking_id = :bid AND status = 'locked'
+        WHERE booking_id = :bid AND status IN ('locked', 'accepted')
         """,
         {"now": datetime.utcnow(), "bid": booking_id},
     )
