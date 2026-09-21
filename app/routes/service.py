@@ -42,10 +42,6 @@ def _parse_iso_datetime(value):
     return None
 
 
-# ✅ FIX: asyncpg is strict about types. Any value coming out of a
-#    `dict(row)` might be a Decimal, str, or None — none of which
-#    asyncpg will silently coerce to a NUMERIC / DOUBLE PRECISION param.
-#    This helper coerces to float with a safe fallback.
 def _as_float(value, default: float = 0.0) -> float:
     if value is None:
         return default
@@ -53,6 +49,7 @@ def _as_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
 
 # ============================================================
 # STATIC ROUTES
@@ -118,8 +115,6 @@ async def get_provider_stats(current_user: dict = Depends(get_current_user)):
         {"pid": provider_id, "start": start_dt, "end": end_dt},
     )
 
-    # ✅ FIX: cast on read — if `amount` came back as a string, SUM would
-    #    fail in SQL. Fall back to 0 and compute in Python if needed.
     total_earnings = 0.0
     try:
         rows = await database.fetch_all(
@@ -210,21 +205,63 @@ async def delete_service(service_id: str, current_user: dict = Depends(get_curre
     )
     return {"message": "Service permanently deleted"}
 
+# ============================================================
+# BOOKINGS — LIST
+# ============================================================
 @router.get("/bookings")
 async def get_bookings(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
+    # ✅ Name joins — every booking row now carries customer_name and
+    #    provider_name so the frontend can render without extra lookups.
     rows = await database.fetch_all(
-        "SELECT * FROM service_bookings "
-        "WHERE customer_id = :uid OR provider_id = :uid2 "
-        "ORDER BY created_at DESC",
+        """
+        SELECT sb.*,
+               s.title AS service_title,
+               COALESCE(
+                   NULLIF(CONCAT(u_c.first_name, ' ', u_c.last_name), ' '),
+                   u_c.nickname, u_c.real_name, u_c.email, 'Customer'
+               ) AS customer_name,
+               COALESCE(
+                   NULLIF(CONCAT(u_p.first_name, ' ', u_p.last_name), ' '),
+                   u_p.nickname, u_p.real_name, u_p.business_name, u_p.email,
+                   'Provider'
+               ) AS provider_name
+        FROM service_bookings sb
+        LEFT JOIN services s ON sb.service_id = s.service_id
+        LEFT JOIN users u_c ON sb.customer_id = u_c.id
+        LEFT JOIN users u_p ON sb.provider_id = u_p.id
+        WHERE sb.customer_id = :uid OR sb.provider_id = :uid2
+        ORDER BY sb.created_at DESC
+        """,
         {"uid": user_id, "uid2": user_id},
     )
     return [dict(row) for row in rows]
 
+# ============================================================
+# BOOKINGS — DETAIL
+# ============================================================
 @router.get("/bookings/{booking_id}")
 async def get_booking(booking_id: str, current_user: dict = Depends(get_current_user)):
+    # ✅ Name joins — receipt page relies on customer_name / provider_name
     row = await database.fetch_one(
-        "SELECT * FROM service_bookings WHERE booking_id = :bid",
+        """
+        SELECT sb.*,
+               s.title AS service_title,
+               COALESCE(
+                   NULLIF(CONCAT(u_c.first_name, ' ', u_c.last_name), ' '),
+                   u_c.nickname, u_c.real_name, u_c.email, 'Customer'
+               ) AS customer_name,
+               COALESCE(
+                   NULLIF(CONCAT(u_p.first_name, ' ', u_p.last_name), ' '),
+                   u_p.nickname, u_p.real_name, u_p.business_name, u_p.email,
+                   'Provider'
+               ) AS provider_name
+        FROM service_bookings sb
+        LEFT JOIN services s ON sb.service_id = s.service_id
+        LEFT JOIN users u_c ON sb.customer_id = u_c.id
+        LEFT JOIN users u_p ON sb.provider_id = u_p.id
+        WHERE sb.booking_id = :bid
+        """,
         {"bid": booking_id},
     )
     if not row:
@@ -238,6 +275,9 @@ async def get_booking(booking_id: str, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=403, detail="Access denied")
     return booking
 
+# ============================================================
+# BOOKINGS — CONFIRM (provider marks done)
+# ============================================================
 @router.post("/bookings/{booking_id}/confirm")
 async def confirm_booking(
     booking_id: str,
@@ -264,7 +304,6 @@ async def confirm_booking(
         "WHERE booking_id = :bid",
         {"now": datetime.utcnow(), "bid": booking_id},
     )
-    # ✅ FIX: coerce amount to float — asyncpg rejects strings for NUMERIC
     await database.execute(
         "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
         {
@@ -278,6 +317,9 @@ async def confirm_booking(
         "message": "Job marked complete, funds released.",
     }
 
+# ============================================================
+# BOOKINGS — COMPLETE (customer releases funds)
+# ============================================================
 @router.post("/bookings/{booking_id}/complete")
 async def complete_booking(
     booking_id: str,
@@ -301,7 +343,6 @@ async def complete_booking(
         "WHERE booking_id = :bid",
         {"now": datetime.utcnow(), "bid": booking_id},
     )
-    # ✅ FIX: coerce amount to float — asyncpg rejects strings for NUMERIC
     await database.execute(
         "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
         {
@@ -313,6 +354,78 @@ async def complete_booking(
         "booking_id": booking_id,
         "status": "completed",
         "message": "Funds released to provider.",
+    }
+
+# ============================================================
+# ✅ NEW — CANCEL (either party, while locked)
+# ============================================================
+# Rules:
+#   - Only when status = 'locked' (no work started yet)
+#   - Either the customer OR the provider can cancel
+#   - Customer's wallet is refunded in full
+#   - Booking status becomes 'cancelled'
+#   - Once 'accepted', cancellation is off — that path becomes a dispute
+@router.post("/bookings/{booking_id}/cancel")
+async def cancel_booking(
+    booking_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    row = await database.fetch_one(
+        "SELECT * FROM service_bookings WHERE booking_id = :bid",
+        {"bid": booking_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking = dict(row)
+    user_id = current_user["id"]
+
+    # Must be either the customer or the provider
+    if user_id not in (booking.get("customer_id"), booking.get("provider_id")):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    current_status = (booking.get("status") or "").lower()
+    if current_status != "locked":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot cancel a booking with status '{current_status}'. "
+                "Only pending bookings can be cancelled."
+            ),
+        )
+
+    amount = _as_float(booking.get("amount"))
+    customer_id = booking.get("customer_id")
+
+    # 1) Refund the customer's wallet (if anything was locked)
+    if amount > 0 and customer_id:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": amount, "uid": customer_id},
+        )
+
+    # 2) Flip the status — guard against a race where the booking was
+    #    completed between the read above and this write.
+    await database.execute(
+        """
+        UPDATE service_bookings
+        SET status = 'cancelled', updated_at = :now
+        WHERE booking_id = :bid AND status = 'locked'
+        """,
+        {"now": datetime.utcnow(), "bid": booking_id},
+    )
+
+    cancelled_by = "customer" if user_id == customer_id else "provider"
+
+    return {
+        "booking_id": booking_id,
+        "status": "cancelled",
+        "refunded": amount,
+        "cancelled_by": cancelled_by,
+        "message": (
+            "Booking cancelled. "
+            + (f"₦{amount:,.0f} returned to your wallet." if amount > 0 else "")
+        ).strip(),
     }
 
 # ============================================================
@@ -363,7 +476,6 @@ async def list_services():
     )
     return [dict(row) for row in rows]
 
-# ---------- Upload service image (Cloudinary) ----------
 @router.post("/{service_id}/image")
 async def upload_service_image(
     service_id: str,
@@ -395,7 +507,6 @@ async def upload_service_image(
     )
     return {"image_url": image_url}
 
-# ---------- Upload service video (Cloudinary) ----------
 @router.post("/{service_id}/video")
 async def upload_service_video(
     service_id: str,
@@ -466,7 +577,6 @@ async def book_service(
     if provider_available is False:
         raise HTTPException(status_code=400, detail="Provider is currently unavailable")
 
-    # ✅ Coerce price to float — if it came back as Decimal/str from the DB
     service_price = _as_float(service["price"])
 
     wallet = await database.fetch_one(
