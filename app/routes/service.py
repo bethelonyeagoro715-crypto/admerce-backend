@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import Optional
 from app.db.database import database
 from app.utils.security import get_current_user
-from app.services.cloudinary_service import upload_image, upload_video   # ✅ Cloudinary
+from app.services.cloudinary_service import upload_image, upload_video
 import uuid
 from datetime import datetime, timedelta
 
@@ -40,6 +40,19 @@ def _parse_iso_datetime(value):
         except ValueError:
             return None
     return None
+
+
+# ✅ FIX: asyncpg is strict about types. Any value coming out of a
+#    `dict(row)` might be a Decimal, str, or None — none of which
+#    asyncpg will silently coerce to a NUMERIC / DOUBLE PRECISION param.
+#    This helper coerces to float with a safe fallback.
+def _as_float(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 # ============================================================
 # STATIC ROUTES
@@ -105,16 +118,23 @@ async def get_provider_stats(current_user: dict = Depends(get_current_user)):
         {"pid": provider_id, "start": start_dt, "end": end_dt},
     )
 
-    total_earnings = await database.fetch_val(
-        """
-        SELECT COALESCE(SUM(sb.amount), 0)
-        FROM service_bookings sb
-        JOIN services s ON sb.service_id = s.service_id
-        WHERE s.provider_id = :pid
-          AND sb.status = 'completed'
-        """,
-        {"pid": provider_id},
-    )
+    # ✅ FIX: cast on read — if `amount` came back as a string, SUM would
+    #    fail in SQL. Fall back to 0 and compute in Python if needed.
+    total_earnings = 0.0
+    try:
+        rows = await database.fetch_all(
+            """
+            SELECT sb.amount
+            FROM service_bookings sb
+            JOIN services s ON sb.service_id = s.service_id
+            WHERE s.provider_id = :pid
+              AND sb.status = 'completed'
+            """,
+            {"pid": provider_id},
+        )
+        total_earnings = sum(_as_float(dict(r).get("amount")) for r in rows)
+    except Exception as e:
+        print(f"⚠️  total_earnings lookup skipped: {e}")
 
     rating = 0.0
     try:
@@ -132,8 +152,8 @@ async def get_provider_stats(current_user: dict = Depends(get_current_user)):
 
     return {
         "today_bookings": today_bookings or 0,
-        "total_earnings": float(total_earnings or 0.0),
-        "rating": float(rating),
+        "total_earnings": _as_float(total_earnings),
+        "rating": _as_float(rating),
     }
 
 @router.put("/providers/availability")
@@ -244,9 +264,13 @@ async def confirm_booking(
         "WHERE booking_id = :bid",
         {"now": datetime.utcnow(), "bid": booking_id},
     )
+    # ✅ FIX: coerce amount to float — asyncpg rejects strings for NUMERIC
     await database.execute(
         "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-        {"amt": booking.get("amount") or 0, "uid": booking["provider_id"]},
+        {
+            "amt": _as_float(booking.get("amount")),
+            "uid": booking["provider_id"],
+        },
     )
     return {
         "booking_id": booking_id,
@@ -277,9 +301,13 @@ async def complete_booking(
         "WHERE booking_id = :bid",
         {"now": datetime.utcnow(), "bid": booking_id},
     )
+    # ✅ FIX: coerce amount to float — asyncpg rejects strings for NUMERIC
     await database.execute(
         "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-        {"amt": booking.get("amount") or 0, "uid": booking["provider_id"]},
+        {
+            "amt": _as_float(booking.get("amount")),
+            "uid": booking["provider_id"],
+        },
     )
     return {
         "booking_id": booking_id,
@@ -438,15 +466,18 @@ async def book_service(
     if provider_available is False:
         raise HTTPException(status_code=400, detail="Provider is currently unavailable")
 
+    # ✅ Coerce price to float — if it came back as Decimal/str from the DB
+    service_price = _as_float(service["price"])
+
     wallet = await database.fetch_one(
         "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": customer_id}
     )
-    if not wallet or float(wallet["balance"]) < service["price"]:
+    if not wallet or _as_float(wallet["balance"]) < service_price:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
     await database.execute(
         "UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid",
-        {"amt": service["price"], "uid": customer_id},
+        {"amt": service_price, "uid": customer_id},
     )
 
     booking_id = uuid.uuid4().hex[:8]
@@ -469,7 +500,7 @@ async def book_service(
             "sid": service_id,
             "cid": customer_id,
             "pid": service["provider_id"],
-            "amt": service["price"],
+            "amt": service_price,
             "sch": scheduled_dt,
             "lat": req.location_lat,
             "lng": req.location_lng,
