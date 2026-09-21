@@ -1,7 +1,7 @@
 import os
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
@@ -12,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
 load_dotenv()
 
+# ── Cloudinary diagnostic ────────────────────────────────────────────────
 print(
     "🔑 Cloudinary env:",
     {
@@ -75,6 +76,19 @@ else:
     print("⚠️ SKIP_MODELS=1 – Heavy AI models disabled")
 
 
+# ─── Money coercion helper ───────────────────────────────────────────────
+# Some columns created before the NUMERIC migration are TEXT-like. asyncpg
+# rejects strings for NUMERIC params. This makes every read safe.
+def _as_float(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ── Background task: auto-refund expired escrow (reservations) ───────────
 async def _refund_expired_escrows() -> None:
     while True:
         try:
@@ -99,16 +113,108 @@ async def _refund_expired_escrows() -> None:
         await asyncio.sleep(60)
 
 
+# ── Background task: expire stale service bookings ───────────────────────
+# ✅ NEW — service bookings had NO auto-timeout. A `locked` booking that
+#    nobody completed stayed locked forever, taking the customer's money
+#    with it. This loop refunds stale bookings on a schedule.
+#
+#    Rules:
+#      - status `locked` (never accepted): expire 24h past due
+#      - status `accepted` (provider committed): expire 72h past due
+#      - "due" = scheduled_for if set, else created_at
+#      - refunds the customer's wallet, sets status to `expired`
+async def _expire_stale_bookings() -> None:
+    LOCKED_GRACE_HOURS = 24
+    ACCEPTED_GRACE_HOURS = 72
+
+    while True:
+        try:
+            now = datetime.utcnow()
+
+            # Query rows we might expire. We compute the effective due date
+            # in Python since scheduled_for can be NULL.
+            candidates = await database.fetch_all(
+                """
+                SELECT booking_id, customer_id, provider_id, amount,
+                       status, scheduled_for, created_at
+                FROM service_bookings
+                WHERE status IN ('locked', 'accepted')
+                """
+            )
+
+            for row in candidates:
+                r = dict(row)
+                status = (r.get("status") or "").lower()
+                due = r.get("scheduled_for") or r.get("created_at")
+                if due is None:
+                    continue
+
+                grace = (
+                    LOCKED_GRACE_HOURS
+                    if status == "locked"
+                    else ACCEPTED_GRACE_HOURS
+                )
+
+                # Defensive: due might be a datetime or a string
+                if isinstance(due, str):
+                    try:
+                        due = datetime.fromisoformat(due.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except ValueError:
+                        continue
+
+                deadline = due + timedelta(hours=grace)
+                if now < deadline:
+                    continue
+
+                booking_id = r["booking_id"]
+                customer_id = r["customer_id"]
+                amount = _as_float(r.get("amount"))
+
+                try:
+                    # 1) Refund customer's wallet
+                    if amount > 0:
+                        await database.execute(
+                            """
+                            UPDATE wallets
+                            SET balance = balance + :amt
+                            WHERE user_id = :uid
+                            """,
+                            {"amt": amount, "uid": customer_id},
+                        )
+
+                    # 2) Mark booking as expired — guard against races by
+                    #    only flipping status if it's still the pre-expiry value
+                    await database.execute(
+                        """
+                        UPDATE service_bookings
+                        SET status = 'expired', updated_at = :now
+                        WHERE booking_id = :bid
+                          AND status IN ('locked', 'accepted')
+                        """,
+                        {"now": now, "bid": booking_id},
+                    )
+
+                    print(
+                        f"⌛ Booking {booking_id} expired "
+                        f"(was {status}) — refunded ₦{amount:.0f} → {customer_id}",
+                        flush=True,
+                    )
+                except Exception as inner:
+                    print(f"⚠️  Failed to expire booking {booking_id}: {inner}")
+
+        except Exception as exc:
+            print(f"⚠️  Booking expiry loop error: {exc}")
+
+        # Runs every 15 minutes
+        await asyncio.sleep(15 * 60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
 
-    # ✅ FIX: `sync_engine.begin()` commits the DDL on block exit.
-    #    `sync_engine.connect()` in SQLAlchemy 2.0 rolls back on exit, so every
-    #    CREATE TABLE / ALTER TABLE in this block was being silently discarded.
-    #    This is why message_deletions, orders, order_items, and order_stores
-    #    never appeared in the database.
+    # ✅ FIX: `sync_engine.begin()` commits DDL. `connect()` rolls back.
     with sync_engine.begin() as conn:
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS otp_codes (
@@ -522,6 +628,7 @@ async def lifespan(app: FastAPI):
     await database.connect()
     print("✅ Async database pool connected.")
 
+    # ── Async tables ─────────────────────────────────────────────────
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
             user_id      TEXT    PRIMARY KEY,
@@ -601,6 +708,11 @@ async def lifespan(app: FastAPI):
     await database.execute(
         "CREATE INDEX IF NOT EXISTS idx_service_bookings_service ON service_bookings(service_id)"
     )
+    # ✅ NEW: index for the auto-expiry loop
+    await database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_service_bookings_status_due "
+        "ON service_bookings(status, scheduled_for)"
+    )
     print("✅ service_bookings table ready.")
 
     await database.execute("""
@@ -642,12 +754,19 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ cards table ready.")
 
-    task = asyncio.create_task(_refund_expired_escrows())
+    # ── Background tasks ─────────────────────────────────────────────
+    task_escrow = asyncio.create_task(_refund_expired_escrows())
+    task_bookings = asyncio.create_task(_expire_stale_bookings())
     print("✅ Server is ready.")
     yield
-    task.cancel()
+    task_escrow.cancel()
+    task_bookings.cancel()
     try:
-        await task
+        await task_escrow
+    except asyncio.CancelledError:
+        pass
+    try:
+        await task_bookings
     except asyncio.CancelledError:
         pass
     await database.disconnect()
