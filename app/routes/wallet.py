@@ -37,10 +37,13 @@ class WithdrawRequest(BaseModel):
     account_number: str
     pin: str
 
+# ✅ FIX: added `quantity` — the frontend now sends it, and the handler
+#    uses it to decrement stock by the right amount.
 class InstantPickupRequest(BaseModel):
     listing_id: str
     storekeeper_id: str
     amount: float
+    quantity: int = 1
 
 # ---------- Helper ----------
 async def _log_wallet_transaction(
@@ -163,7 +166,6 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
     if not row:
         raise HTTPException(status_code=404, detail="Wallet not found")
 
-    # ✅ Convert Record → plain dict so .get() works
     wallet = dict(row)
     withdrawal_pin = wallet.get("withdrawal_pin")
     balance = float(wallet.get("balance") or 0)
@@ -206,11 +208,15 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
     }
 
 # ---------- Instant Pickup ----------
+# ✅ FIX: decrements stock by `req.quantity` (was hardcoded to 1).
+#    Also validates stock before charging.
 @router.post("/instant-pickup")
 async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
+
+    quantity = max(1, int(req.quantity or 1))
 
     row = await database.fetch_one(
         "SELECT * FROM listings WHERE listing_id = :lid AND store_id IN "
@@ -222,8 +228,12 @@ async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends
 
     listing = dict(row)
 
-    if listing.get("quantity_available") is not None and listing["quantity_available"] <= 0:
-        raise HTTPException(status_code=400, detail="Item out of stock")
+    available = listing.get("quantity_available")
+    if available is not None and available < quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only {available} item(s) left in stock.",
+        )
 
     wallet = await database.fetch_one(
         "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": shopper_id}
@@ -240,10 +250,12 @@ async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends
         {"amt": req.amount, "uid": req.storekeeper_id},
     )
 
-    if listing.get("quantity_available") is not None:
+    # ✅ Decrement by the actual quantity, not 1.
+    if available is not None:
         await database.execute(
-            "UPDATE listings SET quantity_available = quantity_available - 1 WHERE listing_id = :lid",
-            {"lid": req.listing_id},
+            "UPDATE listings SET quantity_available = quantity_available - :qty "
+            "WHERE listing_id = :lid AND quantity_available >= :qty",
+            {"qty": quantity, "lid": req.listing_id},
         )
 
     txn_id = f"pickup_{uuid.uuid4().hex[:8]}"
@@ -251,11 +263,16 @@ async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends
         user_id=shopper_id,
         amount=req.amount,
         type='debit',
-        description='Instant pickup payment',
+        description=f"Instant pickup ({quantity} item{'s' if quantity > 1 else ''})",
         reference=txn_id,
     )
 
-    return {"message": "Payment successful", "transaction_id": txn_id, "amount": req.amount}
+    return {
+        "message": "Payment successful",
+        "transaction_id": txn_id,
+        "amount": req.amount,
+        "quantity": quantity,
+    }
 
 # ---------- Reserve ----------
 @router.post("/reserve")
@@ -265,6 +282,8 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
 
     if total <= 0:
         raise HTTPException(status_code=400, detail="Item amount must be positive")
+
+    quantity = max(1, int(req.quantity or 1))
 
     wallet = await database.fetch_one(
         "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": shopper_id}
@@ -295,7 +314,7 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         )
     listing = dict(row)
 
-    if listing.get("quantity_available") is not None and listing["quantity_available"] < req.quantity:
+    if listing.get("quantity_available") is not None and listing["quantity_available"] < quantity:
         raise HTTPException(status_code=400, detail=f"Only {listing['quantity_available']} items available")
 
     await database.execute(
@@ -324,7 +343,7 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         "storekeeper_id": req.storekeeper_id,
         "courier_id": req.courier_id,
         "listing_id": req.listing_id,
-        "quantity": req.quantity,
+        "quantity": quantity,
         "item_amount": float(req.item_amount),
         "delivery_fee": float(req.delivery_fee),
         "total_amount": float(total),
@@ -336,18 +355,24 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         user_id=shopper_id,
         amount=total,
         type='debit',
-        description='Item reservation',
+        description=f"Reservation ({quantity} item{'s' if quantity > 1 else ''})",
         reference=req.order_id,
     )
 
     asyncio.create_task(send_push_to_user(
         req.storekeeper_id,
         "New Reservation!",
-        f"A shopper just reserved {req.quantity} item(s). Order #{req.order_id[:8]}",
+        f"A shopper reserved {quantity} item{'s' if quantity > 1 else ''}. Order #{req.order_id[:8]}",
         {"order_id": req.order_id},
     ))
 
-    return {"order_id": req.order_id, "status": "locked", "total": total, "message": "Funds reserved"}
+    return {
+        "order_id": req.order_id,
+        "status": "locked",
+        "total": total,
+        "quantity": quantity,
+        "message": "Funds reserved",
+    }
 
 # ---------- Accept Reservation ----------
 @router.post("/accept")
