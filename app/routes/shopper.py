@@ -11,6 +11,15 @@ from app.services.image_embedder import json_to_embedding, cosine_similarity
 
 router = APIRouter(prefix="/shopper", tags=["Shopper"])
 
+# ✅ How many items rank can return in a single call.
+#    The frontend paginates client-side (reveals 20 at a time), so this
+#    is just an upper bound to protect against runaway responses.
+MAX_FEED_SIZE = 500
+
+# ✅ How many items from the same store can appear before we skip to
+#    other stores. Relaxed from 2 → 5 to allow the feed to grow.
+MAX_PER_STORE = 5
+
 # ---------- Helper ----------
 def _to_datetime(value):
     """Return a datetime object from either a string or an existing datetime."""
@@ -41,7 +50,6 @@ class RankRequest(BaseModel):
     candidate_ids: List[str]
     session_items_shown: List[str] = []
 
-# ✅ New models for wanted alerts
 class WantedAlertCreate(BaseModel):
     title: str = Field(..., min_length=2, max_length=120)
     notes: Optional[str] = Field(None, max_length=500)
@@ -232,10 +240,15 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
     if not rows:
         return {"feed": [], "total": 0, "model_used": model is not None}
 
+    # ── Fallback path (no ML model) — this is what runs in production ──
     if model is None:
         rows_by_id = {row["listing_id"]: row for row in rows}
         fallback_feed = []
+        # ✅ FIX: filter by session_items_shown so pagination actually works.
+        shown_set = set(req.session_items_shown)
         for cid in req.candidate_ids:
+            if cid in shown_set:
+                continue
             row = rows_by_id.get(cid)
             if row is None:
                 continue
@@ -256,10 +269,14 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
                 "store_id": row["store_id"],
                 "fallback": True,
             })
-            if len(fallback_feed) >= 20:
+            shown_set.add(cid)
+            # ✅ Removed the 20-item cap — returned whole list is what
+            #    pagination wants.
+            if len(fallback_feed) >= MAX_FEED_SIZE:
                 break
         return {"feed": fallback_feed, "total": len(fallback_feed), "model_used": False}
 
+    # ── ML-ranked path ──
     scored = []
     for row in rows:
         dist = haversine(req.lat, req.lng, row["lat"], row["lng"])
@@ -287,6 +304,8 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
 
     scored.sort(key=lambda x: x["score"], reverse=True)
 
+    # ✅ FIX: no more 20-item cap. Return everything by score, with a
+    #    soft per-store cap so one store can't dominate the top of the feed.
     final_feed = []
     store_counter = {}
     shown_set = set(req.session_items_shown)
@@ -295,19 +314,23 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
         sid = item["store_id"]
         if lid in shown_set:
             continue
-        if store_counter.get(sid, 0) >= 2:
+        if store_counter.get(sid, 0) >= MAX_PER_STORE:
             continue
         final_feed.append(item)
         shown_set.add(lid)
         store_counter[sid] = store_counter.get(sid, 0) + 1
+        if len(final_feed) >= MAX_FEED_SIZE:
+            break
 
-    if len(final_feed) < min(20, len(scored)):
+    # Fallback: if the store cap starved the feed, fill remaining slots
+    # without the per-store restriction.
+    if len(final_feed) < MAX_FEED_SIZE:
         for item in scored:
             if item["listing_id"] in shown_set:
                 continue
             final_feed.append(item)
             shown_set.add(item["listing_id"])
-            if len(final_feed) >= 20:
+            if len(final_feed) >= MAX_FEED_SIZE:
                 break
 
     return {"feed": final_feed, "total": len(final_feed), "model_used": True}
@@ -416,10 +439,6 @@ async def get_save_status(listing_id: str, current_user: dict = Depends(get_curr
 # ==================== SAVED ITEMS LIST ====================
 @router.get("/saved")
 async def get_saved_items(current_user: dict = Depends(get_current_user)):
-    """
-    Return the current user's saved listings, joined with listing + store
-    details so the frontend has everything it needs to render cards.
-    """
     user_id = current_user["id"]
     rows = await database.fetch_all(
         """
@@ -444,10 +463,6 @@ async def get_saved_items(current_user: dict = Depends(get_current_user)):
 # ==================== WANTED ALERTS ====================
 @router.get("/wanted")
 async def list_wanted_alerts(current_user: dict = Depends(get_current_user)):
-    """
-    Return the current user's own wanted alerts (things they posted that
-    they want to buy). Active first, then newest.
-    """
     rows = await database.fetch_all(
         """
         SELECT id, user_id, title, notes, category, budget, lat, lng,
@@ -465,7 +480,6 @@ async def create_wanted_alert(
     req: WantedAlertCreate,
     current_user: dict = Depends(get_current_user),
 ):
-    """Create a wanted alert. Auto-expires after 30 days."""
     if req.budget is not None and req.budget < 0:
         raise HTTPException(status_code=400, detail="Budget cannot be negative")
 
@@ -500,7 +514,6 @@ async def delete_wanted_alert(
     alert_id: int,
     current_user: dict = Depends(get_current_user),
 ):
-    """Delete one of the user's own wanted alerts."""
     row = await database.fetch_one(
         "SELECT user_id FROM wanted_alerts WHERE id = :aid",
         {"aid": alert_id},
@@ -521,7 +534,6 @@ async def toggle_wanted_alert(
     alert_id: int,
     current_user: dict = Depends(get_current_user),
 ):
-    """Toggle active/paused for one of the user's own wanted alerts."""
     row = await database.fetch_one(
         "SELECT user_id, is_active FROM wanted_alerts WHERE id = :aid",
         {"aid": alert_id},
@@ -549,7 +561,6 @@ async def get_provider_services(provider_id: str):
 
 # ── Helper for agentic SEAI search ───────────────────────────
 async def search_shopper_items(query: str, lat: float, lng: float, radius_km: float = 10, limit: int = 10):
-    """Return up to `limit` items whose title matches the query (ILIKE) and are within `radius_km`."""
     rows = await database.fetch_all(
         "SELECT listing_id, title, price, lat, lng, image_url, store_id "
         "FROM listings WHERE quantity_available > 0 AND title ILIKE :q "
