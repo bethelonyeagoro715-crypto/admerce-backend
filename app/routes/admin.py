@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
 from app.db.database import database
 from app.routes.auth import get_current_user
-from typing import Optional
+from typing import Optional, Union
 from datetime import datetime
 import uuid
 
@@ -14,44 +14,55 @@ async def admin_required(current_user: dict = Depends(get_current_user)):
     return current_user
 
 
-# Helper functions
-def _subtract_months(dt: datetime, months: int) -> datetime:
-    target_month = dt.month - months
-    target_year = dt.year
-    while target_month <= 0:
-        target_month += 12
-        target_year -= 1
-    day = min(dt.day, [0, 31, 29 if target_year % 4 == 0 and (target_year % 100 != 0 or target_year % 400 == 0) else 28,
-                       31, 30, 31, 30, 31, 31, 30, 31, 30, 31][target_month])
-    return datetime(target_year, target_month, day)
+# ---------- Helpers ----------
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    """Add (or subtract, if negative) months from dt, clamping the day. ✅ Replaces broken _subtract_months."""
+    month_index = (dt.year * 12 + (dt.month - 1)) + months
+    year = month_index // 12
+    month = (month_index % 12) + 1
+    if month == 2:
+        leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
+        max_day = 29 if leap else 28
+    else:
+        max_day = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+    day = min(dt.day, max_day)
+    return datetime(year, month, day)
 
 
 def _month_start(dt: datetime) -> datetime:
     return datetime(dt.year, dt.month, 1)
 
 
-def _time_ago(iso_date: str) -> str:
-    if not iso_date:
+def _time_ago(value: Union[str, datetime, None]) -> str:
+    """Accept either a datetime (asyncpg) or an ISO string. ✅ Fixes 'Just now' everywhere."""
+    if not value:
         return "Just now"
     try:
-        dt = datetime.fromisoformat(iso_date.replace('Z', '+00:00'))
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
         now = datetime.utcnow()
-        diff = now - dt
-        seconds = diff.total_seconds()
+        seconds = (now - dt).total_seconds()
+        if seconds < 0:
+            return "Just now"
         if seconds < 60:
             return "Just now"
         elif seconds < 3600:
             mins = int(seconds / 60)
-            return f"{mins} min{'s' if mins > 1 else ''} ago"
+            return f"{mins} min{'s' if mins != 1 else ''} ago"
         elif seconds < 86400:
             hours = int(seconds / 3600)
-            return f"{hours} hour{'s' if hours > 1 else ''} ago"
+            return f"{hours} hour{'s' if hours != 1 else ''} ago"
         elif seconds < 604800:
             days = int(seconds / 86400)
-            return f"{days} day{'s' if days > 1 else ''} ago"
+            return f"{days} day{'s' if days != 1 else ''} ago"
         else:
             return dt.strftime("%d %b %Y")
-    except:
+    except Exception:
         return "Just now"
 
 
@@ -64,38 +75,41 @@ async def platform_stats(admin: dict = Depends(admin_required)):
 
     total_users = await database.fetch_val("SELECT COUNT(*) FROM users") or 0
     total_stores = await database.fetch_val("SELECT COUNT(*) FROM stores") or 0
-    total_orders = await database.fetch_val("SELECT COUNT(*) FROM escrow WHERE status = 'completed'") or 0
-
-    # FIX: cast total_amount to numeric, using NULLIF for empty strings
-    total_revenue = await database.fetch_val(
-        "SELECT COALESCE(SUM(NULLIF(total_amount, '')::numeric), 0) FROM escrow WHERE status = 'completed'"
+    total_orders = await database.fetch_val(
+        "SELECT COUNT(*) FROM escrow WHERE status = 'completed'"
     ) or 0
 
-    last_month_start = _subtract_months(now, 1)
+    # ✅ FIXED: total_amount is double precision — no NULLIF, no ::numeric cast.
+    total_revenue = await database.fetch_val(
+        "SELECT COALESCE(SUM(total_amount), 0) FROM escrow WHERE status = 'completed'"
+    ) or 0
+
+    last_month_start = _add_months(now, -1)
     previous_users = await database.fetch_val(
         "SELECT COUNT(*) FROM users WHERE created_at < :date",
-        {"date": last_month_start.isoformat()}
+        {"date": last_month_start}  # ✅ datetime, not .isoformat()
     ) or 1
     growth = int(((total_users - previous_users) / previous_users) * 100)
 
     user_growth = []
     for i in range(11, -1, -1):
-        month_start = _month_start(_subtract_months(now, i))
-        next_month = _month_start(_subtract_months(now, i - 1))
+        month_start = _month_start(_add_months(now, -i))
+        next_month = _month_start(_add_months(now, 1 - i))
         count = await database.fetch_val(
             "SELECT COUNT(*) FROM users WHERE created_at >= :start AND created_at < :end",
-            {"start": month_start.isoformat(), "end": next_month.isoformat()}
+            {"start": month_start, "end": next_month}  # ✅ datetime objects
         ) or 0
         user_growth.append(count)
 
     monthly_revenue = []
     for i in range(11, -1, -1):
-        month_start = _month_start(_subtract_months(now, i))
-        next_month = _month_start(_subtract_months(now, i - 1))
+        month_start = _month_start(_add_months(now, -i))
+        next_month = _month_start(_add_months(now, 1 - i))
+        # ✅ FIXED: plain SUM on double precision.
         revenue = await database.fetch_val(
-            "SELECT COALESCE(SUM(NULLIF(total_amount, '')::numeric), 0) FROM escrow "
+            "SELECT COALESCE(SUM(total_amount), 0) FROM escrow "
             "WHERE status = 'completed' AND created_at >= :start AND created_at < :end",
-            {"start": month_start.isoformat(), "end": next_month.isoformat()}
+            {"start": month_start, "end": next_month}
         ) or 0
         monthly_revenue.append(revenue)
 
@@ -108,11 +122,11 @@ async def platform_stats(admin: dict = Depends(admin_required)):
 
     orders_trend = []
     for i in range(11, -1, -1):
-        month_start = _month_start(_subtract_months(now, i))
-        next_month = _month_start(_subtract_months(now, i - 1))
+        month_start = _month_start(_add_months(now, -i))
+        next_month = _month_start(_add_months(now, 1 - i))
         count = await database.fetch_val(
             "SELECT COUNT(*) FROM escrow WHERE created_at >= :start AND created_at < :end",
-            {"start": month_start.isoformat(), "end": next_month.isoformat()}
+            {"start": month_start, "end": next_month}
         ) or 0
         orders_trend.append(count)
 
@@ -125,7 +139,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
             "type": "user",
             "action": "signed up",
             "name": user["nickname"] or user["id"][:8],
-            "time": _time_ago(user["created_at"])
+            "time": _time_ago(user["created_at"])  # ✅ now handles datetime
         })
 
     recent_stores = await database.fetch_all(
@@ -150,22 +164,23 @@ async def platform_stats(admin: dict = Depends(admin_required)):
             "time": _time_ago(order["created_at"])
         })
 
-    # Keep recent activity limited to 5 (no sorting by time string)
     recent_activity = recent_activity[:5]
 
+    # ✅ FIXED: no NULLIF, and joins rewritten to use scalar subqueries
+    # because the previous cross-join of listings × escrow multiplied SUM(total_amount)
+    # by the number of listings per store. Also joined on owner_id, not store_id —
+    # escrow.storekeeper_id is a user id, not a store id.
     top_stores = await database.fetch_all("""
-        SELECT 
+        SELECT
             s.name,
-            COUNT(l.listing_id) as items,
-            COALESCE(SUM(NULLIF(e.total_amount, '')::numeric), 0) as revenue,
-            COALESCE(AVG(r.rating), 0) as rating
+            (SELECT COUNT(*) FROM listings l WHERE l.store_id = s.store_id) AS items,
+            (SELECT COALESCE(SUM(e.total_amount), 0)
+                FROM escrow e
+                WHERE e.storekeeper_id = s.owner_id AND e.status = 'completed') AS revenue,
+            (SELECT COALESCE(AVG(r.rating), 0)
+                FROM reviews r
+                WHERE r.store_id = s.store_id) AS rating
         FROM stores s
-        LEFT JOIN listings l ON s.store_id = l.store_id
-        LEFT JOIN escrow e ON s.store_id = e.storekeeper_id AND e.status = 'completed'
-        LEFT JOIN (
-            SELECT store_id, AVG(rating) as rating FROM reviews GROUP BY store_id
-        ) r ON s.store_id = r.store_id
-        GROUP BY s.store_id, s.name
         ORDER BY revenue DESC
         LIMIT 5
     """)
@@ -262,7 +277,7 @@ async def suspend_user(user_id: str, admin: dict = Depends(admin_required)):
         raise HTTPException(status_code=404, detail="User not found")
     await database.execute(
         "UPDATE users SET suspended = 1, updated_at = :now WHERE id = :uid",
-        {"uid": user_id, "now": datetime.utcnow().isoformat()}
+        {"uid": user_id, "now": datetime.utcnow()}  # ✅ datetime object
     )
     return {"message": "User suspended"}
 
@@ -274,7 +289,7 @@ async def unsuspend_user(user_id: str, admin: dict = Depends(admin_required)):
         raise HTTPException(status_code=404, detail="User not found")
     await database.execute(
         "UPDATE users SET suspended = 0, updated_at = :now WHERE id = :uid",
-        {"uid": user_id, "now": datetime.utcnow().isoformat()}
+        {"uid": user_id, "now": datetime.utcnow()}
     )
     return {"message": "User unsuspended"}
 
@@ -302,7 +317,7 @@ async def list_stores(
     base_query = """
         SELECT s.*, u.nickname as owner_name, u.email as owner_email,
                COUNT(l.listing_id) as total_items,
-               (SELECT COUNT(*) FROM escrow WHERE storekeeper_id = s.store_id AND status = 'completed') as total_orders
+               (SELECT COUNT(*) FROM escrow WHERE storekeeper_id = s.owner_id AND status = 'completed') as total_orders
         FROM stores s
         LEFT JOIN users u ON s.owner_id = u.id
         LEFT JOIN listings l ON s.store_id = l.store_id
@@ -339,7 +354,7 @@ async def verify_store(store_id: str, admin: dict = Depends(admin_required)):
         raise HTTPException(status_code=404, detail="Store not found")
     await database.execute(
         "UPDATE stores SET verified = 1, updated_at = :now WHERE store_id = :sid",
-        {"sid": store_id, "now": datetime.utcnow().isoformat()}
+        {"sid": store_id, "now": datetime.utcnow()}
     )
     return {"message": "Store verified"}
 
@@ -351,7 +366,7 @@ async def suspend_store(store_id: str, admin: dict = Depends(admin_required)):
         raise HTTPException(status_code=404, detail="Store not found")
     await database.execute(
         "UPDATE stores SET verified = 0, updated_at = :now WHERE store_id = :sid",
-        {"sid": store_id, "now": datetime.utcnow().isoformat()}
+        {"sid": store_id, "now": datetime.utcnow()}
     )
     return {"message": "Store suspended"}
 
@@ -378,7 +393,7 @@ async def list_orders(
     admin: dict = Depends(admin_required)
 ):
     base_query = """
-        SELECT e.*, 
+        SELECT e.*,
                u1.nickname as shopper_name,
                u2.nickname as storekeeper_name,
                s.name as store_name
@@ -428,7 +443,7 @@ async def update_order_status(
         raise HTTPException(status_code=404, detail="Order not found")
     await database.execute(
         "UPDATE escrow SET status = :status, updated_at = :now WHERE order_id = :oid",
-        {"status": status, "now": datetime.utcnow().isoformat(), "oid": order_id}
+        {"status": status, "now": datetime.utcnow(), "oid": order_id}
     )
     return {"message": f"Order status updated to {status}"}
 
@@ -488,7 +503,6 @@ async def admin_get_couriers(
     if search:
         query += " WHERE name LIKE :search OR courier_id LIKE :search"
         params["search"] = f"%{search}%"
-    # Removed ORDER BY created_at because couriers table doesn't have that column
     query += " LIMIT :limit OFFSET :offset"
     params["limit"] = limit
     params["offset"] = offset
@@ -589,8 +603,10 @@ async def list_transactions(
     offset: int = 0,
     admin: dict = Depends(admin_required)
 ):
+    # ⚠️ ASSUMPTION: table is `wallet_transactions` (handoff schema list). If your DB
+    # really has a `transactions` table, revert this one line.
     rows = await database.fetch_all(
-        "SELECT * FROM transactions ORDER BY created_at DESC LIMIT :l OFFSET :o",
+        "SELECT * FROM wallet_transactions ORDER BY created_at DESC LIMIT :l OFFSET :o",
         {"l": limit, "o": offset}
     )
     return [dict(row) for row in rows]
@@ -601,6 +617,8 @@ async def list_transactions(
 # ============================================================
 @router.get("/promotions")
 async def get_promotions():
+    # ⚠️ `promotions` table is not in the handoff schema list. Endpoint will 500
+    # until the table exists. Leaving the query as-is.
     rows = await database.fetch_all(
         "SELECT * FROM promotions WHERE is_active = 1 ORDER BY position ASC"
     )
@@ -697,6 +715,8 @@ async def get_settings(admin: dict = Depends(admin_required)):
         "commission_rate": 5.0,
         "min_withdrawal": 1000,
     }
+
+
 @router.get("/users/{user_id}")
 async def get_user(user_id: str, admin: dict = Depends(admin_required)):
     user = await database.fetch_one("SELECT * FROM users WHERE id = :uid", {"uid": user_id})
