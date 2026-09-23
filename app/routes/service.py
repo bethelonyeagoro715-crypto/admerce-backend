@@ -28,9 +28,14 @@ class BookServiceRequest(BaseModel):
 class ToggleAvailabilityRequest(BaseModel):
     is_available: bool
 
-# ✅ NEW: direct service payment. Amount is NOT sent — backend uses the DB
-#    price so a malicious client can't underpay. `reference` is a client-
-#    generated UUID used for idempotency (blocks double-tap + retry dupes).
+# ✅ NEW — partial update. All fields optional; only provided keys are written.
+class UpdateServiceRequest(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    duration_minutes: Optional[int] = None
+
 class InstantPayRequest(BaseModel):
     service_id: str
     provider_id: str
@@ -180,18 +185,8 @@ async def update_provider_availability(
 
 
 # ============================================================
-# DIRECT SERVICE PAYMENT (no booking, no escrow)
+# DIRECT SERVICE PAYMENT
 # ============================================================
-# ✅ NEW. Mirrors `instant_pickup` in wallet.py — money moves directly
-#    from the customer's wallet to the provider's wallet in one hop.
-#
-#    Idempotency: the client sends a UUID `reference`. If a wallet
-#    transaction with that reference already exists for this customer,
-#    we return success without charging again. This blocks double-tap
-#    and timeout-retry duplicates.
-#
-#    Security: the amount is read from the DB, not the request. A
-#    malicious client can't send amount=1 and pay ₦1 for a ₦5000 job.
 @router.post("/instant-pay")
 async def instant_pay_service(
     req: InstantPayRequest,
@@ -202,7 +197,6 @@ async def instant_pay_service(
     if not req.reference or len(req.reference) < 8:
         raise HTTPException(status_code=400, detail="Invalid payment reference")
 
-    # ── 1. Verify the service exists, is active, and belongs to the provider
     service_row = await database.fetch_one(
         "SELECT provider_id, price, title FROM services "
         "WHERE service_id = :sid AND is_active = TRUE",
@@ -218,12 +212,10 @@ async def instant_pay_service(
     if customer_id == service["provider_id"]:
         raise HTTPException(status_code=400, detail="You cannot pay for your own service")
 
-    # ── 2. Trust the DB price, not the client
     price = _as_float(service["price"])
     if price <= 0:
         raise HTTPException(status_code=400, detail="Service price is invalid")
 
-    # ── 3. Idempotency — reject replayed references
     existing = await database.fetch_one(
         "SELECT id FROM wallet_transactions "
         "WHERE user_id = :uid AND reference = :ref",
@@ -235,7 +227,6 @@ async def instant_pay_service(
             detail="This payment has already been processed",
         )
 
-    # ── 4. Check customer balance
     wallet = await database.fetch_one(
         "SELECT balance FROM wallets WHERE user_id = :uid",
         {"uid": customer_id},
@@ -243,7 +234,6 @@ async def instant_pay_service(
     if not wallet or _as_float(wallet["balance"]) < price:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    # ── 5. Move the money
     await database.execute(
         "UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid",
         {"amt": price, "uid": customer_id},
@@ -253,9 +243,6 @@ async def instant_pay_service(
         {"amt": price, "uid": service["provider_id"]},
     )
 
-    # ── 6. Log both sides. Same reference on both rows so the pair is
-    #       traceable, but the idempotency check above filters by user_id
-    #       so it only sees the customer's side.
     await database.execute(
         """
         INSERT INTO wallet_transactions
@@ -294,6 +281,102 @@ async def instant_pay_service(
     }
 
 
+# ============================================================
+# EDIT — PATCH /services/{id}   (owner only, partial)
+# ============================================================
+# ✅ NEW. Single UPDATE with owner in the WHERE — no read-then-write race.
+#    rowcount == 0 means either the service doesn't exist or the caller
+#    isn't its provider; both map to 403 to avoid leaking existence.
+@router.patch("/{service_id}")
+async def update_service(
+    service_id: str,
+    req: UpdateServiceRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    provider_id = current_user["id"]
+
+    updates = []
+    params = {"sid": service_id, "pid": provider_id}
+
+    if req.title is not None:
+        t = req.title.strip()
+        if not t:
+            raise HTTPException(status_code=400, detail="Title cannot be empty")
+        if len(t) > 120:
+            raise HTTPException(status_code=400, detail="Title too long (max 120 characters)")
+        updates.append("title = :title")
+        params["title"] = t
+
+    if req.category is not None:
+        updates.append("category = :category")
+        params["category"] = req.category.strip()
+
+    if req.description is not None:
+        updates.append("description = :description")
+        params["description"] = req.description.strip()
+
+    if req.price is not None:
+        if req.price < 0:
+            raise HTTPException(status_code=400, detail="Price must be 0 or greater")
+        updates.append("price = :price")
+        params["price"] = float(req.price)
+
+    if req.duration_minutes is not None:
+        if req.duration_minutes <= 0:
+            raise HTTPException(status_code=400, detail="Duration must be greater than 0")
+        updates.append("duration_minutes = :duration_minutes")
+        params["duration_minutes"] = int(req.duration_minutes)
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    query = f"""
+        UPDATE services
+        SET {', '.join(updates)}
+        WHERE service_id = :sid AND provider_id = :pid
+    """
+    result = await database.execute(query, params)
+
+    # asyncpg returns a status string like 'UPDATE 1' or 'UPDATE 0'
+    if isinstance(result, str) and result.strip().endswith("0"):
+        raise HTTPException(status_code=403, detail="Not authorized or service not found")
+
+    # Return the updated row so the caller doesn't need a second GET.
+    row = await database.fetch_one(
+        "SELECT * FROM services WHERE service_id = :sid",
+        {"sid": service_id},
+    )
+    return dict(row) if row else {"service_id": service_id, "message": "Updated"}
+
+
+# ============================================================
+# DELETE VIDEO — removes only the video_url (owner only)
+# ============================================================
+# ✅ NEW. Cloudinary asset is NOT deleted (we don't store its public_id).
+#    The row's video_url is set to NULL; the provider can upload a new
+#    video or switch back to image-only.
+@router.delete("/{service_id}/video")
+async def delete_service_video(
+    service_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    provider_id = current_user["id"]
+    result = await database.execute(
+        """
+        UPDATE services
+        SET video_url = NULL
+        WHERE service_id = :sid AND provider_id = :pid
+        """,
+        {"sid": service_id, "pid": provider_id},
+    )
+    if isinstance(result, str) and result.strip().endswith("0"):
+        raise HTTPException(status_code=403, detail="Not authorized or service not found")
+    return {"service_id": service_id, "video_url": None, "message": "Video removed"}
+
+
+# ============================================================
+# TOGGLE / DELETE / BOOK — existing
+# ============================================================
 @router.post("/{service_id}/toggle")
 async def toggle_service_active(
     service_id: str,
@@ -331,7 +414,7 @@ async def delete_service(service_id: str, current_user: dict = Depends(get_curre
 
 
 # ============================================================
-# BOOKINGS — LIST
+# BOOKINGS
 # ============================================================
 @router.get("/bookings")
 async def get_bookings(current_user: dict = Depends(get_current_user)):
@@ -360,9 +443,6 @@ async def get_bookings(current_user: dict = Depends(get_current_user)):
     )
     return [dict(row) for row in rows]
 
-# ============================================================
-# BOOKINGS — DETAIL
-# ============================================================
 @router.get("/bookings/{booking_id}")
 async def get_booking(booking_id: str, current_user: dict = Depends(get_current_user)):
     row = await database.fetch_one(
@@ -397,9 +477,6 @@ async def get_booking(booking_id: str, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=403, detail="Access denied")
     return booking
 
-# ============================================================
-# ACCEPT
-# ============================================================
 @router.post("/bookings/{booking_id}/accept")
 async def accept_booking(
     booking_id: str,
@@ -444,9 +521,6 @@ async def accept_booking(
         "message": "Booking accepted. The customer has been notified.",
     }
 
-# ============================================================
-# DECLINE
-# ============================================================
 @router.post("/bookings/{booking_id}/decline")
 async def decline_booking(
     booking_id: str,
@@ -501,9 +575,6 @@ async def decline_booking(
         "message": f"Booking declined. ₦{amount:,.0f} returned to the customer.",
     }
 
-# ============================================================
-# CONFIRM (provider marks done)
-# ============================================================
 @router.post("/bookings/{booking_id}/confirm")
 async def confirm_booking(
     booking_id: str,
@@ -545,9 +616,6 @@ async def confirm_booking(
         "message": "Job marked complete, funds released.",
     }
 
-# ============================================================
-# COMPLETE (customer releases funds)
-# ============================================================
 @router.post("/bookings/{booking_id}/complete")
 async def complete_booking(
     booking_id: str,
@@ -586,9 +654,6 @@ async def complete_booking(
         "message": "Funds released to provider.",
     }
 
-# ============================================================
-# CANCEL
-# ============================================================
 @router.post("/bookings/{booking_id}/cancel")
 async def cancel_booking(
     booking_id: str,
@@ -651,7 +716,7 @@ async def cancel_booking(
 
 
 # ============================================================
-# DYNAMIC ROUTES
+# DYNAMIC — create, list, upload, get, book, provider-services
 # ============================================================
 
 @router.post("/")
@@ -849,9 +914,6 @@ async def book_service(
 
 @router.get("/provider/{provider_id}")
 async def get_provider_services_by_user(provider_id: str):
-    # ✅ FIX: JOIN users so the frontend gets business_name / username /
-    #    avatar_url. Previously returned `SELECT *` from services only,
-    #    so /provider-services/[id] always showed "Service Provider".
     rows = await database.fetch_all(
         """
         SELECT s.*,
