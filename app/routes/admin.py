@@ -17,7 +17,7 @@ async def admin_required(current_user: dict = Depends(get_current_user)):
 # ---------- Helpers ----------
 
 def _add_months(dt: datetime, months: int) -> datetime:
-    """Add (or subtract, if negative) months from dt, clamping the day. ✅ Replaces broken _subtract_months."""
+    """Add (or subtract, if negative) months from dt, clamping the day."""
     month_index = (dt.year * 12 + (dt.month - 1)) + months
     year = month_index // 12
     month = (month_index % 12) + 1
@@ -35,7 +35,7 @@ def _month_start(dt: datetime) -> datetime:
 
 
 def _time_ago(value: Union[str, datetime, None]) -> str:
-    """Accept either a datetime (asyncpg) or an ISO string. ✅ Fixes 'Just now' everywhere."""
+    """Accept either a datetime (asyncpg) or an ISO string."""
     if not value:
         return "Just now"
     try:
@@ -79,7 +79,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
         "SELECT COUNT(*) FROM escrow WHERE status = 'completed'"
     ) or 0
 
-    # ✅ FIXED: total_amount is double precision — no NULLIF, no ::numeric cast.
+    # total_amount is double precision — no NULLIF, no ::numeric cast.
     total_revenue = await database.fetch_val(
         "SELECT COALESCE(SUM(total_amount), 0) FROM escrow WHERE status = 'completed'"
     ) or 0
@@ -87,7 +87,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
     last_month_start = _add_months(now, -1)
     previous_users = await database.fetch_val(
         "SELECT COUNT(*) FROM users WHERE created_at < :date",
-        {"date": last_month_start}  # ✅ datetime, not .isoformat()
+        {"date": last_month_start}
     ) or 1
     growth = int(((total_users - previous_users) / previous_users) * 100)
 
@@ -97,7 +97,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
         next_month = _month_start(_add_months(now, 1 - i))
         count = await database.fetch_val(
             "SELECT COUNT(*) FROM users WHERE created_at >= :start AND created_at < :end",
-            {"start": month_start, "end": next_month}  # ✅ datetime objects
+            {"start": month_start, "end": next_month}
         ) or 0
         user_growth.append(count)
 
@@ -105,7 +105,6 @@ async def platform_stats(admin: dict = Depends(admin_required)):
     for i in range(11, -1, -1):
         month_start = _month_start(_add_months(now, -i))
         next_month = _month_start(_add_months(now, 1 - i))
-        # ✅ FIXED: plain SUM on double precision.
         revenue = await database.fetch_val(
             "SELECT COALESCE(SUM(total_amount), 0) FROM escrow "
             "WHERE status = 'completed' AND created_at >= :start AND created_at < :end",
@@ -139,7 +138,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
             "type": "user",
             "action": "signed up",
             "name": user["nickname"] or user["id"][:8],
-            "time": _time_ago(user["created_at"])  # ✅ now handles datetime
+            "time": _time_ago(user["created_at"])
         })
 
     recent_stores = await database.fetch_all(
@@ -166,10 +165,6 @@ async def platform_stats(admin: dict = Depends(admin_required)):
 
     recent_activity = recent_activity[:5]
 
-    # ✅ FIXED: no NULLIF, and joins rewritten to use scalar subqueries
-    # because the previous cross-join of listings × escrow multiplied SUM(total_amount)
-    # by the number of listings per store. Also joined on owner_id, not store_id —
-    # escrow.storekeeper_id is a user id, not a store id.
     top_stores = await database.fetch_all("""
         SELECT
             s.name,
@@ -275,9 +270,10 @@ async def suspend_user(user_id: str, admin: dict = Depends(admin_required)):
     user = await database.fetch_one("SELECT id FROM users WHERE id = :uid", {"uid": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # ✅ FIXED: boolean column — use TRUE literal, not integer 1.
     await database.execute(
-        "UPDATE users SET suspended = 1, updated_at = :now WHERE id = :uid",
-        {"uid": user_id, "now": datetime.utcnow()}  # ✅ datetime object
+        "UPDATE users SET suspended = TRUE, updated_at = :now WHERE id = :uid",
+        {"uid": user_id, "now": datetime.utcnow()}
     )
     return {"message": "User suspended"}
 
@@ -287,8 +283,9 @@ async def unsuspend_user(user_id: str, admin: dict = Depends(admin_required)):
     user = await database.fetch_one("SELECT id FROM users WHERE id = :uid", {"uid": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # ✅ FIXED: boolean column — use FALSE literal, not integer 0.
     await database.execute(
-        "UPDATE users SET suspended = 0, updated_at = :now WHERE id = :uid",
+        "UPDATE users SET suspended = FALSE, updated_at = :now WHERE id = :uid",
         {"uid": user_id, "now": datetime.utcnow()}
     )
     return {"message": "User unsuspended"}
@@ -329,7 +326,7 @@ async def list_stores(
         params["s"] = f"%{search}%"
     if status and status != "All":
         conditions.append("s.verified = :verified")
-        params["verified"] = status == "Active"
+        params["verified"] = status == "Active"  # Python bool → boolean column, OK
     if conditions:
         base_query += " WHERE " + " AND ".join(conditions)
     base_query += " GROUP BY s.store_id, u.nickname, u.email ORDER BY s.created_at DESC LIMIT :l OFFSET :o"
@@ -352,8 +349,9 @@ async def verify_store(store_id: str, admin: dict = Depends(admin_required)):
     store = await database.fetch_one("SELECT store_id FROM stores WHERE store_id = :sid", {"sid": store_id})
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
+    # ✅ FIXED: stores.verified is boolean — use TRUE literal, not integer 1.
     await database.execute(
-        "UPDATE stores SET verified = 1, updated_at = :now WHERE store_id = :sid",
+        "UPDATE stores SET verified = TRUE, updated_at = :now WHERE store_id = :sid",
         {"sid": store_id, "now": datetime.utcnow()}
     )
     return {"message": "Store verified"}
@@ -364,8 +362,9 @@ async def suspend_store(store_id: str, admin: dict = Depends(admin_required)):
     store = await database.fetch_one("SELECT store_id FROM stores WHERE store_id = :sid", {"sid": store_id})
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
+    # ✅ FIXED: stores.verified is boolean — use FALSE literal, not integer 0.
     await database.execute(
-        "UPDATE stores SET verified = 0, updated_at = :now WHERE store_id = :sid",
+        "UPDATE stores SET verified = FALSE, updated_at = :now WHERE store_id = :sid",
         {"sid": store_id, "now": datetime.utcnow()}
     )
     return {"message": "Store suspended"}
@@ -603,7 +602,7 @@ async def list_transactions(
     offset: int = 0,
     admin: dict = Depends(admin_required)
 ):
-    # ⚠️ ASSUMPTION: table is `wallet_transactions` (handoff schema list). If your DB
+    # ⚠️ ASSUMPTION: table is `wallet_transactions` per handoff schema. If your DB
     # really has a `transactions` table, revert this one line.
     rows = await database.fetch_all(
         "SELECT * FROM wallet_transactions ORDER BY created_at DESC LIMIT :l OFFSET :o",
@@ -618,9 +617,9 @@ async def list_transactions(
 @router.get("/promotions")
 async def get_promotions():
     # ⚠️ `promotions` table is not in the handoff schema list. Endpoint will 500
-    # until the table exists. Leaving the query as-is.
+    # until the table exists. Query left as-is.
     rows = await database.fetch_all(
-        "SELECT * FROM promotions WHERE is_active = 1 ORDER BY position ASC"
+        "SELECT * FROM promotions WHERE is_active = TRUE ORDER BY position ASC"  # ✅ boolean literal
     )
     return [dict(row) for row in rows]
 
@@ -635,10 +634,11 @@ async def create_promotion(
     admin: dict = Depends(admin_required)
 ):
     promo_id = uuid.uuid4().hex
+    # ✅ FIXED: is_active = TRUE literal, not integer 1.
     await database.execute(
         """
         INSERT INTO promotions (id, image_url, title, subtitle, target_url, position, is_active)
-        VALUES (:id, :img, :title, :sub, :url, :pos, 1)
+        VALUES (:id, :img, :title, :sub, :url, :pos, TRUE)
         """,
         {
             "id": promo_id,
@@ -681,6 +681,7 @@ async def update_promotion(
         updates.append("position = :pos")
         params["pos"] = position
     if is_active is not None:
+        # Python bool → boolean column, correct as-is. No change needed.
         updates.append("is_active = :active")
         params["active"] = is_active
     if not updates:
