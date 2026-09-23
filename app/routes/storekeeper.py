@@ -31,6 +31,17 @@ class StoreCreateRequest(BaseModel):
 class UpdateOrderRequest(BaseModel):
     listing_ids: List[str]   # ordered list of listing IDs
 
+# ✅ NEW — store verification submission. Evidence is a list of URLs; the
+#    storekeeper uploads files through the existing /upload-store-image
+#    endpoint (or any future media endpoint) and passes the returned URLs.
+class VerificationSubmitRequest(BaseModel):
+    legal_name: str = Field(..., min_length=2, max_length=200)
+    business_type: str = Field(..., min_length=2, max_length=100)
+    cac_number: Optional[str] = Field(None, max_length=50)
+    business_address: str = Field(..., min_length=4, max_length=400)
+    contact_phone: str = Field(..., min_length=7, max_length=30)
+    evidence: List[str] = Field(default_factory=list)
+
 # ---------- helper ----------
 def compute_title_quality(title: str) -> float:
     if not title or len(title.strip()) == 0:
@@ -46,6 +57,33 @@ def compute_title_quality(title: str) -> float:
     bonus = 0.2 if has_desc else 0.0
     score = min(max(length_score + bonus, 0.1), 0.95)
     return round(score, 4)
+
+# ✅ NEW — the single place that writes to store_verification_events.
+#    Append-only; nothing here can UPDATE or DELETE existing events.
+async def _log_store_verification_event(
+    store_id: str,
+    from_status: Optional[str],
+    to_status: str,
+    actor_id: Optional[str],
+    reason: Optional[str] = None,
+    reference: Optional[str] = None,
+):
+    await database.execute(
+        """
+        INSERT INTO store_verification_events
+            (store_id, actor_id, from_status, to_status, reason, reference, created_at)
+        VALUES
+            (:sid, :actor, :from_s, :to_s, :reason, :ref, NOW())
+        """,
+        {
+            "sid": store_id,
+            "actor": actor_id,
+            "from_s": from_status,
+            "to_s": to_status,
+            "reason": reason,
+            "ref": reference,
+        },
+    )
 
 # ==================== CREATE STORE ====================
 @router.post("/store", status_code=201)
@@ -105,6 +143,243 @@ async def create_store(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"Store creation failed: {str(e)}")
+
+# ==================== STORE VERIFICATION ====================
+# Admin-reviewed two-step flow:
+#   1. Storekeeper submits a request (this section).
+#   2. Admin approves / rejects (admin.py).
+#
+# Rules enforced here:
+#   - Only the store's owner can submit or cancel.
+#   - Store must be 'unverified' or 'rejected' to submit a new request.
+#   - A store with a pending request cannot submit a second one.
+#   - Cancelling reverts the store to 'unverified'; the storekeeper can
+#     then fix the submission and try again.
+#
+# Every transition writes an append-only row to store_verification_events.
+
+@router.get("/{store_id}/verification")
+async def get_store_verification_status(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Owner-side status: current state, latest request, full event history.
+    """
+    store = await database.fetch_one(
+        "SELECT store_id, owner_id, verification_status, verified, verified_at "
+        "FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+    if store["owner_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not your store")
+
+    latest_request = await database.fetch_one(
+        """
+        SELECT * FROM store_verifications
+        WHERE store_id = :sid
+        ORDER BY submitted_at DESC
+        LIMIT 1
+        """,
+        {"sid": store_id},
+    )
+    events = await database.fetch_all(
+        """
+        SELECT * FROM store_verification_events
+        WHERE store_id = :sid
+        ORDER BY created_at DESC
+        LIMIT 20
+        """,
+        {"sid": store_id},
+    )
+
+    return {
+        "store_id": store_id,
+        "verification_status": store["verification_status"] or "unverified",
+        "verified": bool(store["verified"]),
+        "verified_at": store["verified_at"],
+        "latest_request": dict(latest_request) if latest_request else None,
+        "events": [dict(e) for e in events],
+    }
+
+@router.post("/{store_id}/verification/request", status_code=201)
+async def submit_store_verification(
+    store_id: str,
+    req: VerificationSubmitRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Submit a verification request. Only the owner can call this.
+    Fails 409 if a pending request already exists for the store.
+    """
+    store = await database.fetch_one(
+        "SELECT store_id, owner_id, name, verification_status FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+    if store["owner_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not your store")
+
+    current_status = store["verification_status"] or "unverified"
+    if current_status not in ("unverified", "rejected"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot submit a verification request from status '{current_status}'. "
+                "Only unverified or rejected stores can submit."
+            ),
+        )
+
+    existing_pending = await database.fetch_one(
+        "SELECT id FROM store_verifications WHERE store_id = :sid AND status = 'pending'",
+        {"sid": store_id},
+    )
+    if existing_pending:
+        raise HTTPException(
+            status_code=409,
+            detail="A verification request is already pending for this store",
+        )
+
+    request_id = uuid.uuid4()
+    reference_code = uuid.uuid4().hex
+    now = datetime.utcnow()
+
+    await database.execute(
+        """
+        INSERT INTO store_verifications (
+            id, store_id, submitted_by, status,
+            legal_name, business_type, cac_number,
+            business_address, contact_phone, evidence,
+            reference_code, submitted_at
+        ) VALUES (
+            :id, :sid, :uid, 'pending',
+            :legal_name, :btype, :cac,
+            :addr, :phone, :evidence,
+            :ref, :now
+        )
+        """,
+        {
+            "id": request_id,
+            "sid": store_id,
+            "uid": current_user["id"],
+            "legal_name": req.legal_name.strip(),
+            "btype": req.business_type.strip(),
+            "cac": (req.cac_number or "").strip() or None,
+            "addr": req.business_address.strip(),
+            "phone": req.contact_phone.strip(),
+            "evidence": json.dumps(req.evidence or []),
+            "ref": reference_code,
+            "now": now,
+        },
+    )
+
+    await database.execute(
+        """
+        UPDATE stores
+        SET verification_status = 'pending',
+            verified = FALSE,
+            updated_at = :now
+        WHERE store_id = :sid
+          AND verification_status IN ('unverified', 'rejected')
+        """,
+        {"now": now, "sid": store_id},
+    )
+
+    await _log_store_verification_event(
+        store_id=store_id,
+        from_status=current_status,
+        to_status="pending",
+        actor_id=current_user["id"],
+        reason=None,
+        reference=reference_code,
+    )
+
+    return {
+        "store_id": store_id,
+        "status": "pending",
+        "reference_code": reference_code,
+        "message": "Verification request submitted. An admin will review it shortly.",
+    }
+
+@router.delete("/{store_id}/verification/request")
+async def cancel_store_verification(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Cancel a pending verification request. Reverts store to 'unverified'.
+    Only the owner can cancel; only works when status is currently 'pending'.
+    """
+    store = await database.fetch_one(
+        "SELECT store_id, owner_id, verification_status FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+    if store["owner_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not your store")
+
+    current_status = store["verification_status"] or "unverified"
+    if current_status != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail=f"No pending request to cancel (current status: '{current_status}')",
+        )
+
+    now = datetime.utcnow()
+
+    pending = await database.fetch_one(
+        """
+        SELECT id, reference_code FROM store_verifications
+        WHERE store_id = :sid AND status = 'pending'
+        ORDER BY submitted_at DESC
+        LIMIT 1
+        """,
+        {"sid": store_id},
+    )
+    if not pending:
+        raise HTTPException(status_code=400, detail="No pending request found")
+
+    await database.execute(
+        """
+        UPDATE store_verifications
+        SET status = 'cancelled',
+            reviewed_by = :uid,
+            reviewed_at = :now,
+            review_reason = 'Cancelled by storekeeper'
+        WHERE id = :rid AND status = 'pending'
+        """,
+        {"uid": current_user["id"], "now": now, "rid": pending["id"]},
+    )
+
+    await database.execute(
+        """
+        UPDATE stores
+        SET verification_status = 'unverified',
+            verified = FALSE,
+            updated_at = :now
+        WHERE store_id = :sid AND verification_status = 'pending'
+        """,
+        {"now": now, "sid": store_id},
+    )
+
+    await _log_store_verification_event(
+        store_id=store_id,
+        from_status="pending",
+        to_status="unverified",
+        actor_id=current_user["id"],
+        reason="Cancelled by storekeeper",
+        reference=pending["reference_code"],
+    )
+
+    return {
+        "store_id": store_id,
+        "status": "unverified",
+        "message": "Verification request cancelled",
+    }
 
 # ==================== CREATE LISTING ====================
 @router.post("/listing")
