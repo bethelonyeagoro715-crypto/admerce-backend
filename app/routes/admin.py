@@ -1,11 +1,13 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Body
 from app.db.database import database
 from app.routes.auth import get_current_user
 from typing import Optional, Union
 from datetime import datetime
 import uuid
+import json
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
+
 
 # ---------- Admin guard ----------
 async def admin_required(current_user: dict = Depends(get_current_user)):
@@ -15,9 +17,7 @@ async def admin_required(current_user: dict = Depends(get_current_user)):
 
 
 # ---------- Helpers ----------
-
 def _add_months(dt: datetime, months: int) -> datetime:
-    """Add (or subtract, if negative) months from dt, clamping the day."""
     month_index = (dt.year * 12 + (dt.month - 1)) + months
     year = month_index // 12
     month = (month_index % 12) + 1
@@ -35,7 +35,6 @@ def _month_start(dt: datetime) -> datetime:
 
 
 def _time_ago(value: Union[str, datetime, None]) -> str:
-    """Accept either a datetime (asyncpg) or an ISO string."""
     if not value:
         return "Just now"
     try:
@@ -66,6 +65,36 @@ def _time_ago(value: Union[str, datetime, None]) -> str:
         return "Just now"
 
 
+# ─────────────────────────────────────────────────────────────
+# Audit log writer — the single place that touches
+# store_verification_events. Every status change funnels here.
+# ─────────────────────────────────────────────────────────────
+async def _log_verification_event(
+    store_id: str,
+    from_status: Optional[str],
+    to_status: str,
+    actor_id: Optional[str],
+    reason: Optional[str] = None,
+    reference: Optional[str] = None,
+):
+    await database.execute(
+        """
+        INSERT INTO store_verification_events
+            (store_id, actor_id, from_status, to_status, reason, reference, created_at)
+        VALUES
+            (:sid, :actor, :from_s, :to_s, :reason, :ref, NOW())
+        """,
+        {
+            "sid": store_id,
+            "actor": actor_id,
+            "from_s": from_status,
+            "to_s": to_status,
+            "reason": reason,
+            "ref": reference,
+        },
+    )
+
+
 # ============================================================
 # 1. DASHBOARD STATS
 # ============================================================
@@ -79,7 +108,6 @@ async def platform_stats(admin: dict = Depends(admin_required)):
         "SELECT COUNT(*) FROM escrow WHERE status = 'completed'"
     ) or 0
 
-    # total_amount is double precision — no NULLIF, no ::numeric cast.
     total_revenue = await database.fetch_val(
         "SELECT COALESCE(SUM(total_amount), 0) FROM escrow WHERE status = 'completed'"
     ) or 0
@@ -87,7 +115,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
     last_month_start = _add_months(now, -1)
     previous_users = await database.fetch_val(
         "SELECT COUNT(*) FROM users WHERE created_at < :date",
-        {"date": last_month_start}
+        {"date": last_month_start},
     ) or 1
     growth = int(((total_users - previous_users) / previous_users) * 100)
 
@@ -97,7 +125,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
         next_month = _month_start(_add_months(now, 1 - i))
         count = await database.fetch_val(
             "SELECT COUNT(*) FROM users WHERE created_at >= :start AND created_at < :end",
-            {"start": month_start, "end": next_month}
+            {"start": month_start, "end": next_month},
         ) or 0
         user_growth.append(count)
 
@@ -108,14 +136,14 @@ async def platform_stats(admin: dict = Depends(admin_required)):
         revenue = await database.fetch_val(
             "SELECT COALESCE(SUM(total_amount), 0) FROM escrow "
             "WHERE status = 'completed' AND created_at >= :start AND created_at < :end",
-            {"start": month_start, "end": next_month}
+            {"start": month_start, "end": next_month},
         ) or 0
         monthly_revenue.append(revenue)
 
     category_sales_raw = await database.fetch_all(
         "SELECT category, COUNT(*) as count FROM listings GROUP BY category ORDER BY count DESC LIMIT 6"
     )
-    category_sales = {row['category']: row['count'] for row in category_sales_raw}
+    category_sales = {row["category"]: row["count"] for row in category_sales_raw}
     if not category_sales:
         category_sales = {"Groceries": 28, "Fashion": 22, "Electronics": 18, "Food": 15, "Services": 10, "Other": 7}
 
@@ -125,7 +153,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
         next_month = _month_start(_add_months(now, 1 - i))
         count = await database.fetch_val(
             "SELECT COUNT(*) FROM escrow WHERE created_at >= :start AND created_at < :end",
-            {"start": month_start, "end": next_month}
+            {"start": month_start, "end": next_month},
         ) or 0
         orders_trend.append(count)
 
@@ -138,7 +166,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
             "type": "user",
             "action": "signed up",
             "name": user["nickname"] or user["id"][:8],
-            "time": _time_ago(user["created_at"])
+            "time": _time_ago(user["created_at"]),
         })
 
     recent_stores = await database.fetch_all(
@@ -149,7 +177,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
             "type": "store",
             "action": "opened",
             "name": store["name"],
-            "time": _time_ago(store["created_at"])
+            "time": _time_ago(store["created_at"]),
         })
 
     recent_orders = await database.fetch_all(
@@ -160,7 +188,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
             "type": "order",
             "action": "placed",
             "name": f"Order #{order['order_id'][:8]}",
-            "time": _time_ago(order["created_at"])
+            "time": _time_ago(order["created_at"]),
         })
 
     recent_activity = recent_activity[:5]
@@ -185,7 +213,7 @@ async def platform_stats(admin: dict = Depends(admin_required)):
             "name": store["name"],
             "items": store["items"] or 0,
             "revenue": store["revenue"] or 0,
-            "rating": round(store["rating"] or 0, 1)
+            "rating": round(store["rating"] or 0, 1),
         })
 
     return {
@@ -212,7 +240,7 @@ async def list_users(
     role: Optional[str] = Query(None),
     limit: int = 50,
     offset: int = 0,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
     base_query = """
         SELECT id, phone, email, nickname, verified, kyc_verified, role,
@@ -250,15 +278,13 @@ async def get_user_full_details(user_id: str, admin: dict = Depends(admin_requir
     user_dict = dict(user)
 
     store = await database.fetch_one(
-        "SELECT * FROM stores WHERE owner_id = :uid",
-        {"uid": user_id}
+        "SELECT * FROM stores WHERE owner_id = :uid", {"uid": user_id}
     )
     user_dict["store"] = dict(store) if store else None
 
     if user_dict.get("role") == "courier":
         courier = await database.fetch_one(
-            "SELECT * FROM couriers WHERE courier_id = :uid",
-            {"uid": user_id}
+            "SELECT * FROM couriers WHERE courier_id = :uid", {"uid": user_id}
         )
         user_dict["courier"] = dict(courier) if courier else None
 
@@ -270,10 +296,9 @@ async def suspend_user(user_id: str, admin: dict = Depends(admin_required)):
     user = await database.fetch_one("SELECT id FROM users WHERE id = :uid", {"uid": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    # ✅ FIXED: boolean column — use TRUE literal, not integer 1.
     await database.execute(
         "UPDATE users SET suspended = TRUE, updated_at = :now WHERE id = :uid",
-        {"uid": user_id, "now": datetime.utcnow()}
+        {"uid": user_id, "now": datetime.utcnow()},
     )
     return {"message": "User suspended"}
 
@@ -283,10 +308,9 @@ async def unsuspend_user(user_id: str, admin: dict = Depends(admin_required)):
     user = await database.fetch_one("SELECT id FROM users WHERE id = :uid", {"uid": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    # ✅ FIXED: boolean column — use FALSE literal, not integer 0.
     await database.execute(
         "UPDATE users SET suspended = FALSE, updated_at = :now WHERE id = :uid",
-        {"uid": user_id, "now": datetime.utcnow()}
+        {"uid": user_id, "now": datetime.utcnow()},
     )
     return {"message": "User unsuspended"}
 
@@ -301,7 +325,7 @@ async def admin_delete_user(user_id: str, admin: dict = Depends(admin_required))
 
 
 # ============================================================
-# 3. STORES MANAGEMENT
+# 3. STORES — list & detail
 # ============================================================
 @router.get("/stores")
 async def list_stores(
@@ -309,7 +333,7 @@ async def list_stores(
     status: Optional[str] = Query(None),
     limit: int = 50,
     offset: int = 0,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
     base_query = """
         SELECT s.*, u.nickname as owner_name, u.email as owner_email,
@@ -321,14 +345,26 @@ async def list_stores(
     """
     params = {}
     conditions = []
+
     if search:
         conditions.append("(s.name LIKE :s OR u.nickname LIKE :s OR s.address LIKE :s)")
         params["s"] = f"%{search}%"
+
     if status and status != "All":
-        conditions.append("s.verified = :verified")
-        params["verified"] = status == "Active"  # Python bool → boolean column, OK
+        # Map legacy 'Active'/'Inactive' to new status filter
+        if status == "Active":
+            conditions.append("s.verification_status = :vstatus")
+            params["vstatus"] = "verified"
+        elif status == "Inactive":
+            conditions.append("s.verification_status != :vstatus")
+            params["vstatus"] = "verified"
+        else:
+            conditions.append("s.verification_status = :vstatus")
+            params["vstatus"] = status.lower()
+
     if conditions:
         base_query += " WHERE " + " AND ".join(conditions)
+
     base_query += " GROUP BY s.store_id, u.nickname, u.email ORDER BY s.created_at DESC LIMIT :l OFFSET :o"
     params["l"] = limit
     params["o"] = offset
@@ -338,41 +374,19 @@ async def list_stores(
 
 @router.get("/stores/{store_id}")
 async def get_store_detail(store_id: str, admin: dict = Depends(admin_required)):
-    store = await database.fetch_one("SELECT * FROM stores WHERE store_id = :sid", {"sid": store_id})
+    store = await database.fetch_one(
+        "SELECT * FROM stores WHERE store_id = :sid", {"sid": store_id}
+    )
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
     return dict(store)
 
 
-@router.post("/stores/{store_id}/verify")
-async def verify_store(store_id: str, admin: dict = Depends(admin_required)):
-    store = await database.fetch_one("SELECT store_id FROM stores WHERE store_id = :sid", {"sid": store_id})
-    if not store:
-        raise HTTPException(status_code=404, detail="Store not found")
-    # ✅ FIXED: stores.verified is boolean — use TRUE literal, not integer 1.
-    await database.execute(
-        "UPDATE stores SET verified = TRUE, updated_at = :now WHERE store_id = :sid",
-        {"sid": store_id, "now": datetime.utcnow()}
-    )
-    return {"message": "Store verified"}
-
-
-@router.post("/stores/{store_id}/suspend")
-async def suspend_store(store_id: str, admin: dict = Depends(admin_required)):
-    store = await database.fetch_one("SELECT store_id FROM stores WHERE store_id = :sid", {"sid": store_id})
-    if not store:
-        raise HTTPException(status_code=404, detail="Store not found")
-    # ✅ FIXED: stores.verified is boolean — use FALSE literal, not integer 0.
-    await database.execute(
-        "UPDATE stores SET verified = FALSE, updated_at = :now WHERE store_id = :sid",
-        {"sid": store_id, "now": datetime.utcnow()}
-    )
-    return {"message": "Store suspended"}
-
-
 @router.delete("/stores/{store_id}")
 async def admin_delete_store(store_id: str, admin: dict = Depends(admin_required)):
-    store = await database.fetch_one("SELECT store_id FROM stores WHERE store_id = :sid", {"sid": store_id})
+    store = await database.fetch_one(
+        "SELECT store_id FROM stores WHERE store_id = :sid", {"sid": store_id}
+    )
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
     await database.execute("DELETE FROM listings WHERE store_id = :sid", {"sid": store_id})
@@ -381,7 +395,379 @@ async def admin_delete_store(store_id: str, admin: dict = Depends(admin_required
 
 
 # ============================================================
-# 4. ORDERS MANAGEMENT
+# 4. STORE VERIFICATION — THE STATE MACHINE
+# ============================================================
+#
+# All status changes go through the endpoints below. The single rule:
+# `stores.verified` is a shadow of `stores.verification_status`.
+# Every UPDATE that changes the status changes both in one statement.
+#
+# Transitions enforced here:
+#   unverified → pending        (storekeeper submits, see storekeeper.py)
+#   pending    → verified       (admin approves: /approve)
+#   pending    → rejected       (admin rejects:  /reject, reason required)
+#   rejected   → pending        (storekeeper re-applies)
+#   verified   → suspended      (admin suspends: /suspend, reason required)
+#   suspended  → unverified     (admin reinstates: /reinstate)
+#   any        → unverified     (admin cancels a pending request: /cancel)
+#
+# Everything is idempotent on `reference_code` — a retry that carries the
+# same reference does nothing if the target state was already reached.
+
+class ApproveRequest(BaseModel):
+    reference: str
+    note: Optional[str] = None
+
+
+class RejectRequest(BaseModel):
+    reference: str
+    reason: str
+
+
+class SuspendRequest(BaseModel):
+    reason: str
+
+
+class ReinstateRequest(BaseModel):
+    note: Optional[str] = None
+
+
+@router.get("/verifications")
+async def list_pending_verifications(
+    status: Optional[str] = Query("pending"),
+    limit: int = 50,
+    offset: int = 0,
+    admin: dict = Depends(admin_required),
+):
+    """Queue of verification requests. Defaults to pending."""
+    params = {"l": limit, "o": offset}
+    where = ""
+    if status and status != "all":
+        where = "WHERE sv.status = :status"
+        params["status"] = status
+
+    rows = await database.fetch_all(
+        f"""
+        SELECT sv.*,
+               s.name AS store_name,
+               s.store_image_url,
+               u.nickname AS owner_name,
+               u.email AS owner_email,
+               u.phone AS owner_phone
+        FROM store_verifications sv
+        JOIN stores s ON sv.store_id = s.store_id
+        JOIN users u ON s.owner_id = u.id
+        {where}
+        ORDER BY sv.submitted_at DESC
+        LIMIT :l OFFSET :o
+        """,
+        params,
+    )
+    return [dict(row) for row in rows]
+
+
+@router.get("/stores/{store_id}/verification")
+async def get_store_verification(
+    store_id: str, admin: dict = Depends(admin_required)
+):
+    """The active verification request + the full audit history for a store."""
+    current = await database.fetch_one(
+        """
+        SELECT * FROM store_verifications
+        WHERE store_id = :sid
+        ORDER BY submitted_at DESC
+        LIMIT 1
+        """,
+        {"sid": store_id},
+    )
+    events = await database.fetch_all(
+        """
+        SELECT * FROM store_verification_events
+        WHERE store_id = :sid
+        ORDER BY created_at DESC
+        LIMIT 50
+        """,
+        {"sid": store_id},
+    )
+    return {
+        "request": dict(current) if current else None,
+        "events": [dict(e) for e in events],
+    }
+
+
+@router.post("/stores/{store_id}/verification/approve")
+async def approve_store_verification(
+    store_id: str,
+    req: ApproveRequest,
+    admin: dict = Depends(admin_required),
+):
+    """
+    Approve a pending verification request.
+    Idempotent on reference: a retry with the same reference on a store that
+    is already verified returns success without creating a new event.
+    """
+    store = await database.fetch_one(
+        "SELECT store_id, verification_status FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    current_status = store["verification_status"] or "unverified"
+
+    # Idempotency: already verified → return success, no state change
+    if current_status == "verified":
+        return {
+            "store_id": store_id,
+            "status": "verified",
+            "message": "Already verified",
+        }
+
+    # Only `pending` can be approved
+    if current_status != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot approve a store in '{current_status}' state. "
+                "Only 'pending' requests can be approved."
+            ),
+        )
+
+    # Verify the reference belongs to the latest pending request
+    pending = await database.fetch_one(
+        """
+        SELECT id, reference_code FROM store_verifications
+        WHERE store_id = :sid AND status = 'pending'
+        ORDER BY submitted_at DESC
+        LIMIT 1
+        """,
+        {"sid": store_id},
+    )
+    if not pending:
+        raise HTTPException(status_code=400, detail="No pending verification request found")
+
+    if pending["reference_code"] != req.reference:
+        raise HTTPException(status_code=409, detail="Reference does not match the pending request")
+
+    now = datetime.utcnow()
+
+    # Single UPDATE sets both the new status and the legacy boolean.
+    await database.execute(
+        """
+        UPDATE stores
+        SET verification_status = 'verified',
+            verified = TRUE,
+            verified_at = :now,
+            updated_at = :now
+        WHERE store_id = :sid AND verification_status = 'pending'
+        """,
+        {"now": now, "sid": store_id},
+    )
+
+    await database.execute(
+        """
+        UPDATE store_verifications
+        SET status = 'approved',
+            reviewed_by = :admin,
+            reviewed_at = :now,
+            review_reason = :note
+        WHERE id = :rid
+        """,
+        {"admin": admin["id"], "now": now, "note": req.note, "rid": pending["id"]},
+    )
+
+    await _log_verification_event(
+        store_id=store_id,
+        from_status="pending",
+        to_status="verified",
+        actor_id=admin["id"],
+        reason=req.note,
+        reference=req.reference,
+    )
+
+    return {"store_id": store_id, "status": "verified", "message": "Store verified"}
+
+
+@router.post("/stores/{store_id}/verification/reject")
+async def reject_store_verification(
+    store_id: str,
+    req: RejectRequest,
+    admin: dict = Depends(admin_required),
+):
+    """Reject a pending request. A reason is required."""
+    if not req.reason or not req.reason.strip():
+        raise HTTPException(status_code=400, detail="A rejection reason is required")
+
+    store = await database.fetch_one(
+        "SELECT verification_status FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    current_status = store["verification_status"] or "unverified"
+
+    # Idempotent: already rejected → success, no state change
+    if current_status == "rejected":
+        return {"store_id": store_id, "status": "rejected", "message": "Already rejected"}
+
+    if current_status != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot reject a store in '{current_status}' state",
+        )
+
+    pending = await database.fetch_one(
+        """
+        SELECT id, reference_code FROM store_verifications
+        WHERE store_id = :sid AND status = 'pending'
+        ORDER BY submitted_at DESC
+        LIMIT 1
+        """,
+        {"sid": store_id},
+    )
+    if not pending:
+        raise HTTPException(status_code=400, detail="No pending verification request found")
+    if pending["reference_code"] != req.reference:
+        raise HTTPException(status_code=409, detail="Reference does not match the pending request")
+
+    now = datetime.utcnow()
+
+    await database.execute(
+        """
+        UPDATE stores
+        SET verification_status = 'rejected',
+            verified = FALSE,
+            updated_at = :now
+        WHERE store_id = :sid AND verification_status = 'pending'
+        """,
+        {"now": now, "sid": store_id},
+    )
+    await database.execute(
+        """
+        UPDATE store_verifications
+        SET status = 'rejected',
+            reviewed_by = :admin,
+            reviewed_at = :now,
+            review_reason = :reason
+        WHERE id = :rid
+        """,
+        {"admin": admin["id"], "now": now, "reason": req.reason, "rid": pending["id"]},
+    )
+    await _log_verification_event(
+        store_id=store_id,
+        from_status="pending",
+        to_status="rejected",
+        actor_id=admin["id"],
+        reason=req.reason,
+        reference=req.reference,
+    )
+    return {"store_id": store_id, "status": "rejected", "message": "Store rejected"}
+
+
+@router.post("/stores/{store_id}/suspend")
+async def suspend_store(
+    store_id: str,
+    req: SuspendRequest,
+    admin: dict = Depends(admin_required),
+):
+    """Suspend a verified store. Reason required."""
+    if not req.reason or not req.reason.strip():
+        raise HTTPException(status_code=400, detail="A suspension reason is required")
+
+    store = await database.fetch_one(
+        "SELECT verification_status FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    current_status = store["verification_status"] or "unverified"
+
+    # Idempotent
+    if current_status == "suspended":
+        return {"store_id": store_id, "status": "suspended", "message": "Already suspended"}
+
+    # Only verified stores can be suspended (unverified = nothing to suspend)
+    if current_status != "verified":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot suspend a store in '{current_status}' state",
+        )
+
+    now = datetime.utcnow()
+    await database.execute(
+        """
+        UPDATE stores
+        SET verification_status = 'suspended',
+            verified = FALSE,
+            updated_at = :now
+        WHERE store_id = :sid AND verification_status = 'verified'
+        """,
+        {"now": now, "sid": store_id},
+    )
+    await _log_verification_event(
+        store_id=store_id,
+        from_status="verified",
+        to_status="suspended",
+        actor_id=admin["id"],
+        reason=req.reason,
+    )
+    return {"store_id": store_id, "status": "suspended", "message": "Store suspended"}
+
+
+@router.post("/stores/{store_id}/reinstate")
+async def reinstate_store(
+    store_id: str,
+    req: ReinstateRequest,
+    admin: dict = Depends(admin_required),
+):
+    """Reinstate a suspended store back to unverified (must re-apply)."""
+    store = await database.fetch_one(
+        "SELECT verification_status FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    current_status = store["verification_status"] or "unverified"
+
+    if current_status == "unverified":
+        return {"store_id": store_id, "status": "unverified", "message": "Already unverified"}
+
+    if current_status != "suspended":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot reinstate a store in '{current_status}' state",
+        )
+
+    now = datetime.utcnow()
+    await database.execute(
+        """
+        UPDATE stores
+        SET verification_status = 'unverified',
+            verified = FALSE,
+            updated_at = :now
+        WHERE store_id = :sid AND verification_status = 'suspended'
+        """,
+        {"now": now, "sid": store_id},
+    )
+    await _log_verification_event(
+        store_id=store_id,
+        from_status="suspended",
+        to_status="unverified",
+        actor_id=admin["id"],
+        reason=req.note,
+    )
+    return {
+        "store_id": store_id,
+        "status": "unverified",
+        "message": "Store reinstated — owner can re-apply",
+    }
+
+
+# ============================================================
+# 5. ORDERS MANAGEMENT
 # ============================================================
 @router.get("/orders")
 async def list_orders(
@@ -389,7 +775,7 @@ async def list_orders(
     search: Optional[str] = Query(None),
     limit: int = 50,
     offset: int = 0,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
     base_query = """
         SELECT e.*,
@@ -432,9 +818,9 @@ async def get_order_detail(order_id: str, admin: dict = Depends(admin_required))
 async def update_order_status(
     order_id: str,
     status: str,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
-    valid_statuses = ['pending', 'shipped', 'completed', 'cancelled']
+    valid_statuses = ["pending", "shipped", "completed", "cancelled"]
     if status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {valid_statuses}")
     order = await database.fetch_one("SELECT order_id FROM escrow WHERE order_id = :oid", {"oid": order_id})
@@ -442,7 +828,7 @@ async def update_order_status(
         raise HTTPException(status_code=404, detail="Order not found")
     await database.execute(
         "UPDATE escrow SET status = :status, updated_at = :now WHERE order_id = :oid",
-        {"status": status, "now": datetime.utcnow(), "oid": order_id}
+        {"status": status, "now": datetime.utcnow(), "oid": order_id},
     )
     return {"message": f"Order status updated to {status}"}
 
@@ -457,14 +843,14 @@ async def admin_delete_order(order_id: str, admin: dict = Depends(admin_required
 
 
 # ============================================================
-# 5. LISTINGS MANAGEMENT
+# 6. LISTINGS MANAGEMENT
 # ============================================================
 @router.get("/listings")
 async def admin_get_listings(
     search: Optional[str] = Query(None),
     limit: int = 50,
     offset: int = 0,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
     query = "SELECT l.*, s.name AS store_name FROM listings l JOIN stores s ON l.store_id = s.store_id"
     params = {}
@@ -488,14 +874,14 @@ async def admin_delete_listing(listing_id: str, admin: dict = Depends(admin_requ
 
 
 # ============================================================
-# 6. COURIERS MANAGEMENT
+# 7. COURIERS / FLIPPERS / SERVICES / PROVIDERS
 # ============================================================
 @router.get("/couriers")
 async def admin_get_couriers(
     search: Optional[str] = Query(None),
     limit: int = 50,
     offset: int = 0,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
     query = "SELECT * FROM couriers"
     params = {}
@@ -509,15 +895,12 @@ async def admin_get_couriers(
     return [dict(row) for row in rows]
 
 
-# ============================================================
-# 7. FLIPPERS MANAGEMENT
-# ============================================================
 @router.get("/flippers")
 async def admin_get_flippers(
     search: Optional[str] = Query(None),
     limit: int = 50,
     offset: int = 0,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
     query = "SELECT id, phone, email, nickname, created_at FROM users WHERE role = 'flipper'"
     params = {}
@@ -537,15 +920,12 @@ async def admin_delete_flipper(user_id: str, admin: dict = Depends(admin_require
     return {"message": f"Flipper {user_id} deleted"}
 
 
-# ============================================================
-# 8. SERVICES MANAGEMENT
-# ============================================================
 @router.get("/services")
 async def admin_get_services(
     search: Optional[str] = Query(None),
     limit: int = 50,
     offset: int = 0,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
     query = "SELECT * FROM services"
     params = {}
@@ -565,15 +945,12 @@ async def admin_delete_service(service_id: str, admin: dict = Depends(admin_requ
     return {"message": f"Service {service_id} deleted"}
 
 
-# ============================================================
-# 9. SERVICE PROVIDERS MANAGEMENT
-# ============================================================
 @router.get("/service-providers")
 async def admin_get_service_providers(
     search: Optional[str] = Query(None),
     limit: int = 50,
     offset: int = 0,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
     query = "SELECT id, phone, email, nickname, created_at FROM users WHERE role = 'service_provider'"
     params = {}
@@ -594,32 +971,25 @@ async def admin_delete_service_provider(user_id: str, admin: dict = Depends(admi
 
 
 # ============================================================
-# 10. TRANSACTIONS
+# 8. TRANSACTIONS / PROMOTIONS / DISPUTES / SETTINGS
 # ============================================================
 @router.get("/transactions")
 async def list_transactions(
     limit: int = 100,
     offset: int = 0,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
-    # ⚠️ ASSUMPTION: table is `wallet_transactions` per handoff schema. If your DB
-    # really has a `transactions` table, revert this one line.
     rows = await database.fetch_all(
         "SELECT * FROM wallet_transactions ORDER BY created_at DESC LIMIT :l OFFSET :o",
-        {"l": limit, "o": offset}
+        {"l": limit, "o": offset},
     )
     return [dict(row) for row in rows]
 
 
-# ============================================================
-# 11. PROMOTIONS
-# ============================================================
 @router.get("/promotions")
 async def get_promotions():
-    # ⚠️ `promotions` table is not in the handoff schema list. Endpoint will 500
-    # until the table exists. Query left as-is.
     rows = await database.fetch_all(
-        "SELECT * FROM promotions WHERE is_active = TRUE ORDER BY position ASC"  # ✅ boolean literal
+        "SELECT * FROM promotions WHERE is_active = TRUE ORDER BY position ASC"
     )
     return [dict(row) for row in rows]
 
@@ -631,10 +1001,9 @@ async def create_promotion(
     subtitle: Optional[str] = None,
     target_url: Optional[str] = None,
     position: int = 0,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
     promo_id = uuid.uuid4().hex
-    # ✅ FIXED: is_active = TRUE literal, not integer 1.
     await database.execute(
         """
         INSERT INTO promotions (id, image_url, title, subtitle, target_url, position, is_active)
@@ -647,7 +1016,7 @@ async def create_promotion(
             "sub": subtitle,
             "url": target_url,
             "pos": position,
-        }
+        },
     )
     return {"id": promo_id, "message": "Promotion created"}
 
@@ -661,7 +1030,7 @@ async def update_promotion(
     target_url: Optional[str] = None,
     position: Optional[int] = None,
     is_active: Optional[bool] = None,
-    admin: dict = Depends(admin_required)
+    admin: dict = Depends(admin_required),
 ):
     updates = []
     params = {"id": promo_id}
@@ -681,7 +1050,6 @@ async def update_promotion(
         updates.append("position = :pos")
         params["pos"] = position
     if is_active is not None:
-        # Python bool → boolean column, correct as-is. No change needed.
         updates.append("is_active = :active")
         params["active"] = is_active
     if not updates:
@@ -697,17 +1065,11 @@ async def delete_promotion(promo_id: str, admin: dict = Depends(admin_required))
     return {"message": "Promotion deleted"}
 
 
-# ============================================================
-# 12. DISPUTES (Placeholder)
-# ============================================================
 @router.get("/disputes")
 async def list_disputes(admin: dict = Depends(admin_required)):
     return []
 
 
-# ============================================================
-# 13. PLATFORM SETTINGS (Placeholder)
-# ============================================================
 @router.get("/settings")
 async def get_settings(admin: dict = Depends(admin_required)):
     return {
