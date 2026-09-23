@@ -77,8 +77,6 @@ else:
 
 
 # ─── Money coercion helper ───────────────────────────────────────────────
-# Some columns created before the NUMERIC migration are TEXT-like. asyncpg
-# rejects strings for NUMERIC params. This makes every read safe.
 def _as_float(value, default: float = 0.0) -> float:
     if value is None:
         return default
@@ -114,15 +112,6 @@ async def _refund_expired_escrows() -> None:
 
 
 # ── Background task: expire stale service bookings ───────────────────────
-# ✅ NEW — service bookings had NO auto-timeout. A `locked` booking that
-#    nobody completed stayed locked forever, taking the customer's money
-#    with it. This loop refunds stale bookings on a schedule.
-#
-#    Rules:
-#      - status `locked` (never accepted): expire 24h past due
-#      - status `accepted` (provider committed): expire 72h past due
-#      - "due" = scheduled_for if set, else created_at
-#      - refunds the customer's wallet, sets status to `expired`
 async def _expire_stale_bookings() -> None:
     LOCKED_GRACE_HOURS = 24
     ACCEPTED_GRACE_HOURS = 72
@@ -131,8 +120,6 @@ async def _expire_stale_bookings() -> None:
         try:
             now = datetime.utcnow()
 
-            # Query rows we might expire. We compute the effective due date
-            # in Python since scheduled_for can be NULL.
             candidates = await database.fetch_all(
                 """
                 SELECT booking_id, customer_id, provider_id, amount,
@@ -155,7 +142,6 @@ async def _expire_stale_bookings() -> None:
                     else ACCEPTED_GRACE_HOURS
                 )
 
-                # Defensive: due might be a datetime or a string
                 if isinstance(due, str):
                     try:
                         due = datetime.fromisoformat(due.replace("Z", "+00:00")).replace(tzinfo=None)
@@ -171,7 +157,6 @@ async def _expire_stale_bookings() -> None:
                 amount = _as_float(r.get("amount"))
 
                 try:
-                    # 1) Refund customer's wallet
                     if amount > 0:
                         await database.execute(
                             """
@@ -182,8 +167,6 @@ async def _expire_stale_bookings() -> None:
                             {"amt": amount, "uid": customer_id},
                         )
 
-                    # 2) Mark booking as expired — guard against races by
-                    #    only flipping status if it's still the pre-expiry value
                     await database.execute(
                         """
                         UPDATE service_bookings
@@ -205,7 +188,6 @@ async def _expire_stale_bookings() -> None:
         except Exception as exc:
             print(f"⚠️  Booking expiry loop error: {exc}")
 
-        # Runs every 15 minutes
         await asyncio.sleep(15 * 60)
 
 
@@ -214,7 +196,6 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=sync_engine)
     print("✅ Tables created/verified (sync).")
 
-    # ✅ FIX: `sync_engine.begin()` commits DDL. `connect()` rolls back.
     with sync_engine.begin() as conn:
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS otp_codes (
@@ -623,6 +604,76 @@ async def lifespan(app: FastAPI):
             "ON order_items(listing_id)"
         )
 
+        # ── Store verification schema ────────────────────────────────
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS store_verifications (
+                id               UUID PRIMARY KEY,
+                store_id         TEXT NOT NULL REFERENCES stores(store_id) ON DELETE CASCADE,
+                submitted_by     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                status           TEXT NOT NULL DEFAULT 'pending'
+                                 CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
+                legal_name       TEXT NOT NULL,
+                business_type    TEXT NOT NULL,
+                cac_number       TEXT,
+                business_address TEXT NOT NULL,
+                contact_phone    TEXT NOT NULL,
+                evidence         JSONB NOT NULL DEFAULT '[]'::jsonb,
+                reference_code   TEXT NOT NULL UNIQUE,
+                submitted_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                reviewed_by      TEXT REFERENCES users(id),
+                reviewed_at      TIMESTAMPTZ,
+                review_reason    TEXT
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_store_verif_store "
+            "ON store_verifications(store_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_store_verif_status "
+            "ON store_verifications(status)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_store_verif_ref "
+            "ON store_verifications(reference_code)"
+        )
+
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS store_verification_events (
+                id           BIGSERIAL PRIMARY KEY,
+                store_id     TEXT NOT NULL REFERENCES stores(store_id) ON DELETE CASCADE,
+                actor_id     TEXT,
+                from_status  TEXT,
+                to_status    TEXT NOT NULL,
+                reason       TEXT,
+                reference    TEXT,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_store_verif_events_store "
+            "ON store_verification_events(store_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_store_verif_events_created "
+            "ON store_verification_events(created_at DESC)"
+        )
+
+        conn.exec_driver_sql(
+            "ALTER TABLE stores ADD COLUMN IF NOT EXISTS "
+            "verification_status TEXT NOT NULL DEFAULT 'unverified'"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE stores ADD COLUMN IF NOT EXISTS "
+            "verified_at TIMESTAMPTZ"
+        )
+
+        conn.exec_driver_sql("""
+            UPDATE stores
+            SET verification_status = 'verified'
+            WHERE verified = TRUE AND verification_status = 'unverified'
+        """)
+
     print("✅ Schema migrations complete.")
 
     await database.connect()
@@ -708,7 +759,6 @@ async def lifespan(app: FastAPI):
     await database.execute(
         "CREATE INDEX IF NOT EXISTS idx_service_bookings_service ON service_bookings(service_id)"
     )
-    # ✅ NEW: index for the auto-expiry loop
     await database.execute(
         "CREATE INDEX IF NOT EXISTS idx_service_bookings_status_due "
         "ON service_bookings(status, scheduled_for)"
