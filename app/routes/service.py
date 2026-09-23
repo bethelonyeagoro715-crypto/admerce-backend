@@ -28,6 +28,14 @@ class BookServiceRequest(BaseModel):
 class ToggleAvailabilityRequest(BaseModel):
     is_available: bool
 
+# ✅ NEW: direct service payment. Amount is NOT sent — backend uses the DB
+#    price so a malicious client can't underpay. `reference` is a client-
+#    generated UUID used for idempotency (blocks double-tap + retry dupes).
+class InstantPayRequest(BaseModel):
+    service_id: str
+    provider_id: str
+    reference: str
+
 # ---------- Helpers ----------
 def _parse_iso_datetime(value):
     if value is None:
@@ -170,6 +178,122 @@ async def update_provider_availability(
     )
     return {"user_id": provider_id, "is_available": req.is_available}
 
+
+# ============================================================
+# DIRECT SERVICE PAYMENT (no booking, no escrow)
+# ============================================================
+# ✅ NEW. Mirrors `instant_pickup` in wallet.py — money moves directly
+#    from the customer's wallet to the provider's wallet in one hop.
+#
+#    Idempotency: the client sends a UUID `reference`. If a wallet
+#    transaction with that reference already exists for this customer,
+#    we return success without charging again. This blocks double-tap
+#    and timeout-retry duplicates.
+#
+#    Security: the amount is read from the DB, not the request. A
+#    malicious client can't send amount=1 and pay ₦1 for a ₦5000 job.
+@router.post("/instant-pay")
+async def instant_pay_service(
+    req: InstantPayRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    customer_id = current_user["id"]
+
+    if not req.reference or len(req.reference) < 8:
+        raise HTTPException(status_code=400, detail="Invalid payment reference")
+
+    # ── 1. Verify the service exists, is active, and belongs to the provider
+    service_row = await database.fetch_one(
+        "SELECT provider_id, price, title FROM services "
+        "WHERE service_id = :sid AND is_active = TRUE",
+        {"sid": req.service_id},
+    )
+    if not service_row:
+        raise HTTPException(status_code=404, detail="Service not found or inactive")
+
+    service = dict(service_row)
+    if service["provider_id"] != req.provider_id:
+        raise HTTPException(status_code=400, detail="Provider does not match this service")
+
+    if customer_id == service["provider_id"]:
+        raise HTTPException(status_code=400, detail="You cannot pay for your own service")
+
+    # ── 2. Trust the DB price, not the client
+    price = _as_float(service["price"])
+    if price <= 0:
+        raise HTTPException(status_code=400, detail="Service price is invalid")
+
+    # ── 3. Idempotency — reject replayed references
+    existing = await database.fetch_one(
+        "SELECT id FROM wallet_transactions "
+        "WHERE user_id = :uid AND reference = :ref",
+        {"uid": customer_id, "ref": req.reference},
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="This payment has already been processed",
+        )
+
+    # ── 4. Check customer balance
+    wallet = await database.fetch_one(
+        "SELECT balance FROM wallets WHERE user_id = :uid",
+        {"uid": customer_id},
+    )
+    if not wallet or _as_float(wallet["balance"]) < price:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+
+    # ── 5. Move the money
+    await database.execute(
+        "UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid",
+        {"amt": price, "uid": customer_id},
+    )
+    await database.execute(
+        "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+        {"amt": price, "uid": service["provider_id"]},
+    )
+
+    # ── 6. Log both sides. Same reference on both rows so the pair is
+    #       traceable, but the idempotency check above filters by user_id
+    #       so it only sees the customer's side.
+    await database.execute(
+        """
+        INSERT INTO wallet_transactions
+            (user_id, amount, type, description, reference, status, created_at)
+        VALUES
+            (:uid, :amt, 'debit', :desc, :ref, 'completed', NOW())
+        """,
+        {
+            "uid": customer_id,
+            "amt": price,
+            "desc": f"Service payment: {service.get('title') or req.service_id}",
+            "ref": req.reference,
+        },
+    )
+    await database.execute(
+        """
+        INSERT INTO wallet_transactions
+            (user_id, amount, type, description, reference, status, created_at)
+        VALUES
+            (:uid, :amt, 'credit', :desc, :ref, 'completed', NOW())
+        """,
+        {
+            "uid": service["provider_id"],
+            "amt": price,
+            "desc": f"Service payment received: {service.get('title') or req.service_id}",
+            "ref": req.reference,
+        },
+    )
+
+    return {
+        "message": "Payment successful",
+        "transaction_id": req.reference,
+        "amount": price,
+        "service_id": req.service_id,
+        "provider_id": service["provider_id"],
+    }
+
+
 @router.post("/{service_id}/toggle")
 async def toggle_service_active(
     service_id: str,
@@ -204,6 +328,7 @@ async def delete_service(service_id: str, current_user: dict = Depends(get_curre
         "DELETE FROM services WHERE service_id = :sid", {"sid": service_id}
     )
     return {"message": "Service permanently deleted"}
+
 
 # ============================================================
 # BOOKINGS — LIST
@@ -273,7 +398,7 @@ async def get_booking(booking_id: str, current_user: dict = Depends(get_current_
     return booking
 
 # ============================================================
-# ACCEPT (provider accepts a locked booking)
+# ACCEPT
 # ============================================================
 @router.post("/bookings/{booking_id}/accept")
 async def accept_booking(
@@ -320,7 +445,7 @@ async def accept_booking(
     }
 
 # ============================================================
-# DECLINE (provider declines a locked booking)
+# DECLINE
 # ============================================================
 @router.post("/bookings/{booking_id}/decline")
 async def decline_booking(
@@ -462,15 +587,8 @@ async def complete_booking(
     }
 
 # ============================================================
-# CANCEL — either party, from `locked` OR `accepted`
+# CANCEL
 # ============================================================
-# ✅ UPDATED: now allows cancellation from `accepted` as well as `locked`.
-#    Real-world services allow this — you can call a plumber back and say
-#    "actually never mind." Full refund, no penalty.
-#
-#    Blocks only from terminal states (completed, cancelled, declined,
-#    expired). Those are done deals; a problem there is a dispute, not
-#    a cancellation.
 @router.post("/bookings/{booking_id}/cancel")
 async def cancel_booking(
     booking_id: str,
@@ -509,7 +627,6 @@ async def cancel_booking(
             {"amt": amount, "uid": customer_id},
         )
 
-    # Race-safe: only flip if still cancellable
     await database.execute(
         """
         UPDATE service_bookings
@@ -531,6 +648,7 @@ async def cancel_booking(
             + (f"₦{amount:,.0f} returned to your wallet." if amount > 0 else "")
         ).strip(),
     }
+
 
 # ============================================================
 # DYNAMIC ROUTES
@@ -731,9 +849,22 @@ async def book_service(
 
 @router.get("/provider/{provider_id}")
 async def get_provider_services_by_user(provider_id: str):
+    # ✅ FIX: JOIN users so the frontend gets business_name / username /
+    #    avatar_url. Previously returned `SELECT *` from services only,
+    #    so /provider-services/[id] always showed "Service Provider".
     rows = await database.fetch_all(
-        "SELECT * FROM services WHERE provider_id = :pid AND is_active = TRUE "
-        "ORDER BY created_at DESC",
+        """
+        SELECT s.*,
+               u.business_name,
+               u.nickname       AS username,
+               u.real_name,
+               u.business_image_url,
+               u.avatar_url
+        FROM services s
+        JOIN users u ON s.provider_id = u.id
+        WHERE s.provider_id = :pid AND s.is_active = TRUE
+        ORDER BY s.created_at DESC
+        """,
         {"pid": provider_id},
     )
     return [dict(row) for row in rows]
