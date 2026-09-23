@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, Query, Body
+from pydantic import BaseModel
 from app.db.database import database
 from app.routes.auth import get_current_user
 from typing import Optional, Union
@@ -66,7 +67,7 @@ def _time_ago(value: Union[str, datetime, None]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Audit log writer — the single place that touches
+# Audit log writer — single place that touches
 # store_verification_events. Every status change funnels here.
 # ─────────────────────────────────────────────────────────────
 async def _log_verification_event(
@@ -351,7 +352,6 @@ async def list_stores(
         params["s"] = f"%{search}%"
 
     if status and status != "All":
-        # Map legacy 'Active'/'Inactive' to new status filter
         if status == "Active":
             conditions.append("s.verification_status = :vstatus")
             params["vstatus"] = "verified"
@@ -397,10 +397,6 @@ async def admin_delete_store(store_id: str, admin: dict = Depends(admin_required
 # ============================================================
 # 4. STORE VERIFICATION — THE STATE MACHINE
 # ============================================================
-#
-# All status changes go through the endpoints below. The single rule:
-# `stores.verified` is a shadow of `stores.verification_status`.
-# Every UPDATE that changes the status changes both in one statement.
 #
 # Transitions enforced here:
 #   unverified → pending        (storekeeper submits, see storekeeper.py)
@@ -515,7 +511,6 @@ async def approve_store_verification(
 
     current_status = store["verification_status"] or "unverified"
 
-    # Idempotency: already verified → return success, no state change
     if current_status == "verified":
         return {
             "store_id": store_id,
@@ -523,7 +518,6 @@ async def approve_store_verification(
             "message": "Already verified",
         }
 
-    # Only `pending` can be approved
     if current_status != "pending":
         raise HTTPException(
             status_code=400,
@@ -533,7 +527,6 @@ async def approve_store_verification(
             ),
         )
 
-    # Verify the reference belongs to the latest pending request
     pending = await database.fetch_one(
         """
         SELECT id, reference_code FROM store_verifications
@@ -551,7 +544,6 @@ async def approve_store_verification(
 
     now = datetime.utcnow()
 
-    # Single UPDATE sets both the new status and the legacy boolean.
     await database.execute(
         """
         UPDATE stores
@@ -607,7 +599,6 @@ async def reject_store_verification(
 
     current_status = store["verification_status"] or "unverified"
 
-    # Idempotent: already rejected → success, no state change
     if current_status == "rejected":
         return {"store_id": store_id, "status": "rejected", "message": "Already rejected"}
 
@@ -684,11 +675,9 @@ async def suspend_store(
 
     current_status = store["verification_status"] or "unverified"
 
-    # Idempotent
     if current_status == "suspended":
         return {"store_id": store_id, "status": "suspended", "message": "Already suspended"}
 
-    # Only verified stores can be suspended (unverified = nothing to suspend)
     if current_status != "verified":
         raise HTTPException(
             status_code=400,
