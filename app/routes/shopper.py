@@ -12,8 +12,6 @@ from app.services.image_embedder import json_to_embedding, cosine_similarity
 router = APIRouter(prefix="/shopper", tags=["Shopper"])
 
 # ✅ How many items rank can return in a single call.
-#    The frontend paginates client-side (reveals 20 at a time), so this
-#    is just an upper bound to protect against runaway responses.
 MAX_FEED_SIZE = 500
 
 # ✅ How many items from the same store can appear before we skip to
@@ -120,6 +118,8 @@ async def real_feed(lat: float, lng: float):
             "title_quality": row["title_quality"],
             "image_url": image_url,
             "store_name": row["store_name"] if "store_name" in row else row["store_id"],
+            # ✅ NEW — carry category through so client filters have data
+            "category": row["category"] if "category" in row else None,
         })
     scored.sort(key=lambda x: x["score"], reverse=True)
     return {"feed": scored}
@@ -161,6 +161,8 @@ async def feed_recall(req: RecallRequest, current_user: Optional[dict] = Depends
                 "title": item.get("title", ""),
                 "pool": "geo",
                 "distance_km": item.get("distance_km", 0),
+                # ✅ NEW — pass category through for filters
+                "category": item.get("category"),
             }
     except Exception as e:
         print(f"geo recall error: {e}")
@@ -244,7 +246,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
     if model is None:
         rows_by_id = {row["listing_id"]: row for row in rows}
         fallback_feed = []
-        # ✅ FIX: filter by session_items_shown so pagination actually works.
         shown_set = set(req.session_items_shown)
         for cid in req.candidate_ids:
             if cid in shown_set:
@@ -268,10 +269,10 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
                 "store_name": row["store_name"] if "store_name" in row else row["store_id"],
                 "store_id": row["store_id"],
                 "fallback": True,
+                # ✅ NEW — carry category through
+                "category": row["category"] if "category" in row else None,
             })
             shown_set.add(cid)
-            # ✅ Removed the 20-item cap — returned whole list is what
-            #    pagination wants.
             if len(fallback_feed) >= MAX_FEED_SIZE:
                 break
         return {"feed": fallback_feed, "total": len(fallback_feed), "model_used": False}
@@ -300,12 +301,12 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
             "image_url": image_url,
             "store_name": row["store_name"] if "store_name" in row else row["store_id"],
             "store_id": row["store_id"],
+            # ✅ NEW — carry category through
+            "category": row["category"] if "category" in row else None,
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
 
-    # ✅ FIX: no more 20-item cap. Return everything by score, with a
-    #    soft per-store cap so one store can't dominate the top of the feed.
     final_feed = []
     store_counter = {}
     shown_set = set(req.session_items_shown)
@@ -322,8 +323,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
         if len(final_feed) >= MAX_FEED_SIZE:
             break
 
-    # Fallback: if the store cap starved the feed, fill remaining slots
-    # without the per-store restriction.
     if len(final_feed) < MAX_FEED_SIZE:
         for item in scored:
             if item["listing_id"] in shown_set:
@@ -339,8 +338,9 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
 async def _geo_recall(lat: float, lng: float, radius_km: float, limit: int):
     lat_diff = radius_km / 111.0
     lng_diff = radius_km / (111.0 * abs(math.cos(math.radians(lat))) + 1e-8)
+    # ✅ NEW — include category in the SELECT so the recall response carries it
     rows = await database.fetch_all(
-        "SELECT listing_id, title, lat, lng FROM listings "
+        "SELECT listing_id, title, category, lat, lng FROM listings "
         "WHERE quantity_available > 0 AND lat BETWEEN :min_lat AND :max_lat "
         "AND lng BETWEEN :min_lng AND :max_lng "
         "ORDER BY created_at DESC LIMIT :lim",
