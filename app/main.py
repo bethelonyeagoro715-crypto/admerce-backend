@@ -55,7 +55,8 @@ from app.routes import settings
 from app.routes.notifications import router as notifications_router
 from app.routes.shopper import router as shopper_router
 from app.routes.seai_search import router as seai_search_router
-from app.routes.presence import router as presence_router  # ✅ NEW
+from app.routes.presence import router as presence_router
+from app.routes.community import router as community_router  # ✅ NEW
 
 SKIP_MODELS = os.getenv("SKIP_MODELS") == "1"
 
@@ -129,7 +130,9 @@ async def _expire_stale_bookings() -> None:
                 if due is None:
                     continue
                 grace = (
-                    LOCKED_GRACE_HOURS if status == "locked" else ACCEPTED_GRACE_HOURS
+                    LOCKED_GRACE_HOURS
+                    if status == "locked"
+                    else ACCEPTED_GRACE_HOURS
                 )
                 if isinstance(due, str):
                     try:
@@ -352,7 +355,7 @@ async def lifespan(app: FastAPI):
             ("suspended", "BOOLEAN DEFAULT FALSE"),
             ("business_image_url", "TEXT"),
             ("business_name", "TEXT"),
-            ("last_seen_at", "TIMESTAMPTZ"),  # ✅ NEW — presence tracking
+            ("last_seen_at", "TIMESTAMPTZ"),
         ]:
             conn.exec_driver_sql(
                 f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}"
@@ -659,10 +662,35 @@ async def lifespan(app: FastAPI):
             WHERE verified = TRUE AND verification_status = 'unverified'
         """)
 
-        # ✅ NEW — index for last_seen lookups (presence)
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_users_last_seen "
             "ON users(last_seen_at DESC)"
+        )
+
+        # ✅ NEW — community schema
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS community_messages (
+                id              SERIAL PRIMARY KEY,
+                sender_id       TEXT NOT NULL,
+                sender_name     TEXT,
+                sender_avatar   TEXT,
+                sender_role     TEXT,
+                room            TEXT NOT NULL DEFAULT 'global',
+                text            TEXT NOT NULL,
+                image_url       TEXT,
+                reply_to_id     INTEGER,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                edited_at       TIMESTAMPTZ,
+                deleted_at      TIMESTAMPTZ
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_community_room_created "
+            "ON community_messages(room, created_at DESC)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_community_sender "
+            "ON community_messages(sender_id)"
         )
 
     print("✅ Schema migrations complete.")
@@ -850,7 +878,8 @@ app.include_router(flipper_router)
 app.include_router(services_router)
 app.include_router(auth_router)
 app.include_router(seai_search_router)
-app.include_router(presence_router)  # ✅ NEW
+app.include_router(presence_router)
+app.include_router(community_router)  # ✅ NEW
 if ai_tools_router:
     app.include_router(ai_tools_router)
 if seai_ask_router:
