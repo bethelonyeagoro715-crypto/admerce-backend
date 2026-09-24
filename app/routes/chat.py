@@ -3,6 +3,7 @@ import uuid
 import json
 import hmac
 import hashlib
+import tempfile
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File, Form, Body
@@ -10,17 +11,16 @@ from pydantic import BaseModel
 from app.db.database import database
 from app.utils.security import get_current_user
 from app.services.transcription_service import transcribe_audio
+# ✅ NEW — Cloudinary for durable voice note storage
+from app.services.cloudinary_service import upload_video
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
-
-UPLOAD_DIR = "uploads/voice"
 
 # ✅ WhatsApp parity limits
 EDIT_WINDOW_MINUTES = 15
 DELETE_FOR_EVERYONE_WINDOW_MINUTES = 60
 
 # ✅ Jitsi room derivation — HMAC of conversation_id with server secret.
-#    Deterministic (both users get the same room) but not guessable.
 _JITSI_SECRET = os.getenv("JITSI_SECRET", os.getenv("JWT_SECRET", "change-me")).encode()
 JITSI_BASE_URL = os.getenv("JITSI_BASE_URL", "https://meet.jit.si")
 
@@ -124,7 +124,7 @@ async def send_message(
     conversation_id = await _get_conversation_id(sender_id, receiver_id)
     now = datetime.utcnow()
 
-    # ✅ Validate reply_to_id if present — must be in the same conversation
+    # Validate reply_to_id if present — must be in the same conversation
     reply_to_id = req.reply_to_id
     if reply_to_id is not None:
         parent = await database.fetch_one(
@@ -132,7 +132,7 @@ async def send_message(
             {"pid": reply_to_id, "cid": conversation_id},
         )
         if not parent:
-            reply_to_id = None  # silently drop invalid reply target
+            reply_to_id = None
 
     sender = await database.fetch_one(
         "SELECT COALESCE(nickname, phone, id) AS name FROM users WHERE id = :uid",
@@ -293,7 +293,7 @@ async def delete_message(
 async def send_voice(
     receiver_id: str = Form(...),
     audio: UploadFile = File(...),
-    reply_to_id: Optional[int] = Form(None),   # ✅ NEW — voice notes can be replies
+    reply_to_id: Optional[int] = Form(None),
     current_user: dict = Depends(get_current_user),
 ):
     sender_id = current_user["id"]
@@ -301,26 +301,53 @@ async def send_voice(
     if sender_id == receiver_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
 
-    # ── Save audio file ──────────────────────────────────────
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    ext = os.path.splitext(audio.filename)[1] or ".webm"
-    audio_filename = f"{uuid.uuid4().hex}{ext}"
-    audio_path = os.path.join(UPLOAD_DIR, audio_filename)
-    with open(audio_path, "wb") as f:
-        f.write(await audio.read())
-    audio_url = f"/uploads/voice/{audio_filename}"
+    # ── Read the file once into memory ────────────────────────
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio file")
 
-    # ── Transcribe (best-effort; never blocks the send) ──────
+    ext = os.path.splitext(audio.filename or "")[1].lower() or ".webm"
+    # Cloudinary's `upload_video` handles audio under resource_type=video.
+    # Extension is inferred from content-type; keep the original suffix
+    # for the transcription pass below.
+
+    # ── Transcription (best-effort; never blocks the send) ────
+    # `transcribe_audio` expects a filesystem path, so we write to a
+    # temporary file and delete it immediately. If transcription fails
+    # for any reason, we still ship the voice note.
     transcription = ""
+    tmp_path: Optional[str] = None
     try:
-        transcription = transcribe_audio(audio_path)
+        with tempfile.NamedTemporaryFile(
+            suffix=ext, delete=False
+        ) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+        transcription = transcribe_audio(tmp_path) or ""
     except Exception as e:
-        print(f"Transcription failed: {e}")
+        print(f"⚠️  Transcription failed: {e!r}", flush=True)
+        transcription = ""
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    # ── Upload to Cloudinary (durable, survives deploys) ──────
+    # ✅ FIX: was writing to `uploads/voice/{uuid}.webm` on the Render
+    #    container's ephemeral disk. Every deploy wiped it. Old voice
+    #    notes served 404. Cloudinary URLs are permanent.
+    try:
+        audio_url = upload_video(audio_bytes, folder="voice_notes")
+    except Exception as e:
+        print(f"❌ Voice upload failed: {e!r}", flush=True)
+        raise HTTPException(status_code=500, detail="Voice note upload failed")
 
     conversation_id = await _get_conversation_id(sender_id, receiver_id)
     now = datetime.utcnow()
 
-    # ✅ Validate reply target if present
+    # Validate reply target if present
     if reply_to_id is not None:
         parent = await database.fetch_one(
             "SELECT id FROM messages WHERE id = :pid AND conversation_id = :cid",
@@ -329,7 +356,7 @@ async def send_voice(
         if not parent:
             reply_to_id = None
 
-    # ✅ Populate sender_name for consistency with text messages
+    # Populate sender_name for consistency with text messages
     sender = await database.fetch_one(
         "SELECT COALESCE(nickname, phone, id) AS name FROM users WHERE id = :uid",
         {"uid": sender_id},
@@ -529,12 +556,6 @@ async def get_call_room(
     conversation_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Return a Jitsi room name/URL for this conversation.
-    Room name is an HMAC of conversation_id → same for both participants,
-    not guessable without the server secret. Access gated by the same
-    validation as fetching messages.
-    """
     user_id = current_user["id"]
 
     valid = _validate_conversation_id(conversation_id, user_id)
