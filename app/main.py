@@ -12,7 +12,6 @@ from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── Cloudinary diagnostic ────────────────────────────────────────────────
 print(
     "🔑 Cloudinary env:",
     {
@@ -54,10 +53,9 @@ from app.routes.chat import router as chat_router
 from app.routes.basket import router as basket_router
 from app.routes import settings
 from app.routes.notifications import router as notifications_router
-
 from app.routes.shopper import router as shopper_router
-
 from app.routes.seai_search import router as seai_search_router
+from app.routes.presence import router as presence_router  # ✅ NEW
 
 SKIP_MODELS = os.getenv("SKIP_MODELS") == "1"
 
@@ -76,7 +74,6 @@ else:
     print("⚠️ SKIP_MODELS=1 – Heavy AI models disabled")
 
 
-# ─── Money coercion helper ───────────────────────────────────────────────
 def _as_float(value, default: float = 0.0) -> float:
     if value is None:
         return default
@@ -86,7 +83,6 @@ def _as_float(value, default: float = 0.0) -> float:
         return default
 
 
-# ── Background task: auto-refund expired escrow (reservations) ───────────
 async def _refund_expired_escrows() -> None:
     while True:
         try:
@@ -111,7 +107,6 @@ async def _refund_expired_escrows() -> None:
         await asyncio.sleep(60)
 
 
-# ── Background task: expire stale service bookings ───────────────────────
 async def _expire_stale_bookings() -> None:
     LOCKED_GRACE_HOURS = 24
     ACCEPTED_GRACE_HOURS = 72
@@ -119,7 +114,6 @@ async def _expire_stale_bookings() -> None:
     while True:
         try:
             now = datetime.utcnow()
-
             candidates = await database.fetch_all(
                 """
                 SELECT booking_id, customer_id, provider_id, amount,
@@ -128,34 +122,28 @@ async def _expire_stale_bookings() -> None:
                 WHERE status IN ('locked', 'accepted')
                 """
             )
-
             for row in candidates:
                 r = dict(row)
                 status = (r.get("status") or "").lower()
                 due = r.get("scheduled_for") or r.get("created_at")
                 if due is None:
                     continue
-
                 grace = (
-                    LOCKED_GRACE_HOURS
-                    if status == "locked"
-                    else ACCEPTED_GRACE_HOURS
+                    LOCKED_GRACE_HOURS if status == "locked" else ACCEPTED_GRACE_HOURS
                 )
-
                 if isinstance(due, str):
                     try:
-                        due = datetime.fromisoformat(due.replace("Z", "+00:00")).replace(tzinfo=None)
+                        due = datetime.fromisoformat(
+                            due.replace("Z", "+00:00")
+                        ).replace(tzinfo=None)
                     except ValueError:
                         continue
-
                 deadline = due + timedelta(hours=grace)
                 if now < deadline:
                     continue
-
                 booking_id = r["booking_id"]
                 customer_id = r["customer_id"]
                 amount = _as_float(r.get("amount"))
-
                 try:
                     if amount > 0:
                         await database.execute(
@@ -166,7 +154,6 @@ async def _expire_stale_bookings() -> None:
                             """,
                             {"amt": amount, "uid": customer_id},
                         )
-
                     await database.execute(
                         """
                         UPDATE service_bookings
@@ -176,7 +163,6 @@ async def _expire_stale_bookings() -> None:
                         """,
                         {"now": now, "bid": booking_id},
                     )
-
                     print(
                         f"⌛ Booking {booking_id} expired "
                         f"(was {status}) — refunded ₦{amount:.0f} → {customer_id}",
@@ -184,10 +170,8 @@ async def _expire_stale_bookings() -> None:
                     )
                 except Exception as inner:
                     print(f"⚠️  Failed to expire booking {booking_id}: {inner}")
-
         except Exception as exc:
             print(f"⚠️  Booking expiry loop error: {exc}")
-
         await asyncio.sleep(15 * 60)
 
 
@@ -368,6 +352,7 @@ async def lifespan(app: FastAPI):
             ("suspended", "BOOLEAN DEFAULT FALSE"),
             ("business_image_url", "TEXT"),
             ("business_name", "TEXT"),
+            ("last_seen_at", "TIMESTAMPTZ"),  # ✅ NEW — presence tracking
         ]:
             conn.exec_driver_sql(
                 f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}"
@@ -604,7 +589,7 @@ async def lifespan(app: FastAPI):
             "ON order_items(listing_id)"
         )
 
-        # ── Store verification schema ────────────────────────────────
+        # Store verification schema
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS store_verifications (
                 id               UUID PRIMARY KEY,
@@ -674,12 +659,17 @@ async def lifespan(app: FastAPI):
             WHERE verified = TRUE AND verification_status = 'unverified'
         """)
 
+        # ✅ NEW — index for last_seen lookups (presence)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_users_last_seen "
+            "ON users(last_seen_at DESC)"
+        )
+
     print("✅ Schema migrations complete.")
 
     await database.connect()
     print("✅ Async database pool connected.")
 
-    # ── Async tables ─────────────────────────────────────────────────
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
             user_id      TEXT    PRIMARY KEY,
@@ -804,7 +794,6 @@ async def lifespan(app: FastAPI):
     """)
     print("✅ cards table ready.")
 
-    # ── Background tasks ─────────────────────────────────────────────
     task_escrow = asyncio.create_task(_refund_expired_escrows())
     task_bookings = asyncio.create_task(_expire_stale_bookings())
     print("✅ Server is ready.")
@@ -861,6 +850,7 @@ app.include_router(flipper_router)
 app.include_router(services_router)
 app.include_router(auth_router)
 app.include_router(seai_search_router)
+app.include_router(presence_router)  # ✅ NEW
 if ai_tools_router:
     app.include_router(ai_tools_router)
 if seai_ask_router:
