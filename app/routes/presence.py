@@ -43,12 +43,25 @@ async def get_presence(
 ):
     """Return presence + public profile summary for the given user.
     Public route — no auth required so anonymous chat works too."""
+    # ✅ FIX: only reference columns that actually exist on `users`.
+    #    Previous version queried `u.username`, which doesn't exist — the
+    #    users table uses `nickname`, `real_name`, `first_name`, `last_name`,
+    #    and `business_name`.
     row = await database.fetch_one(
         """
-        SELECT u.id, u.nickname, u.username, u.avatar_url, u.role,
-               u.business_name, u.business_image_url, u.last_seen_at,
-               s.store_id       AS own_store_id,
-               s.name           AS own_store_name,
+        SELECT u.id,
+               u.nickname,
+               u.real_name,
+               u.first_name,
+               u.last_name,
+               u.phone,
+               u.role,
+               u.avatar_url,
+               u.business_name,
+               u.business_image_url,
+               u.last_seen_at,
+               s.store_id        AS own_store_id,
+               s.name            AS own_store_name,
                s.store_image_url AS own_store_image
         FROM users u
         LEFT JOIN stores s ON s.owner_id = u.id
@@ -72,26 +85,42 @@ async def get_presence(
     if role == "storekeeper" and row["own_store_id"]:
         public_url = f"/store-detail/{row['own_store_id']}"
     elif role == "service_provider":
-        public_url = f"/provider-services/{row['id']}"
+        public_url = f"/service-provider/{row['id']}"
 
-    # Display name preference — business name first for seller roles.
-    if role == "storekeeper" and row["own_store_name"]:
-        display_name = row["own_store_name"]
-    elif role == "service_provider" and row["business_name"]:
+    # Display name preference — build the fallback chain.
+    # 1. business_name (provider)
+    # 2. store name (storekeeper)
+    # 3. nickname
+    # 4. real_name
+    # 5. first + last
+    # 6. phone
+    # 7. short id
+    display_name: Optional[str] = None
+    if row["business_name"]:
         display_name = row["business_name"]
-    else:
-        display_name = (
-            row["nickname"]
-            or row["username"]
-            or (row["id"][:8] if row["id"] else "User")
-        )
+    elif row["own_store_name"]:
+        display_name = row["own_store_name"]
+    elif row["nickname"]:
+        display_name = row["nickname"]
+    elif row["real_name"]:
+        display_name = row["real_name"]
+    elif row["first_name"] or row["last_name"]:
+        display_name = " ".join(
+            p for p in [row["first_name"], row["last_name"]] if p
+        ).strip() or None
+    elif row["phone"]:
+        display_name = row["phone"]
+    elif row["id"]:
+        display_name = row["id"][:8]
 
-    # Avatar preference — store image for storekeepers, business image
-    # for providers, then fall back to avatar_url.
-    if role == "storekeeper" and row["own_store_image"]:
-        avatar_url = row["own_store_image"]
-    elif role == "service_provider" and row["business_image_url"]:
+    if not display_name:
+        display_name = "User"
+
+    # Avatar preference — business image, then store image, then avatar_url.
+    if role == "service_provider" and row["business_image_url"]:
         avatar_url = row["business_image_url"]
+    elif role == "storekeeper" and row["own_store_image"]:
+        avatar_url = row["own_store_image"]
     else:
         avatar_url = row["avatar_url"]
 
