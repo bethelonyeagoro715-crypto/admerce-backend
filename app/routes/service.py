@@ -28,7 +28,6 @@ class BookServiceRequest(BaseModel):
 class ToggleAvailabilityRequest(BaseModel):
     is_available: bool
 
-# ✅ NEW — partial update. All fields optional; only provided keys are written.
 class UpdateServiceRequest(BaseModel):
     title: Optional[str] = None
     category: Optional[str] = None
@@ -62,6 +61,53 @@ def _as_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _update_won(result) -> bool:
+    """
+    asyncpg's database.execute() returns a status string like 'UPDATE 1'
+    or 'UPDATE 0' for UPDATE statements. This returns True iff the row
+    was actually touched by the guarded UPDATE — i.e. this caller won
+    any race for the row.
+    """
+    if isinstance(result, str):
+        return not result.strip().endswith("0")
+    # Anything else (RETURNING value, None) — treat as success.
+    return True
+
+
+async def _record_wallet_txn(
+    user_id: str,
+    amount: float,
+    txn_type: str,
+    description: str,
+    reference: str,
+    now: Optional[datetime] = None,
+) -> None:
+    """
+    Write a wallet_transactions audit row.
+
+    Fire-and-forget: does not participate in any surrounding DB transaction.
+    Caller must have already committed the wallet balance UPDATE. Silently
+    no-ops when amount <= 0 so callers can call it unconditionally.
+    """
+    if amount <= 0 or not user_id:
+        return
+    await database.execute(
+        """
+        INSERT INTO wallet_transactions
+            (user_id, amount, type, description, reference, status, created_at)
+        VALUES (:uid, :amt, :type, :desc, :ref, 'completed', :now)
+        """,
+        {
+            "uid": user_id,
+            "amt": float(amount),
+            "type": txn_type,
+            "desc": description,
+            "ref": reference,
+            "now": now or datetime.utcnow(),
+        },
+    )
 
 
 # ============================================================
@@ -284,9 +330,6 @@ async def instant_pay_service(
 # ============================================================
 # EDIT — PATCH /services/{id}   (owner only, partial)
 # ============================================================
-# ✅ NEW. Single UPDATE with owner in the WHERE — no read-then-write race.
-#    rowcount == 0 means either the service doesn't exist or the caller
-#    isn't its provider; both map to 403 to avoid leaking existence.
 @router.patch("/{service_id}")
 async def update_service(
     service_id: str,
@@ -337,11 +380,9 @@ async def update_service(
     """
     result = await database.execute(query, params)
 
-    # asyncpg returns a status string like 'UPDATE 1' or 'UPDATE 0'
-    if isinstance(result, str) and result.strip().endswith("0"):
+    if not _update_won(result):
         raise HTTPException(status_code=403, detail="Not authorized or service not found")
 
-    # Return the updated row so the caller doesn't need a second GET.
     row = await database.fetch_one(
         "SELECT * FROM services WHERE service_id = :sid",
         {"sid": service_id},
@@ -352,9 +393,6 @@ async def update_service(
 # ============================================================
 # DELETE VIDEO — removes only the video_url (owner only)
 # ============================================================
-# ✅ NEW. Cloudinary asset is NOT deleted (we don't store its public_id).
-#    The row's video_url is set to NULL; the provider can upload a new
-#    video or switch back to image-only.
 @router.delete("/{service_id}/video")
 async def delete_service_video(
     service_id: str,
@@ -369,7 +407,7 @@ async def delete_service_video(
         """,
         {"sid": service_id, "pid": provider_id},
     )
-    if isinstance(result, str) and result.strip().endswith("0"):
+    if not _update_won(result):
         raise HTTPException(status_code=403, detail="Not authorized or service not found")
     return {"service_id": service_id, "video_url": None, "message": "Video removed"}
 
@@ -506,14 +544,22 @@ async def accept_booking(
             ),
         )
 
-    await database.execute(
+    now = datetime.utcnow()
+    # Atomic guard — if another request already accepted it, this updates 0 rows.
+    result = await database.execute(
         """
         UPDATE service_bookings
         SET status = 'accepted', updated_at = :now
         WHERE booking_id = :bid AND status = 'locked'
         """,
-        {"now": datetime.utcnow(), "bid": booking_id},
+        {"now": now, "bid": booking_id},
     )
+    if not _update_won(result):
+        return {
+            "booking_id": booking_id,
+            "status": "accepted",
+            "message": "Booking was already accepted.",
+        }
 
     return {
         "booking_id": booking_id,
@@ -552,27 +598,51 @@ async def decline_booking(
 
     amount = _as_float(booking.get("amount"))
     customer_id = booking.get("customer_id")
+    now = datetime.utcnow()
 
-    if amount > 0 and customer_id:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": amount, "uid": customer_id},
-        )
-
-    await database.execute(
+    # ✅ Atomic flip FIRST. Refund only if this caller actually won the race.
+    result = await database.execute(
         """
         UPDATE service_bookings
         SET status = 'declined', updated_at = :now
         WHERE booking_id = :bid AND status = 'locked'
         """,
-        {"now": datetime.utcnow(), "bid": booking_id},
+        {"now": now, "bid": booking_id},
     )
+    if not _update_won(result):
+        # Someone else already processed this booking — no double refund.
+        return {
+            "booking_id": booking_id,
+            "status": "declined",
+            "refunded": 0,
+            "message": "Booking was already processed.",
+        }
+
+    refunded = 0.0
+    if amount > 0 and customer_id:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": amount, "uid": customer_id},
+        )
+        refunded = amount
+        await _record_wallet_txn(
+            user_id=customer_id,
+            amount=amount,
+            txn_type="credit",
+            description=f"Refund: booking {booking_id} declined by provider",
+            reference=f"decline:{booking_id}",
+            now=now,
+        )
 
     return {
         "booking_id": booking_id,
         "status": "declined",
-        "refunded": amount,
-        "message": f"Booking declined. ₦{amount:,.0f} returned to the customer.",
+        "refunded": refunded,
+        "message": (
+            f"Booking declined. ₦{refunded:,.0f} returned to the customer."
+            if refunded > 0
+            else "Booking declined."
+        ),
     }
 
 @router.post("/bookings/{booking_id}/confirm")
@@ -598,18 +668,37 @@ async def confirm_booking(
     if current_status not in ("locked", "accepted"):
         raise HTTPException(status_code=400, detail="Booking already processed")
 
-    await database.execute(
+    amount = _as_float(booking.get("amount"))
+    provider_id = booking["provider_id"]
+    now = datetime.utcnow()
+
+    # ✅ Atomic flip FIRST. Credit only if we won the race.
+    result = await database.execute(
         "UPDATE service_bookings SET status = 'completed', updated_at = :now "
-        "WHERE booking_id = :bid",
-        {"now": datetime.utcnow(), "bid": booking_id},
+        "WHERE booking_id = :bid AND status IN ('locked', 'accepted')",
+        {"now": now, "bid": booking_id},
     )
-    await database.execute(
-        "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-        {
-            "amt": _as_float(booking.get("amount")),
-            "uid": booking["provider_id"],
-        },
-    )
+    if not _update_won(result):
+        return {
+            "booking_id": booking_id,
+            "status": "completed",
+            "message": "Booking was already processed.",
+        }
+
+    if amount > 0:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": amount, "uid": provider_id},
+        )
+        await _record_wallet_txn(
+            user_id=provider_id,
+            amount=amount,
+            txn_type="credit",
+            description=f"Payment received: booking {booking_id} confirmed by provider",
+            reference=f"confirm:{booking_id}",
+            now=now,
+        )
+
     return {
         "booking_id": booking_id,
         "status": "completed",
@@ -636,18 +725,37 @@ async def complete_booking(
     if current_status not in ("locked", "accepted"):
         raise HTTPException(status_code=400, detail="Booking already processed")
 
-    await database.execute(
+    amount = _as_float(booking.get("amount"))
+    provider_id = booking["provider_id"]
+    now = datetime.utcnow()
+
+    # ✅ Atomic flip FIRST. Credit only if we won the race.
+    result = await database.execute(
         "UPDATE service_bookings SET status = 'completed', updated_at = :now "
-        "WHERE booking_id = :bid",
-        {"now": datetime.utcnow(), "bid": booking_id},
+        "WHERE booking_id = :bid AND status IN ('locked', 'accepted')",
+        {"now": now, "bid": booking_id},
     )
-    await database.execute(
-        "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-        {
-            "amt": _as_float(booking.get("amount")),
-            "uid": booking["provider_id"],
-        },
-    )
+    if not _update_won(result):
+        return {
+            "booking_id": booking_id,
+            "status": "completed",
+            "message": "Booking was already processed.",
+        }
+
+    if amount > 0:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": amount, "uid": provider_id},
+        )
+        await _record_wallet_txn(
+            user_id=provider_id,
+            amount=amount,
+            txn_type="credit",
+            description=f"Payment received: booking {booking_id} released by customer",
+            reference=f"complete:{booking_id}",
+            now=now,
+        )
+
     return {
         "booking_id": booking_id,
         "status": "completed",
@@ -685,32 +793,56 @@ async def cancel_booking(
 
     amount = _as_float(booking.get("amount"))
     customer_id = booking.get("customer_id")
+    cancelled_by = "customer" if user_id == customer_id else "provider"
+    now = datetime.utcnow()
 
-    if amount > 0 and customer_id:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": amount, "uid": customer_id},
-        )
-
-    await database.execute(
+    # ✅ Atomic flip FIRST. Refund only if this caller won the race.
+    result = await database.execute(
         """
         UPDATE service_bookings
         SET status = 'cancelled', updated_at = :now
         WHERE booking_id = :bid AND status IN ('locked', 'accepted')
         """,
-        {"now": datetime.utcnow(), "bid": booking_id},
+        {"now": now, "bid": booking_id},
     )
+    if not _update_won(result):
+        # Idempotent: another caller already cancelled this booking.
+        return {
+            "booking_id": booking_id,
+            "status": "cancelled",
+            "refunded": 0,
+            "cancelled_by": cancelled_by,
+            "message": "Booking was already cancelled.",
+        }
 
-    cancelled_by = "customer" if user_id == customer_id else "provider"
+    refunded = 0.0
+    if amount > 0 and customer_id:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": amount, "uid": customer_id},
+        )
+        refunded = amount
+        await _record_wallet_txn(
+            user_id=customer_id,
+            amount=amount,
+            txn_type="credit",
+            description=f"Refund: booking {booking_id} cancelled by {cancelled_by}",
+            reference=f"cancel:{booking_id}",
+            now=now,
+        )
 
     return {
         "booking_id": booking_id,
         "status": "cancelled",
-        "refunded": amount,
+        "refunded": refunded,
         "cancelled_by": cancelled_by,
         "message": (
             "Booking cancelled. "
-            + (f"₦{amount:,.0f} returned to your wallet." if amount > 0 else "")
+            + (
+                f"₦{refunded:,.0f} returned to the customer's wallet."
+                if refunded > 0
+                else ""
+            )
         ).strip(),
     }
 
@@ -857,6 +989,8 @@ async def book_service(
     if customer_id == service["provider_id"]:
         raise HTTPException(status_code=400, detail="You cannot book your own service")
 
+    # If no availability row exists, fetch_val returns None and we treat that
+    # as "available by default" — only an explicit False blocks booking.
     provider_available = await database.fetch_val(
         "SELECT is_available FROM provider_availability WHERE user_id = :pid",
         {"pid": service["provider_id"]},
@@ -905,6 +1039,18 @@ async def book_service(
             "now": now,
         },
     )
+
+    # Audit row for the escrow debit. The booking_id ties the wallet
+    # transaction back to the booking so support can trace the flow.
+    await _record_wallet_txn(
+        user_id=customer_id,
+        amount=service_price,
+        txn_type="debit",
+        description=f"Escrow hold: booking {booking_id}",
+        reference=f"book:{booking_id}",
+        now=now,
+    )
+
     return {
         "booking_id": booking_id,
         "service_id": service_id,
