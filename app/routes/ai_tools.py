@@ -2,11 +2,20 @@ import os
 import re
 import json
 import base64
+import asyncio
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
 from pydantic import BaseModel
 
 from .auth import get_current_user
+
+# ✅ Reuse the already-configured Gemini client from llm_agent.
+try:
+    import google.generativeai as genai
+    _GEMINI_SDK_AVAILABLE = True
+except ImportError:
+    genai = None
+    _GEMINI_SDK_AVAILABLE = False
 
 router = APIRouter(prefix="/storekeeper", tags=["AI Tools"])
 
@@ -23,25 +32,29 @@ except ImportError:
     _groq_client = None
     print("⚠️ AI Tools: groq package not installed")
 
-# ✅ Import the model chain. Fall back to a known candidate if the
-#    import fails for any reason.
 try:
     from app.services.llm_agent import (
         GROQ_MODEL as REWRITE_MODEL,
         GROQ_VISION_MODELS as VISION_MODEL_CANDIDATES,
+        GEMINI_VISION_MODELS as GEMINI_VISION_CANDIDATES,
+        GEMINI_ENABLED,
     )
 except Exception:
     REWRITE_MODEL = "openai/gpt-oss-120b"
     VISION_MODEL_CANDIDATES = [
-        "llama-3.2-11b-vision-preview",
-        "llama-3.2-90b-vision-preview",
-        "llama-3.2-11b-vision-instruct",
         "meta-llama/llama-4-scout-17b-16e-instruct",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
     ]
+    GEMINI_VISION_CANDIDATES = [
+        "gemini-3.6-flash",
+        "gemini-2.0-flash-exp",
+        "gemini-1.5-flash",
+    ]
+    GEMINI_ENABLED = _GEMINI_SDK_AVAILABLE
 
-# ✅ Cache the first vision model that works so subsequent calls skip
-#    the dead attempts. Reset on process restart (fine).
-_working_vision_model: Optional[str] = None
+# ✅ Cache the winning model per provider so we skip dead attempts.
+_working_gemini_vision_model: Optional[str] = None
+_working_groq_vision_model: Optional[str] = None
 
 
 class RewriteRequest(BaseModel):
@@ -102,31 +115,36 @@ def _extract_json(text: str) -> dict:
         return json.loads(m.group(0))
 
 
-def _is_model_not_found(err: Exception) -> bool:
-    """Groq returns 404 with 'model_not_found' when the account can't
-    use a model name. Detect it so we can fall through to the next."""
-    msg = str(err)
-    return (
-        "model_not_found" in msg
-        or "does not exist" in msg
-        or "you do not have access" in msg
+def _is_model_unusable(err: Exception) -> bool:
+    """
+    Detect any error that means 'this model name isn't usable right now'.
+    Covers: model_not_found, model_decommissioned, 404s, deprecation, etc.
+    We want the loop to keep trying instead of failing fast on these.
+    """
+    msg = str(err).lower()
+    phrases = (
+        "model_not_found",
+        "model_decommissioned",
+        "decommissioned",
+        "does not exist",
+        "do not have access",
+        "no longer supported",
+        "no longer available",
+        "not found",
+        "unsupported",
+        "404",
     )
+    return any(p in msg for p in phrases)
 
 
 # ============================================================
-# Diagnostic — list every model this Groq account can access
+# Diagnostics
 # ============================================================
 @router.get("/groq-models")
 async def list_groq_models(current_user: dict = Depends(get_current_user)):
-    """
-    Returns every model the current Groq account has access to.
-    Use this to pick the correct vision model name.
-    """
+    """Every model the current Groq account can access."""
     if _groq_client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Groq not configured. Check GROQ_API_KEY on the server.",
-        )
+        raise HTTPException(status_code=503, detail="Groq not configured.")
     try:
         models = _groq_client.models.list()
         entries = []
@@ -137,15 +155,33 @@ async def list_groq_models(current_user: dict = Depends(get_current_user)):
                 "active": getattr(m, "active", None),
             })
         entries.sort(key=lambda e: (e["id"] or "").lower())
-        return {
-            "count": len(entries),
-            "models": entries,
-        }
+        return {"count": len(entries), "models": entries}
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not list models: {e}",
-        )
+        raise HTTPException(status_code=500, detail=f"Could not list models: {e}")
+
+
+@router.get("/gemini-models")
+async def list_gemini_models(current_user: dict = Depends(get_current_user)):
+    """Every model the current Gemini API key can access."""
+    if not GEMINI_ENABLED or genai is None:
+        raise HTTPException(status_code=503, detail="Gemini not configured.")
+    try:
+        def _sync_call():
+            return list(genai.list_models())
+        models = await asyncio.to_thread(_sync_call)
+        entries = []
+        for m in models:
+            methods = getattr(m, "supported_generation_methods", []) or []
+            entries.append({
+                "name": getattr(m, "name", None),
+                "display_name": getattr(m, "display_name", None),
+                "methods": list(methods),
+                "supports_vision": "generateContent" in methods,
+            })
+        entries.sort(key=lambda e: (e["name"] or "").lower())
+        return {"count": len(entries), "models": entries}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not list models: {e}")
 
 
 # ============================================================
@@ -207,7 +243,109 @@ async def rewrite_listing(
 
 
 # ============================================================
-# Vision rewrite — sees the actual product photo
+# Vision provider helpers
+# ============================================================
+async def _try_gemini_vision(
+    prompt: str, image_bytes: bytes, mime: str,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Try each Gemini vision model in order until one returns JSON.
+    Returns (parsed_dict, used_model) on success, (None, error_msg) on failure."""
+    global _working_gemini_vision_model
+
+    if not GEMINI_ENABLED or genai is None:
+        return None, "Gemini not configured"
+
+    # If we've already found a working one, use only that.
+    candidates = (
+        [_working_gemini_vision_model]
+        if _working_gemini_vision_model
+        else list(GEMINI_VISION_CANDIDATES)
+    )
+
+    last_err: Optional[str] = None
+    for model_name in candidates:
+        print(f"🤖 [vision/gemini] trying model={model_name} mime={mime} bytes={len(image_bytes)}", flush=True)
+        try:
+            def _sync_call():
+                model = genai.GenerativeModel(model_name)
+                return model.generate_content([
+                    prompt,
+                    {"mime_type": mime, "data": image_bytes},
+                ])
+            response = await asyncio.to_thread(_sync_call)
+            raw = getattr(response, "text", "") or ""
+            if not raw.strip():
+                raise ValueError("empty response from Gemini")
+            parsed = _extract_json(raw)
+            _working_gemini_vision_model = model_name
+            print(f"✅ [vision/gemini] model={model_name} succeeded, cached", flush=True)
+            return parsed, model_name
+        except Exception as e:
+            last_err = str(e)
+            if _is_model_unusable(e):
+                print(f"⚠️ [vision/gemini] {model_name} not usable, trying next", flush=True)
+                continue
+            print(f"⚠️ [vision/gemini] {model_name} error (non-model), trying next: {e}", flush=True)
+            continue
+
+    return None, last_err or "All Gemini vision models failed"
+
+
+async def _try_groq_vision(
+    prompt: str, image_bytes: bytes, mime: str,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Fallback Groq path. Returns (parsed_dict, used_model) or (None, error)."""
+    global _working_groq_vision_model
+
+    if _groq_client is None:
+        return None, "Groq not configured"
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    data_url = f"data:{mime};base64,{b64}"
+
+    candidates = (
+        [_working_groq_vision_model]
+        if _working_groq_vision_model
+        else list(VISION_MODEL_CANDIDATES)
+    )
+
+    last_err: Optional[str] = None
+    for model_name in candidates:
+        print(f"🤖 [vision/groq] trying model={model_name} mime={mime} bytes={len(image_bytes)}", flush=True)
+        try:
+            response = await asyncio.to_thread(
+                _groq_client.chat.completions.create,
+                model=model_name,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }],
+                temperature=0.7,
+                max_tokens=800,
+            )
+            raw = response.choices[0].message.content or ""
+            if not raw.strip():
+                raise ValueError("empty response from Groq")
+            parsed = _extract_json(raw)
+            _working_groq_vision_model = model_name
+            print(f"✅ [vision/groq] model={model_name} succeeded, cached", flush=True)
+            return parsed, model_name
+        except Exception as e:
+            last_err = str(e)
+            if _is_model_unusable(e):
+                print(f"⚠️ [vision/groq] {model_name} not usable, trying next", flush=True)
+                continue
+            print(f"⚠️ [vision/groq] {model_name} error (non-model), trying next: {e}", flush=True)
+            continue
+
+    return None, last_err or "All Groq vision models failed"
+
+
+# ============================================================
+# Vision rewrite — Gemini first, Groq fallback
 # ============================================================
 @router.post("/rewrite-listing-vision")
 async def rewrite_listing_vision(
@@ -217,26 +355,13 @@ async def rewrite_listing_vision(
     category: str = Form(""),
     current_user: dict = Depends(get_current_user),
 ):
-    global _working_vision_model
-
-    if _groq_client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="AI vision service is temporarily unavailable.",
-        )
-
     image_bytes = await image.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty image file")
     if len(image_bytes) > 8 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail="Image too large. Please use a photo under 8MB.",
-        )
+        raise HTTPException(status_code=413, detail="Image too large. Please use a photo under 8MB.")
 
     mime = _detect_image_mime(image.content_type, image.filename)
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-    data_url = f"data:{mime};base64,{b64}"
 
     categories_line = ""
     if category.strip():
@@ -262,97 +387,24 @@ async def rewrite_listing_vision(
         existing_line=existing_line,
     )
 
-    # Build the list of models to try. If we've already found a working
-    # one, just use it — otherwise walk the candidate list.
-    if _working_vision_model:
-        models_to_try = [_working_vision_model]
-    else:
-        models_to_try = list(VISION_MODEL_CANDIDATES)
+    # ✅ Gemini first — it's the stable vision provider.
+    parsed, gemini_err = await _try_gemini_vision(prompt, image_bytes, mime)
 
-    raw: Optional[str] = None
-    last_err: Optional[Exception] = None
-
-    for model_name in models_to_try:
-        print(
-            f"🤖 [vision] trying model={model_name} "
-            f"mime={mime} bytes={len(image_bytes)}",
-            flush=True,
-        )
-        try:
-            response = _groq_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": data_url},
-                            },
-                        ],
-                    }
-                ],
-                temperature=0.7,
-                max_tokens=800,
-            )
-            raw = response.choices[0].message.content or ""
-            _working_vision_model = model_name
-            print(
-                f"✅ [vision] model={model_name} succeeded, cached for future calls",
-                flush=True,
-            )
-            break
-        except Exception as e:
-            last_err = e
-            if _is_model_not_found(e):
-                print(
-                    f"⚠️ [vision] model={model_name} not available, trying next",
-                    flush=True,
-                )
-                continue
-            # Any other error — fail fast, don't burn through the list.
-            print(f"❌ [vision] model={model_name} failed: {e}", flush=True)
+    # ✅ Groq as opportunistic fallback if Gemini is fully unavailable.
+    if parsed is None:
+        print(f"↩️ [vision] Gemini exhausted ({gemini_err}); falling back to Groq", flush=True)
+        parsed, groq_err = await _try_groq_vision(prompt, image_bytes, mime)
+        if parsed is None:
+            print(f"❌ [vision] all providers failed. gemini={gemini_err} groq={groq_err}", flush=True)
             raise HTTPException(
                 status_code=500,
-                detail="AI couldn't analyse the photo. Please try again.",
+                detail=(
+                    "AI vision isn't available on this server right now. "
+                    "An admin can check GET /storekeeper/gemini-models and GET /storekeeper/groq-models."
+                ),
             )
 
-    if raw is None:
-        print(
-            f"❌ [vision] all candidate models failed. last_err={last_err}",
-            flush=True,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "AI vision isn't available on this server right now. "
-                "No supported vision model was found. "
-                "An admin can check GET /storekeeper/groq-models."
-            ),
-        )
-
-    # Diagnostic — see exactly what the model returned
-    print(f"🔍 [vision] raw response ({len(raw)} chars): {raw[:1500]}", flush=True)
-
-    try:
-        parsed = _extract_json(raw)
-    except Exception as e:
-        print(f"❌ Vision JSON parse failed: {e}", flush=True)
-        raise HTTPException(
-            status_code=500,
-            detail="AI returned an unexpected response. Please try again.",
-        )
-
-    print(
-        f"✅ [vision] parsed keys={list(parsed.keys())}",
-        flush=True,
-    )
-    print(
-        f"   title={repr(parsed.get('title'))[:120]} "
-        f"description={repr(parsed.get('description'))[:120]}",
-        flush=True,
-    )
+    print(f"✅ [vision] parsed keys={list(parsed.keys())}", flush=True)
 
     return {
         "item_identified": str(parsed.get("item_identified", ""))[:120],

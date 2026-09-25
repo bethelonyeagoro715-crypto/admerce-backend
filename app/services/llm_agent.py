@@ -6,20 +6,25 @@ from typing import Optional
 # ── Groq (primary — fastest, best free tier for chat) ────────
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-# ✅ Vision-capable model candidates. Groq rotates these frequently and
-#    access varies by account tier. We try them in order and cache the
-#    first one that works. The 11B preview is the longest-lived and most
-#    widely available. Add more here as Groq releases them.
+# ⚠️ Groq's vision lineup is volatile — previews get decommissioned
+#    without notice and access varies by account tier. We keep this
+#    as an opportunistic fallback; Gemini is the primary vision path.
 GROQ_VISION_MODELS = [
-    "llama-3.2-11b-vision-preview",
-    "llama-3.2-90b-vision-preview",
-    "llama-3.2-11b-vision-instruct",
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
 ]
 
-# Backward-compat alias — some code imports this singular name.
+# Backward-compat alias.
 GROQ_VISION_MODEL = GROQ_VISION_MODELS[0]
+
+# ✅ Gemini vision chain. Google's vision models are stable and widely
+#    available on every tier. We try them in order; the first one that
+#    returns a valid JSON response wins and is cached for the session.
+GEMINI_VISION_MODELS = [
+    "gemini-3.6-flash",       # matches the chat model — has vision
+    "gemini-2.0-flash-exp",
+    "gemini-1.5-flash",
+]
 
 try:
     from groq import AsyncGroq
