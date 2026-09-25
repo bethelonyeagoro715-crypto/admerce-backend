@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Body
 from pydantic import BaseModel
 from typing import Optional, List
 from app.db.database import database
@@ -21,6 +21,8 @@ class ReserveRequest(BaseModel):
     quantity: int = 1
     courier_id: Optional[str] = None
     delivery_fee: float = 0.0
+    # ✅ NEW — how long the shopper has to pick up. Clamped to 1..168 hours.
+    pickup_window_hours: int = 2
 
 class ConfirmRequest(BaseModel):
     order_id: str
@@ -37,15 +39,24 @@ class WithdrawRequest(BaseModel):
     account_number: str
     pin: str
 
-# ✅ FIX: added `quantity` — the frontend now sends it, and the handler
-#    uses it to decrement stock by the right amount.
 class InstantPickupRequest(BaseModel):
     listing_id: str
     storekeeper_id: str
     amount: float
     quantity: int = 1
 
-# ---------- Helper ----------
+# ---------- Helpers ----------
+def _update_won(result) -> bool:
+    """
+    asyncpg's database.execute() returns a status string like 'UPDATE 1'
+    or 'UPDATE 0' for UPDATE statements. True iff a row was actually
+    touched — i.e. this caller won any race for the row.
+    """
+    if isinstance(result, str):
+        return not result.strip().endswith("0")
+    return True
+
+
 async def _log_wallet_transaction(
     user_id: str,
     amount: float,
@@ -54,6 +65,8 @@ async def _log_wallet_transaction(
     reference: str,
     status: str = 'completed'
 ):
+    if amount <= 0 or not user_id:
+        return
     await database.execute(
         """
         INSERT INTO wallet_transactions (user_id, amount, type, description, reference, status, created_at)
@@ -61,7 +74,7 @@ async def _log_wallet_transaction(
         """,
         {
             "uid": user_id,
-            "amt": amount,
+            "amt": float(amount),
             "type": type,
             "desc": description,
             "ref": reference,
@@ -85,8 +98,14 @@ async def create_wallet(current_user: dict = Depends(get_current_user)):
     return {"user_id": user_id, "balance": 0.0, "message": "Wallet created"}
 
 # ---------- Topup ----------
+# ✅ FIX — amount was declared as a bare `float`, which FastAPI treats as a
+#    query parameter for POST. The frontend sends JSON body { "amount": N },
+#    so the request would 422. Explicit Body(...) makes it read the body.
 @router.post("/topup")
-async def topup(amount: float, current_user: dict = Depends(get_current_user)):
+async def topup(
+    amount: float = Body(..., embed=True),
+    current_user: dict = Depends(get_current_user),
+):
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
     user_id = current_user["id"]
@@ -155,6 +174,7 @@ async def set_pin(req: SetPinRequest, current_user: dict = Depends(get_current_u
     return {"message": "Withdrawal PIN set successfully"}
 
 # ---------- Withdraw ----------
+# ⚠️ STILL LEDGER-ONLY. No Paystack Transfers. Does not move real money.
 @router.post("/withdraw")
 async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
@@ -208,8 +228,6 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
     }
 
 # ---------- Instant Pickup ----------
-# ✅ FIX: decrements stock by `req.quantity` (was hardcoded to 1).
-#    Also validates stock before charging.
 @router.post("/instant-pickup")
 async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
@@ -250,7 +268,6 @@ async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends
         {"amt": req.amount, "uid": req.storekeeper_id},
     )
 
-    # ✅ Decrement by the actual quantity, not 1.
     if available is not None:
         await database.execute(
             "UPDATE listings SET quantity_available = quantity_available - :qty "
@@ -265,6 +282,13 @@ async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends
         type='debit',
         description=f"Instant pickup ({quantity} item{'s' if quantity > 1 else ''})",
         reference=txn_id,
+    )
+    await _log_wallet_transaction(
+        user_id=req.storekeeper_id,
+        amount=req.amount,
+        type='credit',
+        description=f"Instant pickup payment ({quantity} item{'s' if quantity > 1 else ''})",
+        reference=f"{txn_id}:credit",
     )
 
     return {
@@ -284,6 +308,8 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=400, detail="Item amount must be positive")
 
     quantity = max(1, int(req.quantity or 1))
+    # ✅ NEW — clamp the pickup window to a sane range.
+    window_hours = max(1, min(168, int(req.pickup_window_hours or 2)))
 
     wallet = await database.fetch_one(
         "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": shopper_id}
@@ -323,7 +349,8 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
     )
 
     now = datetime.utcnow()
-    expires_at = now + timedelta(hours=2)
+    # ✅ FIX — use the caller-supplied window instead of hardcoded 2.
+    expires_at = now + timedelta(hours=window_hours)
 
     query = """
     INSERT INTO escrow (
@@ -355,7 +382,7 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         user_id=shopper_id,
         amount=total,
         type='debit',
-        description=f"Reservation ({quantity} item{'s' if quantity > 1 else ''})",
+        description=f"Reservation ({quantity} item{'s' if quantity > 1 else ''}, {window_hours}h window)",
         reference=req.order_id,
     )
 
@@ -371,6 +398,8 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         "status": "locked",
         "total": total,
         "quantity": quantity,
+        "pickup_window_hours": window_hours,
+        "expires_at": expires_at.isoformat(),
         "message": "Funds reserved",
     }
 
@@ -388,10 +417,13 @@ async def accept_reservation(req: AcceptRequest, current_user: dict = Depends(ge
     if escrow["status"] != "locked":
         raise HTTPException(status_code=400, detail="Order is not in a reservable state (status must be 'locked')")
 
-    await database.execute(
-        "UPDATE escrow SET status = 'accepted' WHERE order_id = :oid",
+    # ✅ Atomic flip — idempotent if a second caller races.
+    result = await database.execute(
+        "UPDATE escrow SET status = 'accepted' WHERE order_id = :oid AND status = 'locked'",
         {"oid": req.order_id},
     )
+    if not _update_won(result):
+        return {"order_id": req.order_id, "status": "accepted", "message": "Already accepted."}
 
     await send_push_to_user(
         escrow["shopper_id"],
@@ -418,21 +450,42 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
 
     item_amount = float(escrow["item_amount"])
     delivery_fee = float(escrow["delivery_fee"])
+    courier_id = escrow["courier_id"]
+    storekeeper_id = escrow["storekeeper_id"]
 
-    await database.execute(
-        "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-        {"amt": item_amount, "uid": escrow["storekeeper_id"]},
-    )
-    if delivery_fee > 0 and escrow["courier_id"]:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": delivery_fee, "uid": escrow["courier_id"]},
-        )
-
-    await database.execute(
-        "UPDATE escrow SET status = 'picked_up' WHERE order_id = :oid",
+    # ✅ Atomic flip FIRST — credit only if we won.
+    result = await database.execute(
+        "UPDATE escrow SET status = 'picked_up' WHERE order_id = :oid AND status IN ('accepted', 'locked')",
         {"oid": req.order_id},
     )
+    if not _update_won(result):
+        return {"order_id": req.order_id, "status": "picked_up", "message": "Order was already processed."}
+
+    if item_amount > 0:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": item_amount, "uid": storekeeper_id},
+        )
+        await _log_wallet_transaction(
+            user_id=storekeeper_id,
+            amount=item_amount,
+            type='credit',
+            description=f"Order #{req.order_id[:8]} picked up",
+            reference=f"{req.order_id}:storekeeper",
+        )
+
+    if delivery_fee > 0 and courier_id:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": delivery_fee, "uid": courier_id},
+        )
+        await _log_wallet_transaction(
+            user_id=courier_id,
+            amount=delivery_fee,
+            type='credit',
+            description=f"Delivery fee for #{req.order_id[:8]}",
+            reference=f"{req.order_id}:courier",
+        )
 
     return {"order_id": req.order_id, "status": "picked_up", "message": "Order marked as picked up. Funds released."}
 
@@ -452,21 +505,42 @@ async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current
 
     item_amount = float(escrow["item_amount"])
     delivery_fee = float(escrow["delivery_fee"])
+    courier_id = escrow["courier_id"]
+    storekeeper_id = escrow["storekeeper_id"]
 
-    await database.execute(
-        "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-        {"amt": item_amount, "uid": escrow["storekeeper_id"]},
-    )
-    if delivery_fee > 0 and escrow["courier_id"]:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": delivery_fee, "uid": escrow["courier_id"]},
-        )
-
-    await database.execute(
-        "UPDATE escrow SET status = 'dispatched' WHERE order_id = :oid",
+    result = await database.execute(
+        "UPDATE escrow SET status = 'dispatched' WHERE order_id = :oid AND status IN ('accepted', 'locked')",
         {"oid": req.order_id},
     )
+    if not _update_won(result):
+        return {"order_id": req.order_id, "status": "dispatched", "message": "Order was already processed."}
+
+    if item_amount > 0:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": item_amount, "uid": storekeeper_id},
+        )
+        await _log_wallet_transaction(
+            user_id=storekeeper_id,
+            amount=item_amount,
+            type='credit',
+            description=f"Order #{req.order_id[:8]} dispatched",
+            reference=f"{req.order_id}:storekeeper",
+        )
+
+    if delivery_fee > 0 and courier_id:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": delivery_fee, "uid": courier_id},
+        )
+        await _log_wallet_transaction(
+            user_id=courier_id,
+            amount=delivery_fee,
+            type='credit',
+            description=f"Delivery fee for #{req.order_id[:8]}",
+            reference=f"{req.order_id}:courier",
+        )
+
     return {"order_id": req.order_id, "status": "dispatched", "message": "Order dispatched. Funds released."}
 
 # ---------- Return ----------
@@ -486,6 +560,15 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
     escrow_d = dict(escrow)
     listing_id = escrow_d.get("listing_id")
     quantity = escrow_d.get("quantity")
+    item_amount = float(escrow["item_amount"])
+
+    # ✅ Atomic flip FIRST.
+    result = await database.execute(
+        "UPDATE escrow SET status = 'returned' WHERE order_id = :oid AND status IN ('locked', 'accepted')",
+        {"oid": req.order_id},
+    )
+    if not _update_won(result):
+        return {"order_id": req.order_id, "status": "returned", "message": "Order was already processed."}
 
     if listing_id and quantity:
         listing = await database.fetch_one(
@@ -498,16 +581,19 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
                 {"qty": quantity, "lid": listing_id},
             )
 
-    item_amount = float(escrow["item_amount"])
+    if item_amount > 0:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": item_amount, "uid": escrow["shopper_id"]},
+        )
+        await _log_wallet_transaction(
+            user_id=escrow["shopper_id"],
+            amount=item_amount,
+            type='credit',
+            description=f"Refund for order #{req.order_id[:8]}",
+            reference=f"{req.order_id}:refund",
+        )
 
-    await database.execute(
-        "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-        {"amt": item_amount, "uid": escrow["shopper_id"]},
-    )
-    await database.execute(
-        "UPDATE escrow SET status = 'returned' WHERE order_id = :oid",
-        {"oid": req.order_id},
-    )
     return {"order_id": req.order_id, "status": "returned", "message": "Item cost refunded. Stock restored."}
 
 # ---------- Reversed Package ----------
@@ -525,16 +611,28 @@ async def reversed_package(req: ConfirmRequest, current_user: dict = Depends(get
         raise HTTPException(status_code=400, detail="Order not in returned state")
 
     delivery_fee = float(escrow["delivery_fee"])
-    if delivery_fee > 0 and escrow["courier_id"]:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": delivery_fee, "uid": escrow["courier_id"]},
-        )
+    courier_id = escrow["courier_id"]
 
-    await database.execute(
-        "UPDATE escrow SET status = 'reversed' WHERE order_id = :oid",
+    result = await database.execute(
+        "UPDATE escrow SET status = 'reversed' WHERE order_id = :oid AND status = 'returned'",
         {"oid": req.order_id},
     )
+    if not _update_won(result):
+        return {"order_id": req.order_id, "status": "reversed", "message": "Already reversed."}
+
+    if delivery_fee > 0 and courier_id:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": delivery_fee, "uid": courier_id},
+        )
+        await _log_wallet_transaction(
+            user_id=courier_id,
+            amount=delivery_fee,
+            type='credit',
+            description=f"Reversed package fee for #{req.order_id[:8]}",
+            reference=f"{req.order_id}:reversed",
+        )
+
     return {"order_id": req.order_id, "status": "reversed", "message": "Courier fee released"}
 
 # ---------- Get Escrows ----------
