@@ -64,15 +64,8 @@ def _as_float(value, default: float = 0.0) -> float:
 
 
 def _update_won(result) -> bool:
-    """
-    asyncpg's database.execute() returns a status string like 'UPDATE 1'
-    or 'UPDATE 0' for UPDATE statements. This returns True iff the row
-    was actually touched by the guarded UPDATE — i.e. this caller won
-    any race for the row.
-    """
     if isinstance(result, str):
         return not result.strip().endswith("0")
-    # Anything else (RETURNING value, None) — treat as success.
     return True
 
 
@@ -84,13 +77,6 @@ async def _record_wallet_txn(
     reference: str,
     now: Optional[datetime] = None,
 ) -> None:
-    """
-    Write a wallet_transactions audit row.
-
-    Fire-and-forget: does not participate in any surrounding DB transaction.
-    Caller must have already committed the wallet balance UPDATE. Silently
-    no-ops when amount <= 0 so callers can call it unconditionally.
-    """
     if amount <= 0 or not user_id:
         return
     await database.execute(
@@ -138,13 +124,15 @@ async def get_provider_bookings(current_user: dict = Depends(get_current_user)):
     params = {f"sid{i}": sid for i, sid in enumerate(service_id_list)}
     query = f"""
         SELECT sb.*, s.title AS service_title,
+               s.image_url AS service_image_url,
                COALESCE(
                    NULLIF(CONCAT(u.first_name, ' ', u.last_name), ' '),
                    u.nickname,
                    u.real_name,
                    u.email,
                    'Customer'
-               ) AS user_name
+               ) AS user_name,
+               u.avatar_url AS user_avatar
         FROM service_bookings sb
         JOIN services s ON sb.service_id = s.service_id
         JOIN users u ON sb.customer_id = u.id
@@ -454,6 +442,8 @@ async def delete_service(service_id: str, current_user: dict = Depends(get_curre
 # ============================================================
 # BOOKINGS
 # ============================================================
+# ✅ FIX — the general /bookings endpoint now returns service image +
+#    provider image so the saved tab can render a rich card.
 @router.get("/bookings")
 async def get_bookings(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
@@ -461,15 +451,20 @@ async def get_bookings(current_user: dict = Depends(get_current_user)):
         """
         SELECT sb.*,
                s.title AS service_title,
+               s.image_url AS service_image_url,
+               s.duration_minutes AS service_duration,
                COALESCE(
                    NULLIF(CONCAT(u_c.first_name, ' ', u_c.last_name), ' '),
                    u_c.nickname, u_c.real_name, u_c.email, 'Customer'
                ) AS customer_name,
+               u_c.avatar_url AS customer_avatar,
                COALESCE(
                    NULLIF(CONCAT(u_p.first_name, ' ', u_p.last_name), ' '),
                    u_p.nickname, u_p.real_name, u_p.business_name, u_p.email,
                    'Provider'
-               ) AS provider_name
+               ) AS provider_name,
+               u_p.business_image_url AS provider_image_url,
+               u_p.avatar_url AS provider_avatar
         FROM service_bookings sb
         LEFT JOIN services s ON sb.service_id = s.service_id
         LEFT JOIN users u_c ON sb.customer_id = u_c.id
@@ -481,21 +476,27 @@ async def get_bookings(current_user: dict = Depends(get_current_user)):
     )
     return [dict(row) for row in rows]
 
+# ✅ FIX — same additions on the single-booking endpoint.
 @router.get("/bookings/{booking_id}")
 async def get_booking(booking_id: str, current_user: dict = Depends(get_current_user)):
     row = await database.fetch_one(
         """
         SELECT sb.*,
                s.title AS service_title,
+               s.image_url AS service_image_url,
+               s.duration_minutes AS service_duration,
                COALESCE(
                    NULLIF(CONCAT(u_c.first_name, ' ', u_c.last_name), ' '),
                    u_c.nickname, u_c.real_name, u_c.email, 'Customer'
                ) AS customer_name,
+               u_c.avatar_url AS customer_avatar,
                COALESCE(
                    NULLIF(CONCAT(u_p.first_name, ' ', u_p.last_name), ' '),
                    u_p.nickname, u_p.real_name, u_p.business_name, u_p.email,
                    'Provider'
-               ) AS provider_name
+               ) AS provider_name,
+               u_p.business_image_url AS provider_image_url,
+               u_p.avatar_url AS provider_avatar
         FROM service_bookings sb
         LEFT JOIN services s ON sb.service_id = s.service_id
         LEFT JOIN users u_c ON sb.customer_id = u_c.id
@@ -545,7 +546,6 @@ async def accept_booking(
         )
 
     now = datetime.utcnow()
-    # Atomic guard — if another request already accepted it, this updates 0 rows.
     result = await database.execute(
         """
         UPDATE service_bookings
@@ -600,7 +600,6 @@ async def decline_booking(
     customer_id = booking.get("customer_id")
     now = datetime.utcnow()
 
-    # ✅ Atomic flip FIRST. Refund only if this caller actually won the race.
     result = await database.execute(
         """
         UPDATE service_bookings
@@ -610,7 +609,6 @@ async def decline_booking(
         {"now": now, "bid": booking_id},
     )
     if not _update_won(result):
-        # Someone else already processed this booking — no double refund.
         return {
             "booking_id": booking_id,
             "status": "declined",
@@ -672,7 +670,6 @@ async def confirm_booking(
     provider_id = booking["provider_id"]
     now = datetime.utcnow()
 
-    # ✅ Atomic flip FIRST. Credit only if we won the race.
     result = await database.execute(
         "UPDATE service_bookings SET status = 'completed', updated_at = :now "
         "WHERE booking_id = :bid AND status IN ('locked', 'accepted')",
@@ -729,7 +726,6 @@ async def complete_booking(
     provider_id = booking["provider_id"]
     now = datetime.utcnow()
 
-    # ✅ Atomic flip FIRST. Credit only if we won the race.
     result = await database.execute(
         "UPDATE service_bookings SET status = 'completed', updated_at = :now "
         "WHERE booking_id = :bid AND status IN ('locked', 'accepted')",
@@ -796,7 +792,6 @@ async def cancel_booking(
     cancelled_by = "customer" if user_id == customer_id else "provider"
     now = datetime.utcnow()
 
-    # ✅ Atomic flip FIRST. Refund only if this caller won the race.
     result = await database.execute(
         """
         UPDATE service_bookings
@@ -806,7 +801,6 @@ async def cancel_booking(
         {"now": now, "bid": booking_id},
     )
     if not _update_won(result):
-        # Idempotent: another caller already cancelled this booking.
         return {
             "booking_id": booking_id,
             "status": "cancelled",
@@ -989,8 +983,6 @@ async def book_service(
     if customer_id == service["provider_id"]:
         raise HTTPException(status_code=400, detail="You cannot book your own service")
 
-    # If no availability row exists, fetch_val returns None and we treat that
-    # as "available by default" — only an explicit False blocks booking.
     provider_available = await database.fetch_val(
         "SELECT is_available FROM provider_availability WHERE user_id = :pid",
         {"pid": service["provider_id"]},
@@ -1040,8 +1032,6 @@ async def book_service(
         },
     )
 
-    # Audit row for the escrow debit. The booking_id ties the wallet
-    # transaction back to the booking so support can trace the flow.
     await _record_wallet_txn(
         user_id=customer_id,
         amount=service_price,
