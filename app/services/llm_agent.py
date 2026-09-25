@@ -5,6 +5,13 @@ from typing import Optional
 
 # ── Groq (primary — fastest, best free tier for chat) ────────
 GROQ_MODEL = "openai/gpt-oss-120b"
+
+# ✅ NEW — vision-capable model for image analysis. Llama 4 Scout
+#    accepts images (base64 or URL) and returns text. Bump to
+#    "meta-llama/llama-4-maverick-17b-128e-instruct" if you need
+#    better quality and don't mind the extra cost.
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
 try:
     from groq import AsyncGroq
     _groq_key = os.getenv("GROQ_API_KEY")
@@ -20,8 +27,6 @@ except ImportError:
     print("⚠️ groq package not installed. Install with: pip install groq")
 
 # ── Google Gemini (secondary — strongest for agent + tools) ──
-# Google rotates model names frequently. If you see a 404
-# "no longer available to new users", update this string.
 GEMINI_MODEL = "gemini-3.6-flash"
 try:
     import google.generativeai as genai
@@ -115,7 +120,6 @@ async def _call_gemini(user_query: str) -> Optional[dict]:
     if not GEMINI_ENABLED:
         return None
     try:
-        # google.generativeai is sync; offload to a thread so it doesn't block
         def _sync_call():
             model = genai.GenerativeModel(GEMINI_MODEL)
             return model.generate_content(
