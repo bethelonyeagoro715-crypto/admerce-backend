@@ -21,8 +21,8 @@ class ReserveRequest(BaseModel):
     quantity: int = 1
     courier_id: Optional[str] = None
     delivery_fee: float = 0.0
-    # ✅ NEW — how long the shopper has to pick up. Clamped to 1..168 hours.
-    pickup_window_hours: int = 2
+    # ✅ FIX — minimum 3 hours. Clamped to 3..168 in the handler.
+    pickup_window_hours: int = 3
 
 class ConfirmRequest(BaseModel):
     order_id: str
@@ -47,11 +47,6 @@ class InstantPickupRequest(BaseModel):
 
 # ---------- Helpers ----------
 def _update_won(result) -> bool:
-    """
-    asyncpg's database.execute() returns a status string like 'UPDATE 1'
-    or 'UPDATE 0' for UPDATE statements. True iff a row was actually
-    touched — i.e. this caller won any race for the row.
-    """
     if isinstance(result, str):
         return not result.strip().endswith("0")
     return True
@@ -98,9 +93,6 @@ async def create_wallet(current_user: dict = Depends(get_current_user)):
     return {"user_id": user_id, "balance": 0.0, "message": "Wallet created"}
 
 # ---------- Topup ----------
-# ✅ FIX — amount was declared as a bare `float`, which FastAPI treats as a
-#    query parameter for POST. The frontend sends JSON body { "amount": N },
-#    so the request would 422. Explicit Body(...) makes it read the body.
 @router.post("/topup")
 async def topup(
     amount: float = Body(..., embed=True),
@@ -308,8 +300,8 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=400, detail="Item amount must be positive")
 
     quantity = max(1, int(req.quantity or 1))
-    # ✅ NEW — clamp the pickup window to a sane range.
-    window_hours = max(1, min(168, int(req.pickup_window_hours or 2)))
+    # ✅ FIX — minimum 3 hours (was 1). Maximum 168 (7 days).
+    window_hours = max(3, min(168, int(req.pickup_window_hours or 3)))
 
     wallet = await database.fetch_one(
         "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": shopper_id}
@@ -349,7 +341,6 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
     )
 
     now = datetime.utcnow()
-    # ✅ FIX — use the caller-supplied window instead of hardcoded 2.
     expires_at = now + timedelta(hours=window_hours)
 
     query = """
@@ -417,7 +408,6 @@ async def accept_reservation(req: AcceptRequest, current_user: dict = Depends(ge
     if escrow["status"] != "locked":
         raise HTTPException(status_code=400, detail="Order is not in a reservable state (status must be 'locked')")
 
-    # ✅ Atomic flip — idempotent if a second caller races.
     result = await database.execute(
         "UPDATE escrow SET status = 'accepted' WHERE order_id = :oid AND status = 'locked'",
         {"oid": req.order_id},
@@ -453,7 +443,6 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
     courier_id = escrow["courier_id"]
     storekeeper_id = escrow["storekeeper_id"]
 
-    # ✅ Atomic flip FIRST — credit only if we won.
     result = await database.execute(
         "UPDATE escrow SET status = 'picked_up' WHERE order_id = :oid AND status IN ('accepted', 'locked')",
         {"oid": req.order_id},
@@ -562,7 +551,6 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
     quantity = escrow_d.get("quantity")
     item_amount = float(escrow["item_amount"])
 
-    # ✅ Atomic flip FIRST.
     result = await database.execute(
         "UPDATE escrow SET status = 'returned' WHERE order_id = :oid AND status IN ('locked', 'accepted')",
         {"oid": req.order_id},
