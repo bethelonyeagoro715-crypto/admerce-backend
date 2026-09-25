@@ -6,11 +6,20 @@ from typing import Optional
 # ── Groq (primary — fastest, best free tier for chat) ────────
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-# ✅ NEW — vision-capable model for image analysis. Llama 4 Scout
-#    accepts images (base64 or URL) and returns text. Bump to
-#    "meta-llama/llama-4-maverick-17b-128e-instruct" if you need
-#    better quality and don't mind the extra cost.
-GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# ✅ Vision-capable model candidates. Groq rotates these frequently and
+#    access varies by account tier. We try them in order and cache the
+#    first one that works. The 11B preview is the longest-lived and most
+#    widely available. Add more here as Groq releases them.
+GROQ_VISION_MODELS = [
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview",
+    "llama-3.2-11b-vision-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+]
+
+# Backward-compat alias — some code imports this singular name.
+GROQ_VISION_MODEL = GROQ_VISION_MODELS[0]
 
 try:
     from groq import AsyncGroq
