@@ -21,7 +21,6 @@ class ReserveRequest(BaseModel):
     quantity: int = 1
     courier_id: Optional[str] = None
     delivery_fee: float = 0.0
-    # ✅ FIX — minimum 3 hours. Clamped to 3..168 in the handler.
     pickup_window_hours: int = 3
 
 class ConfirmRequest(BaseModel):
@@ -300,7 +299,6 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=400, detail="Item amount must be positive")
 
     quantity = max(1, int(req.quantity or 1))
-    # ✅ FIX — minimum 3 hours (was 1). Maximum 168 (7 days).
     window_hours = max(3, min(168, int(req.pickup_window_hours or 3)))
 
     wallet = await database.fetch_one(
@@ -634,13 +632,32 @@ async def get_escrows(current_user: dict = Depends(get_current_user)):
     return [dict(row) for row in rows]
 
 # ---------- Get Orders ----------
+# ✅ FIX — joins listings + stores so the response carries item title,
+#    item image, store address, and store coordinates. Also routes the
+#    store join through `listings.store_id` instead of `stores.owner_id`,
+#    which previously returned an arbitrary store when the owner had more
+#    than one.
 @router.get("/orders")
 async def get_orders(
     current_user: dict = Depends(get_current_user),
     status: Optional[str] = Query(None, description="Comma-separated statuses"),
 ):
     user_id = current_user["id"]
-    query = "SELECT * FROM escrow WHERE shopper_id = :uid"
+    query = """
+        SELECT e.*,
+               s.name             AS store_name,
+               s.store_image_url  AS store_image_url,
+               s.address          AS store_address,
+               s.latitude         AS store_latitude,
+               s.longitude        AS store_longitude,
+               l.title            AS listing_title,
+               l.image_url        AS listing_image_url,
+               l.category         AS listing_category
+        FROM escrow e
+        LEFT JOIN listings l ON e.listing_id = l.listing_id
+        LEFT JOIN stores   s ON l.store_id   = s.store_id
+        WHERE e.shopper_id = :uid
+    """
     params: dict = {"uid": user_id}
 
     if status:
@@ -651,14 +668,16 @@ async def get_orders(
                 ph = f"status_{idx}"
                 placeholders.append(f":{ph}")
                 params[ph] = s
-            query += f" AND status IN ({', '.join(placeholders)})"
+            query += f" AND e.status IN ({', '.join(placeholders)})"
 
-    query += " ORDER BY created_at DESC"
+    query += " ORDER BY e.created_at DESC"
 
     rows = await database.fetch_all(query, params)
     return [dict(row) for row in rows]
 
 # ---------- Get Order Detail ----------
+# ✅ FIX — same joins as above, plus fixes the multi-store bug by routing
+#    the store join through the listing's store_id.
 @router.get("/order/{order_id}")
 async def get_order_detail(order_id: str, current_user: dict = Depends(get_current_user)):
     order = await database.fetch_one(
@@ -679,12 +698,19 @@ async def get_order_detail(order_id: str, current_user: dict = Depends(get_curre
                    NULLIF(sk.phone, ''),
                    'Storekeeper'
                ) AS storekeeper_name,
-               s.name AS store_name,
-               s.store_image_url AS store_image_url
+               s.name             AS store_name,
+               s.store_image_url  AS store_image_url,
+               s.address          AS store_address,
+               s.latitude         AS store_latitude,
+               s.longitude        AS store_longitude,
+               l.title            AS listing_title,
+               l.image_url        AS listing_image_url,
+               l.category         AS listing_category
         FROM escrow e
-        LEFT JOIN users u   ON e.shopper_id     = u.id
-        LEFT JOIN users sk  ON e.storekeeper_id = sk.id
-        LEFT JOIN stores s  ON e.storekeeper_id = s.owner_id
+        LEFT JOIN users    u ON e.shopper_id     = u.id
+        LEFT JOIN users    sk ON e.storekeeper_id = sk.id
+        LEFT JOIN listings l ON e.listing_id      = l.listing_id
+        LEFT JOIN stores   s ON l.store_id        = s.store_id
         WHERE e.order_id = :oid
         """,
         {"oid": order_id},
