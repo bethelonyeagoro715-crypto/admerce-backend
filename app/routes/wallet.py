@@ -29,6 +29,12 @@ class ConfirmRequest(BaseModel):
 class AcceptRequest(BaseModel):
     order_id: str
 
+# ✅ NEW — decline is storekeeper-initiated. Reason is optional but
+#    recommended; it goes into the shopper's notification and the audit row.
+class DeclineRequest(BaseModel):
+    order_id: str
+    reason: Optional[str] = None
+
 class SetPinRequest(BaseModel):
     pin: str
 
@@ -393,6 +399,7 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
     }
 
 # ---------- Accept Reservation ----------
+# ✅ Storekeeper-only. Flips locked → accepted. No wallet mutation.
 @router.post("/accept")
 async def accept_reservation(req: AcceptRequest, current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
@@ -422,7 +429,101 @@ async def accept_reservation(req: AcceptRequest, current_user: dict = Depends(ge
 
     return {"order_id": req.order_id, "status": "accepted", "message": "Reservation accepted"}
 
+# ---------- Decline Reservation ----------
+# ✅ NEW — storekeeper-only. Flips locked → declined, refunds the shopper.
+#    Only valid on 'locked' — once the storekeeper has accepted, they've
+#    committed; declining after that is a support case, not a button.
+#    Atomic flip first, refund only if this caller won the race.
+@router.post("/decline")
+async def decline_reservation(req: DeclineRequest, current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    escrow = await database.fetch_one(
+        "SELECT * FROM escrow WHERE order_id = :oid", {"oid": req.order_id}
+    )
+    if not escrow:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if escrow["storekeeper_id"] != user_id:
+        raise HTTPException(status_code=403, detail="You are not the storekeeper for this order")
+
+    current_status = (escrow["status"] or "").lower()
+    if current_status != "locked":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot decline a reservation with status '{current_status}'. "
+                "Only pending reservations can be declined. If you've already "
+                "held the item, contact support."
+            ),
+        )
+
+    # Optional reason — cap at 500 chars to prevent abuse.
+    reason = (req.reason or "").strip()
+    if len(reason) > 500:
+        raise HTTPException(status_code=400, detail="Reason too long (max 500 characters)")
+
+    shopper_id = escrow["shopper_id"]
+    total = float(escrow["total_amount"] or 0)
+    short = req.order_id[:8]
+    now = datetime.utcnow()
+
+    # ✅ Atomic flip FIRST. Refund only if we won the race.
+    result = await database.execute(
+        "UPDATE escrow SET status = 'declined' WHERE order_id = :oid AND status = 'locked'",
+        {"oid": req.order_id},
+    )
+    if not _update_won(result):
+        return {
+            "order_id": req.order_id,
+            "status": "declined",
+            "refunded": 0,
+            "reason": reason or None,
+            "message": "Reservation was already processed.",
+        }
+
+    refunded = 0.0
+    if total > 0 and shopper_id:
+        await database.execute(
+            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+            {"amt": total, "uid": shopper_id},
+        )
+        refunded = total
+        audit_desc = f"Refund: reservation {short} declined by store"
+        if reason:
+            audit_desc += f" — {reason}"
+        await _log_wallet_transaction(
+            user_id=shopper_id,
+            amount=total,
+            type='credit',
+            description=audit_desc,
+            reference=f"decline:{req.order_id}",
+        )
+
+    # Push to shopper — includes the reason when provided.
+    notify_body = f"Your order #{short} couldn't be fulfilled. ₦{refunded:,.0f} has been refunded to your wallet."
+    if reason:
+        notify_body += f" Reason: {reason}"
+
+    asyncio.create_task(send_push_to_user(
+        shopper_id,
+        "Reservation Declined",
+        notify_body,
+        {"order_id": req.order_id, "reason": reason or ""},
+    ))
+
+    return {
+        "order_id": req.order_id,
+        "status": "declined",
+        "refunded": refunded,
+        "reason": reason or None,
+        "message": (
+            f"Reservation declined. ₦{refunded:,.0f} returned to the shopper."
+            if refunded > 0
+            else "Reservation declined."
+        ),
+    }
+
 # ---------- Confirm ----------
+# ⚠️ Shopper-only. Storekeepers calling this get 403. That's by design.
 @router.post("/confirm")
 async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
@@ -632,11 +733,6 @@ async def get_escrows(current_user: dict = Depends(get_current_user)):
     return [dict(row) for row in rows]
 
 # ---------- Get Orders ----------
-# ✅ FIX — joins listings + stores so the response carries item title,
-#    item image, store address, and store coordinates. Also routes the
-#    store join through `listings.store_id` instead of `stores.owner_id`,
-#    which previously returned an arbitrary store when the owner had more
-#    than one.
 @router.get("/orders")
 async def get_orders(
     current_user: dict = Depends(get_current_user),
@@ -676,8 +772,6 @@ async def get_orders(
     return [dict(row) for row in rows]
 
 # ---------- Get Order Detail ----------
-# ✅ FIX — same joins as above, plus fixes the multi-store bug by routing
-#    the store join through the listing's store_id.
 @router.get("/order/{order_id}")
 async def get_order_detail(order_id: str, current_user: dict = Depends(get_current_user)):
     order = await database.fetch_one(
