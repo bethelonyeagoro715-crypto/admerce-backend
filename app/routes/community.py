@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as _tz
 from app.db.database import database
 from app.routes.auth import get_current_user
 
@@ -43,6 +43,19 @@ async def community_required(current_user: dict = Depends(get_current_user)):
 
 
 # ---------- Helpers ----------
+def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    Normalize a datetime to naive-UTC so it can be safely compared with
+    datetime.utcnow(). Handles both naive values (TIMESTAMP columns) and
+    tz-aware values (TIMESTAMPTZ columns, which asyncpg returns aware).
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(_tz.utc).replace(tzinfo=None)
+    return dt
+
+
 async def _resolve_sender_identity(user_id: str) -> tuple[str, Optional[str]]:
     """
     Return (display_name, avatar_url) for the given user.
@@ -91,7 +104,7 @@ async def list_messages(
 ):
     """
     Return recent messages in the room, oldest first.
-    `before_id` enables backwards pagination for infinite scroll.
+    Soft-deleted rows are excluded. `before_id` enables backwards pagination.
     """
     params: dict = {"room": room, "lim": limit}
     query = """
@@ -99,7 +112,7 @@ async def list_messages(
                room, text, image_url, reply_to_id,
                created_at, edited_at, deleted_at
         FROM community_messages
-        WHERE room = :room
+        WHERE room = :room AND deleted_at IS NULL
     """
     if before_id:
         query += " AND id < :bid"
@@ -121,11 +134,13 @@ async def post_message(
     sender_name, sender_avatar = await _resolve_sender_identity(sender_id)
     sender_role = (current_user.get("role") or "").lower()
 
-    # Validate the reply target — must be a real message in the same room.
+    # Validate the reply target — must be a real, non-deleted message in the
+    # same room.
     reply_to_id = req.reply_to_id
     if reply_to_id is not None:
         parent = await database.fetch_one(
-            "SELECT id FROM community_messages WHERE id = :pid AND room = :room",
+            "SELECT id FROM community_messages "
+            "WHERE id = :pid AND room = :room AND deleted_at IS NULL",
             {"pid": reply_to_id, "room": req.room},
         )
         if not parent:
@@ -191,8 +206,12 @@ async def edit_message(
     if row["deleted_at"]:
         raise HTTPException(status_code=400, detail="Cannot edit a deleted message")
 
-    created_at = row["created_at"]
-    if created_at and datetime.utcnow() - created_at > timedelta(minutes=EDIT_WINDOW_MINUTES):
+    # Compare in naive-UTC on both sides. Handles both TIMESTAMP and
+    # TIMESTAMPTZ columns — the latter returns tz-aware from asyncpg.
+    created_at_naive = _to_naive_utc(row["created_at"])
+    if created_at_naive and datetime.utcnow() - created_at_naive > timedelta(
+        minutes=EDIT_WINDOW_MINUTES
+    ):
         raise HTTPException(
             status_code=403,
             detail=f"Edit window closed ({EDIT_WINDOW_MINUTES} min)",
