@@ -4,10 +4,26 @@ from typing import Optional
 from app.db.database import database
 from app.utils.security import get_current_user
 from app.services.cloudinary_service import upload_image, upload_video
-import uuid
+from PIL import Image
+import uuid, io
 from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/services", tags=["Services"])
+
+
+# ---------- image dimensions helper ----------
+def _image_dimensions(image_bytes: bytes) -> tuple[Optional[int], Optional[int]]:
+    """Return (width, height) for the exact bytes being uploaded.
+    Returns (None, None) on decode failure — frontend falls back to hash."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+        if w > 0 and h > 0:
+            return int(w), int(h)
+    except Exception as e:
+        print(f"⚠️  Could not read image dimensions: {e}")
+    return None, None
+
 
 # ---------- Models ----------
 class CreateServiceRequest(BaseModel):
@@ -39,6 +55,7 @@ class InstantPayRequest(BaseModel):
     service_id: str
     provider_id: str
     reference: str
+
 
 # ---------- Helpers ----------
 def _parse_iso_datetime(value):
@@ -125,6 +142,8 @@ async def get_provider_bookings(current_user: dict = Depends(get_current_user)):
     query = f"""
         SELECT sb.*, s.title AS service_title,
                s.image_url AS service_image_url,
+               s.image_width AS service_image_width,
+               s.image_height AS service_image_height,
                COALESCE(
                    NULLIF(CONCAT(u.first_name, ' ', u.last_name), ' '),
                    u.nickname,
@@ -442,8 +461,6 @@ async def delete_service(service_id: str, current_user: dict = Depends(get_curre
 # ============================================================
 # BOOKINGS
 # ============================================================
-# ✅ FIX — the general /bookings endpoint now returns service image +
-#    provider image so the saved tab can render a rich card.
 @router.get("/bookings")
 async def get_bookings(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
@@ -452,6 +469,8 @@ async def get_bookings(current_user: dict = Depends(get_current_user)):
         SELECT sb.*,
                s.title AS service_title,
                s.image_url AS service_image_url,
+               s.image_width AS service_image_width,
+               s.image_height AS service_image_height,
                s.duration_minutes AS service_duration,
                COALESCE(
                    NULLIF(CONCAT(u_c.first_name, ' ', u_c.last_name), ' '),
@@ -464,6 +483,8 @@ async def get_bookings(current_user: dict = Depends(get_current_user)):
                    'Provider'
                ) AS provider_name,
                u_p.business_image_url AS provider_image_url,
+               u_p.business_image_width AS provider_image_width,
+               u_p.business_image_height AS provider_image_height,
                u_p.avatar_url AS provider_avatar
         FROM service_bookings sb
         LEFT JOIN services s ON sb.service_id = s.service_id
@@ -476,7 +497,6 @@ async def get_bookings(current_user: dict = Depends(get_current_user)):
     )
     return [dict(row) for row in rows]
 
-# ✅ FIX — same additions on the single-booking endpoint.
 @router.get("/bookings/{booking_id}")
 async def get_booking(booking_id: str, current_user: dict = Depends(get_current_user)):
     row = await database.fetch_one(
@@ -484,6 +504,8 @@ async def get_booking(booking_id: str, current_user: dict = Depends(get_current_
         SELECT sb.*,
                s.title AS service_title,
                s.image_url AS service_image_url,
+               s.image_width AS service_image_width,
+               s.image_height AS service_image_height,
                s.duration_minutes AS service_duration,
                COALESCE(
                    NULLIF(CONCAT(u_c.first_name, ' ', u_c.last_name), ' '),
@@ -496,6 +518,8 @@ async def get_booking(booking_id: str, current_user: dict = Depends(get_current_
                    'Provider'
                ) AS provider_name,
                u_p.business_image_url AS provider_image_url,
+               u_p.business_image_width AS provider_image_width,
+               u_p.business_image_height AS provider_image_height,
                u_p.avatar_url AS provider_avatar
         FROM service_bookings sb
         LEFT JOIN services s ON sb.service_id = s.service_id
@@ -880,7 +904,8 @@ async def create_service(
 async def list_services():
     rows = await database.fetch_all(
         """
-        SELECT s.*, u.business_name, u.business_image_url
+        SELECT s.*, u.business_name, u.business_image_url,
+               u.business_image_width, u.business_image_height
         FROM services s
         JOIN users u ON s.provider_id = u.id
         WHERE s.is_active = TRUE
@@ -914,11 +939,19 @@ async def upload_service_image(
         print(f"❌ Cloudinary upload failed: {e!r}", flush=True)
         raise HTTPException(status_code=500, detail="Image upload failed")
 
+    image_width, image_height = _image_dimensions(image_bytes)
+
     await database.execute(
-        "UPDATE services SET image_url = :url WHERE service_id = :sid",
-        {"url": image_url, "sid": service_id},
+        "UPDATE services SET image_url = :url, "
+        "image_width = :w, image_height = :h "
+        "WHERE service_id = :sid",
+        {"url": image_url, "w": image_width, "h": image_height, "sid": service_id},
     )
-    return {"image_url": image_url}
+    return {
+        "image_url": image_url,
+        "image_width": image_width,
+        "image_height": image_height,
+    }
 
 @router.post("/{service_id}/video")
 async def upload_service_video(
@@ -955,7 +988,8 @@ async def upload_service_video(
 async def get_service(service_id: str):
     row = await database.fetch_one(
         """
-        SELECT s.*, u.business_name, u.business_image_url
+        SELECT s.*, u.business_name, u.business_image_url,
+               u.business_image_width, u.business_image_height
         FROM services s
         JOIN users u ON s.provider_id = u.id
         WHERE s.service_id = :sid AND s.is_active = TRUE
@@ -1057,6 +1091,8 @@ async def get_provider_services_by_user(provider_id: str):
                u.nickname       AS username,
                u.real_name,
                u.business_image_url,
+               u.business_image_width,
+               u.business_image_height,
                u.avatar_url
         FROM services s
         JOIN users u ON s.provider_id = u.id
