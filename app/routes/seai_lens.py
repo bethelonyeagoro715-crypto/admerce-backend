@@ -3,12 +3,14 @@ from app.services.image_embedder import (
     image_to_embedding,
     json_to_embedding,
     cosine_similarity,
+    is_real_embedding,
 )
-from app.services.llm_agent import GEMINI_VISION_MODELS
+from app.services.llm_agent import GEMINI_VISION_MODELS, GEMINI_MODEL
 from app.db.database import database
 from app.utils.security import get_current_user
 import numpy as np
 import os
+import re
 import uuid
 import asyncio
 from typing import Optional
@@ -28,6 +30,7 @@ def _bbox(lat: float, lng: float, radius_km: float) -> dict:
 
 
 async def _visual_search(query_emb, lat: float, lng: float, radius_km: float):
+    """HF-based visual similarity. Only runs if embeddings exist."""
     box = _bbox(lat, lng, radius_km)
     try:
         rows = await database.fetch_all(
@@ -47,9 +50,10 @@ async def _visual_search(query_emb, lat: float, lng: float, radius_km: float):
         try:
             stored = json_to_embedding(row["embedding"])
             sim = cosine_similarity(query_emb, stored)
+            if sim > 0.01:
+                scored.append((sim, dict(row)))
         except Exception:
             continue
-        scored.append((sim, dict(row)))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:20]
@@ -64,7 +68,7 @@ async def _describe_image_with_llm(image_bytes: bytes) -> Optional[str]:
         return None
 
     if not os.getenv("GEMINI_API_KEY"):
-        print("⚠️  GEMINI_API_KEY not set — skipping vision describe", flush=True)
+        print("⚠️  GEMINI_API_KEY not set", flush=True)
         return None
 
     for model_name in GEMINI_VISION_MODELS:
@@ -75,7 +79,7 @@ async def _describe_image_with_llm(image_bytes: bytes) -> Optional[str]:
                     "What is the main physical object in this image? "
                     "Reply with ONLY the object name in 2-4 words, no punctuation, "
                     "no explanation. Examples: 'iPhone 14', 'leather handbag', "
-                    "'wooden chair', 'cheeseburger', 'plate of rice'. "
+                    "'wooden chair', 'cheeseburger', 'plate of jollof rice'. "
                     "If nothing identifiable, reply with a single hyphen.",
                     {"mime_type": "image/jpeg", "data": image_bytes},
                 ])
@@ -93,64 +97,104 @@ async def _describe_image_with_llm(image_bytes: bytes) -> Optional[str]:
     return None
 
 
-async def _text_fallback_search(
-    description: str, lat: float, lng: float, radius_km: float
-):
-    tokens = [t for t in description.lower().split() if len(t) > 2][:5]
-    if not tokens:
-        return []
-
+async def _fetch_candidates(lat: float, lng: float, radius_km: float, limit: int = 30):
+    """Fetch listings in radius without embeddings — used for LLM re-rank."""
     box = _bbox(lat, lng, radius_km)
-    or_parts = []
-    params: dict = dict(box)
-    for i, tok in enumerate(tokens):
-        or_parts.append(
-            f"LOWER(l.title) LIKE :w{i} "
-            f"OR LOWER(COALESCE(l.category, '')) LIKE :w{i}"
-        )
-        params[f"w{i}"] = f"%{tok}%"
-
-    where = " OR ".join(f"({p})" for p in or_parts)
-
-    sql = f"""
-        SELECT l.listing_id, l.store_id, l.title, l.price, l.image_url,
-               l.lat, l.lng,
-               s.name           AS store_name,
-               s.store_image_url AS store_image_url
-        FROM listings l
-        LEFT JOIN stores s ON l.store_id = s.store_id
-        WHERE ({where})
-          AND (l.quantity_available IS NULL OR l.quantity_available > 0)
-          AND l.lat BETWEEN :min_lat AND :max_lat
-          AND l.lng BETWEEN :min_lng AND :max_lng
-        LIMIT 20
-    """
     try:
-        rows = await database.fetch_all(sql, params)
+        rows = await database.fetch_all(
+            """
+            SELECT l.listing_id, l.store_id, l.title, l.price, l.image_url,
+                   l.lat, l.lng,
+                   s.name             AS store_name,
+                   s.store_image_url  AS store_image_url
+            FROM listings l
+            LEFT JOIN stores s ON l.store_id = s.store_id
+            WHERE (l.quantity_available IS NULL OR l.quantity_available > 0)
+              AND l.lat BETWEEN :min_lat AND :max_lat
+              AND l.lng BETWEEN :min_lng AND :max_lng
+            LIMIT :lim
+            """,
+            {**box, "lim": limit},
+        )
     except Exception as e:
-        print(f"⚠️  text fallback sql error: {e}", flush=True)
+        print(f"⚠️  candidates sql error: {e}", flush=True)
+        return []
+    return [dict(r) for r in rows]
+
+
+async def _llm_rank_listings(
+    description: str, listings: list[dict]
+) -> list[dict]:
+    """
+    Ask Gemini to pick the best matches from the candidate listings.
+    This is the fallback when visual embeddings are unavailable — it
+    uses the description Gemini already produced plus the actual
+    listings in radius, so matching is contextual rather than
+    substring-based.
+    """
+    if not listings:
         return []
 
-    return [dict(r) for r in rows]
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        return []
+
+    if not os.getenv("GEMINI_API_KEY"):
+        return []
+
+    catalog = "\n".join(
+        f"{i + 1}. {l['title']} — ₦{l.get('price', 0)}"
+        for i, l in enumerate(listings[:20])
+    )
+
+    prompt = f"""A user uploaded a photo. It shows: "{description}".
+
+Which of the following listings match the photo best? Reply with ONLY the index numbers of the best 1-3 matches, comma-separated. If none are a reasonable match, reply with a single hyphen.
+
+Listings:
+{catalog}
+
+Reply with indices only (e.g. "1,3" or "-"):"""
+
+    try:
+        def _sync():
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            return model.generate_content(prompt)
+
+        response = await asyncio.to_thread(_sync)
+        text = (getattr(response, "text", "") or "").strip()
+        print(f"🎯 llm rank raw response: {text!r}", flush=True)
+
+        if not text or text == "-":
+            return []
+
+        indices = [int(m) for m in re.findall(r"\d+", text)]
+        selected: list[dict] = []
+        seen: set[int] = set()
+        for idx in indices[:3]:
+            if 1 <= idx <= len(listings) and idx not in seen:
+                selected.append(listings[idx - 1])
+                seen.add(idx)
+        return selected
+    except Exception as e:
+        print(f"⚠️  llm rank failed: {e}", flush=True)
+        return []
 
 
 def _build_hint(diagnostics: dict, embed_error: Optional[str]) -> str:
     if diagnostics.get("listings_total", 0) == 0:
         return "There are no listings on Admerce yet."
-    if diagnostics.get("listings_with_embeddings", 0) == 0:
-        return (
-            "Photo search isn't ready yet — listings don't have photo "
-            "embeddings. Try a text search while we finish setting this up."
-        )
     if diagnostics.get("listings_in_radius", 0) == 0:
         return "No listings near you in the current radius. Try a wider area."
-    if embed_error:
-        return "Couldn't process that image. Try a different photo."
+    if diagnostics.get("description"):
+        return (
+            f"That looks like {diagnostics['description']}, but I couldn't "
+            "find a close match nearby."
+        )
     return "Couldn't match that photo. Try a clearer image or a text search."
 
 
-# Both decorators — /seai/lens and /seai/lens/ hit the same handler,
-# so no 307 redirect risk.
 @router.post("")
 @router.post("/")
 async def visual_search(
@@ -160,99 +204,92 @@ async def visual_search(
     radius_km: float = Form(10),
     current_user: dict = Depends(get_current_user),
 ):
-    # ── 1. Read the upload once ─────────────────────────────────────
     image_bytes = await image.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty image upload")
 
-    # ── 2. Try to generate a visual embedding ───────────────────────
-    os.makedirs("uploads/tmp", exist_ok=True)
-    tmp_path = f"uploads/tmp/{uuid.uuid4().hex}.jpg"
-    with open(tmp_path, "wb") as f:
-        f.write(image_bytes)
-
+    # ── 1. Try HF visual embedding (non-fatal — HF is currently dead) ─
     query_emb = None
     embed_error: Optional[str] = None
+    tmp_path = None
     try:
+        os.makedirs("uploads/tmp", exist_ok=True)
+        tmp_path = f"uploads/tmp/{uuid.uuid4().hex}.jpg"
+        with open(tmp_path, "wb") as f:
+            f.write(image_bytes)
         query_emb = image_to_embedding(tmp_path)
+        if not is_real_embedding(query_emb):
+            query_emb = None
     except Exception as e:
         embed_error = str(e)
         print(f"⚠️  image_to_embedding failed: {e}", flush=True)
     finally:
-        if os.path.exists(tmp_path):
+        if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    # ── 3. Visual match attempt ─────────────────────────────────────
-    visual_matches: list = []
+    # ── 2. Visual match attempt (only if we got a real embedding) ─────
     if query_emb is not None:
         visual_matches = await _visual_search(query_emb, lat, lng, radius_km)
+        if visual_matches:
+            return {
+                "query_lat": lat,
+                "query_lng": lng,
+                "radius_km": radius_km,
+                "method": "visual",
+                "results": [
+                    {
+                        "type": "item",
+                        "listing_id": r["listing_id"],
+                        "store_id": r["store_id"],
+                        "title": r["title"],
+                        "price": r["price"],
+                        "image_url": r["image_url"],
+                        "latitude": r["lat"],
+                        "longitude": r["lng"],
+                        "similarity": round(sim, 4),
+                    }
+                    for sim, r in visual_matches
+                ],
+            }
 
-    if visual_matches:
-        return {
-            "query_lat": lat,
-            "query_lng": lng,
-            "radius_km": radius_km,
-            "method": "visual",
-            "results": [
-                {
-                    "type": "item",
-                    "listing_id": r["listing_id"],
-                    "store_id": r["store_id"],
-                    "title": r["title"],
-                    "price": r["price"],
-                    "image_url": r["image_url"],
-                    "latitude": r["lat"],
-                    "longitude": r["lng"],
-                    "similarity": round(sim, 4),
-                }
-                for sim, r in visual_matches
-            ],
-        }
-
-    # ── 4. Fallback: describe with vision LLM, then keyword search ──
+    # ── 3. Vision LLM path — describe then rank ─────────────────────
     description = await _describe_image_with_llm(image_bytes)
-    text_matches: list = []
+
     if description:
-        text_matches = await _text_fallback_search(
-            description, lat, lng, radius_km
-        )
+        candidates = await _fetch_candidates(lat, lng, radius_km, limit=30)
 
-    if text_matches:
-        return {
-            "query_lat": lat,
-            "query_lng": lng,
-            "radius_km": radius_km,
-            "method": "vision_llm",
-            "description": description,
-            "message": f"That looks like {description}. Here's what I found nearby:",
-            "results": [
-                {
-                    "type": "item",
-                    "listing_id": r["listing_id"],
-                    "store_id": r["store_id"],
-                    "title": r["title"],
-                    "price": r["price"],
-                    "image_url": r["image_url"],
-                    "store_name": r.get("store_name"),
-                    "store_image_url": r.get("store_image_url"),
-                    "latitude": r["lat"],
-                    "longitude": r["lng"],
+        if candidates:
+            ranked = await _llm_rank_listings(description, candidates)
+            if ranked:
+                return {
+                    "query_lat": lat,
+                    "query_lng": lng,
+                    "radius_km": radius_km,
+                    "method": "vision_llm",
+                    "description": description,
+                    "message": f"That looks like {description}. Here's what I found nearby:",
+                    "results": [
+                        {
+                            "type": "item",
+                            "listing_id": r["listing_id"],
+                            "store_id": r["store_id"],
+                            "title": r["title"],
+                            "price": r["price"],
+                            "image_url": r["image_url"],
+                            "store_name": r.get("store_name"),
+                            "store_image_url": r.get("store_image_url"),
+                            "latitude": r["lat"],
+                            "longitude": r["lng"],
+                        }
+                        for r in ranked
+                    ],
                 }
-                for r in text_matches
-            ],
-        }
 
-    # ── 5. Nothing matched — return diagnostics ─────────────────────
-    diagnostics: dict = {}
+    # ── 4. Nothing matched — return diagnostics ─────────────────────
+    diagnostics: dict = {"description": description}
     try:
         diagnostics["listings_total"] = (
             await database.fetch_val("SELECT COUNT(*) FROM listings") or 0
-        )
-        diagnostics["listings_with_embeddings"] = (
-            await database.fetch_val(
-                "SELECT COUNT(*) FROM listings WHERE embedding IS NOT NULL"
-            )
-            or 0
         )
         box = _bbox(lat, lng, radius_km)
         diagnostics["listings_in_radius"] = (
