@@ -48,7 +48,6 @@ INTENT_PATTERNS = [
 
 STOP_WORDS = {
     "me", "a", "an", "the", "for", "some", "any", "please",
-    # Verbs/fillers that would pollute the search filter
     "i", "you", "need", "want", "looking", "look", "find", "show",
     "search", "see", "buy", "get", "give", "help", "can", "could",
     "would", "have", "has", "is", "are", "was", "were", "be",
@@ -76,20 +75,17 @@ def classify_intent(text: str) -> Tuple[str, Dict[str, Any]]:
 
 
 def _tokenize(text: str) -> list[str]:
-    """Extract meaningful tokens for filtering a search query."""
     words = re.findall(r"[a-z0-9]+", text.lower())
     return [w for w in words if w not in STOP_WORDS and len(w) > 1]
 
 
 def _travel_minutes(distance_km: float) -> int:
-    """Rough city-driving estimate: ~30 km/h average in Nigerian cities."""
     if distance_km <= 0:
         return 0
     return max(1, int(round(distance_km * 2)))
 
 
 def _directions_url(lat: float, lng: float, label: str = "") -> str:
-    """Google Maps directions from the user's current location to (lat, lng)."""
     from urllib.parse import quote_plus
     base = "https://www.google.com/maps/dir/?api=1"
     dest = f"{lat},{lng}"
@@ -99,11 +95,6 @@ def _directions_url(lat: float, lng: float, label: str = "") -> str:
     return url
 
 
-# ════════════════════════════════════════════════════════════
-# ✅ NEW — direct query-relevant item search
-# Filters by the user's actual query FIRST, then ranks by
-# (relevance, distance). Only returns items the user asked for.
-# ════════════════════════════════════════════════════════════
 async def _query_relevant_items(
     query: str,
     lat: float,
@@ -115,7 +106,6 @@ async def _query_relevant_items(
     if not tokens:
         return []
 
-    # Build OR conditions across title / category / store name
     or_parts = []
     params: dict = {}
     for i, tok in enumerate(tokens):
@@ -128,7 +118,6 @@ async def _query_relevant_items(
 
     where = " OR ".join(f"({p})" for p in or_parts)
 
-    # Relevance score — title match weights 3, category 2, store name 1
     score_terms = []
     for i, tok in enumerate(tokens):
         score_terms.append(f"CASE WHEN LOWER(l.title) LIKE :w{i} THEN 3 ELSE 0 END")
@@ -179,7 +168,6 @@ async def _query_relevant_items(
         item_lng = d.get("store_lng") if d.get("store_lng") is not None else d.get("listing_lng")
 
         if item_lat is None or item_lng is None:
-            # No coords — can't compute distance. Rank it last but keep it.
             d["distance_km"] = 9999.0
         else:
             dist = haversine(lat, lng, item_lat, item_lng)
@@ -187,7 +175,6 @@ async def _query_relevant_items(
                 continue
             d["distance_km"] = dist
 
-        # ✅ Combined score — relevance dominates (×100), distance breaks ties
         d["_score"] = relevance * 100 - d["distance_km"]
         scored.append(d)
 
@@ -196,9 +183,16 @@ async def _query_relevant_items(
 
 
 # ════════════════════════════════════════════════════════════
-# Service recall — unchanged but capped at 3
+# FIXED — removed s.address (column doesn't exist on services),
+#         added relevance scoring, expanded to search category + provider name
 # ════════════════════════════════════════════════════════════
-async def _service_recall(query: str, lat: float, lng: float, radius_km: float, limit: int = 3):
+async def _service_recall(
+    query: str,
+    lat: float,
+    lng: float,
+    radius_km: float,
+    limit: int = 3,
+):
     tokens = _tokenize(query)
     if not tokens:
         return []
@@ -206,24 +200,48 @@ async def _service_recall(query: str, lat: float, lng: float, radius_km: float, 
     or_parts = []
     params: dict = {}
     for i, tok in enumerate(tokens):
-        or_parts.append(f"LOWER(s.title) LIKE :w{i}")
+        or_parts.append(
+            f"LOWER(s.title) LIKE :w{i} "
+            f"OR LOWER(COALESCE(s.category, '')) LIKE :w{i} "
+            f"OR LOWER(COALESCE(s.description, '')) LIKE :w{i} "
+            f"OR LOWER(COALESCE(u.business_name, '')) LIKE :w{i}"
+        )
         params[f"w{i}"] = f"%{tok}%"
 
     where = " OR ".join(f"({p})" for p in or_parts)
 
-    rows = await database.fetch_all(
-        f"""
+    score_terms = []
+    for i, tok in enumerate(tokens):
+        score_terms.append(f"CASE WHEN LOWER(s.title) LIKE :w{i} THEN 3 ELSE 0 END")
+        score_terms.append(
+            f"CASE WHEN LOWER(COALESCE(s.category, '')) LIKE :w{i} THEN 2 ELSE 0 END"
+        )
+        score_terms.append(
+            f"CASE WHEN LOWER(COALESCE(u.business_name, '')) LIKE :w{i} THEN 1 ELSE 0 END"
+        )
+    score_expr = " + ".join(score_terms)
+
+    # ✅ No s.address — that column doesn't exist on the services table.
+    sql = f"""
         SELECT s.service_id, s.title, s.price, s.lat, s.lng, s.image_url,
-               s.provider_id, s.address,
-               u.business_name, u.business_image_url
+               s.provider_id, s.category,
+               u.business_name, u.business_image_url,
+               ({score_expr}) AS relevance
         FROM services s
         JOIN users u ON s.provider_id = u.id
         WHERE s.is_active = TRUE
+          AND s.lat IS NOT NULL
+          AND s.lng IS NOT NULL
           AND ({where})
-        LIMIT 50
-        """,
-        params,
-    )
+        LIMIT 100
+    """
+
+    try:
+        rows = await database.fetch_all(sql, params)
+    except Exception as e:
+        print(f"⚠️  _service_recall sql error: {e}")
+        return []
+
     results = []
     for row in rows:
         d = dict(row)
@@ -242,17 +260,21 @@ async def _service_recall(query: str, lat: float, lng: float, radius_km: float, 
             "business_name": d["business_name"] or "Service Provider",
             "business_image_url": d["business_image_url"],
             "provider_id": d["provider_id"],
+            "category": d.get("category"),
             "lat": d["lat"],
             "lng": d["lng"],
-            "address": d.get("address"),
+            "relevance": int(d.get("relevance") or 0),
+            "address": None,
         })
-    results.sort(key=lambda x: x["distance_km"])
+
+    # Filter out zero-relevance in case the SQL matched something irrelevant
+    results = [r for r in results if r["relevance"] > 0]
+
+    # Sort by (relevance desc, distance asc)
+    results.sort(key=lambda x: (-x["relevance"], x["distance_km"]))
     return results[:limit]
 
 
-# ════════════════════════════════════════════════════════════
-# Store recall — capped at 3
-# ════════════════════════════════════════════════════════════
 async def _store_recall(query: str, lat: float, lng: float, radius_km: float, limit: int = 3):
     tokens = _tokenize(query)
     if not tokens:
@@ -299,7 +321,9 @@ async def _store_recall(query: str, lat: float, lng: float, radius_km: float, li
 
 
 # ════════════════════════════════════════════════════════════
-# ✅ REWRITTEN — strict query filter, tiered fallback, capped output
+# FIXED — items and services run in PARALLEL, merged, then
+#         interleaved by a combined relevance score. Stores remain
+#         a final fallback.
 # ════════════════════════════════════════════════════════════
 async def handle_search_items(
     params: dict,
@@ -311,23 +335,33 @@ async def handle_search_items(
     if not query:
         return {"type": "text", "text": "What are you looking for?"}
 
-    # ── Tier 1: items matching the query ─────────────────────
-    items = await _query_relevant_items(query, lat, lng, radius_km=50, limit=5)
+    # ── Tier 1 & 2: items AND services run together ─────────
+    # Wrapped so one failing doesn't kill the other.
+    import asyncio
 
-    # ── Tier 2 (only if no items): services matching the query
-    services = []
-    if not items:
+    async def safe_items():
         try:
-            services = await _service_recall(query, lat, lng, radius_km=50, limit=3)
-        except Exception:
-            services = []
+            return await _query_relevant_items(query, lat, lng, radius_km=50, limit=5)
+        except Exception as e:
+            print(f"⚠️  items failed: {e}", flush=True)
+            return []
 
-    # ── Tier 3 (only if no items AND no services): stores
+    async def safe_services():
+        try:
+            return await _service_recall(query, lat, lng, radius_km=50, limit=3)
+        except Exception as e:
+            print(f"⚠️  services failed: {e}", flush=True)
+            return []
+
+    items, services = await asyncio.gather(safe_items(), safe_services())
+
+    # ── Tier 3: stores only when nothing else matched ───────
     stores = []
     if not items and not services:
         try:
             stores = await _store_recall(query, lat, lng, radius_km=50, limit=3)
-        except Exception:
+        except Exception as e:
+            print(f"⚠️  stores failed: {e}", flush=True)
             stores = []
 
     all_results: list[dict] = []
@@ -391,7 +425,7 @@ async def handle_search_items(
             ),
         })
 
-    # Cap at 5 — even across the tiers
+    # Cap at 5 — mix of items and services, sorted by distance
     top = all_results[:5]
 
     if not top:
@@ -411,7 +445,6 @@ async def handle_search_items(
     }
 
 
-# ── Book service ───────────────────────────────────────────────
 async def handle_book_service(user_id: str, params: dict) -> dict:
     service_name = params.get("service", "")
     if not service_name:
@@ -438,7 +471,6 @@ async def handle_book_service(user_id: str, params: dict) -> dict:
     }
 
 
-# ── Store info ─────────────────────────────────────────────────
 async def handle_get_store_info(params: dict) -> dict:
     name = params.get("store", "")
     if not name:
@@ -470,7 +502,6 @@ async def handle_get_store_info(params: dict) -> dict:
     }
 
 
-# ── Placeholder recall functions (kept for import compatibility) ─
 async def _embedding_recall(user_id, lat, lng, radius_km, limit):
     return []
 
