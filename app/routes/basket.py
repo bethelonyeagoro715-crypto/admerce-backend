@@ -1,11 +1,10 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Optional
 from app.db.database import database
 from app.utils.security import get_current_user
 from datetime import datetime, timedelta
 import uuid
-import asyncio
 from app.routes.notifications import send_push_to_user
 
 router = APIRouter(prefix="/basket", tags=["Basket"])
@@ -74,7 +73,6 @@ async def add_to_basket(
             {"qty": new_qty, "id": existing["id"]}
         )
     else:
-        # ✅ FIX: include `user_id` — NOT NULL column on basket_items.
         await database.execute(
             """
             INSERT INTO basket_items (basket_id, user_id, listing_id, store_id, quantity)
@@ -245,14 +243,16 @@ async def checkout(
     if not items:
         raise HTTPException(status_code=400, detail="Basket is empty")
 
+    # Aggregate into per-store buckets and pre-validate stock.
     store_totals = {}
-    total_order = 0
+    total_order = 0.0
 
     for item in items:
-        if item["quantity_available"] is not None and item["quantity_available"] < item["quantity"]:
+        qty_avail = item["quantity_available"]
+        if qty_avail is not None and qty_avail < item["quantity"]:
             raise HTTPException(
                 status_code=400,
-                detail=f"Not enough stock for {item['product_name']}. Only {item['quantity_available']} available."
+                detail=f"Not enough stock for {item['product_name']}. Only {qty_avail} available."
             )
 
         store_id = item["store_id"]
@@ -260,139 +260,174 @@ async def checkout(
             store_totals[store_id] = {
                 "store_id": store_id,
                 "items": [],
-                "subtotal": 0,
-                "delivery_fee": 0,
-                "fulfillment_type": "pickup"
+                "subtotal": 0.0,
+                "delivery_fee": 0.0,
+                "fulfillment_type": "pickup",
             }
-        unit_price = item["current_price"]
+
+        unit_price = float(item["current_price"] or 0)
         subtotal = item["quantity"] * unit_price
         store_totals[store_id]["items"].append({
             "listing_id": item["listing_id"],
             "quantity": item["quantity"],
             "price": unit_price,
-            "subtotal": subtotal
+            "subtotal": subtotal,
         })
         store_totals[store_id]["subtotal"] += subtotal
         total_order += subtotal
 
-    wallet = await database.fetch_one(
-        "SELECT balance FROM wallets WHERE user_id = :uid",
-        {"uid": user_id}
-    )
-    if not wallet or wallet["balance"] < total_order:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
-
     order_id = f"ord_{uuid.uuid4().hex[:12]}"
     now = datetime.utcnow()
-    expires_at = datetime.utcnow() + timedelta(hours=2)
+    expires_at = now + timedelta(hours=2)
 
-    await database.execute(
-        """
-        INSERT INTO orders (order_id, user_id, total_amount, status, created_at, updated_at, expires_at)
-        VALUES (:oid, :uid, :total, 'pending', :now, :now, :exp)
-        """,
-        {"oid": order_id, "uid": user_id, "total": total_order, "now": now, "exp": expires_at}
-    )
+    # ── Atomic block ────────────────────────────────────────────────
+    # Any failure inside rolls back orders, order_stores, order_items,
+    # escrow, stock decrements, and the wallet debit together.
+    async with database.transaction():
+        # 1. Wallet debit — WHERE guard blocks overdraft atomically.
+        new_balance = await database.fetch_val(
+            """
+            UPDATE wallets
+            SET balance = balance - :amt
+            WHERE user_id = :uid AND balance >= :amt
+            RETURNING balance
+            """,
+            {"amt": total_order, "uid": user_id}
+        )
+        if new_balance is None:
+            raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    for store_id, store_data in store_totals.items():
-        store_order_id = f"so_{uuid.uuid4().hex[:10]}"
+        # 2. Order shell
         await database.execute(
             """
-            INSERT INTO order_stores (order_id, store_id, subtotal, delivery_fee, fulfillment_type, status, created_at, updated_at)
-            VALUES (:oid, :sid, :subtotal, :dfee, :ftype, 'pending', :now, :now)
+            INSERT INTO orders (order_id, user_id, total_amount, status, created_at, updated_at, expires_at)
+            VALUES (:oid, :uid, :total, 'pending', :now, :now, :exp)
             """,
-            {
-                "oid": order_id,
-                "sid": store_id,
-                "subtotal": store_data["subtotal"],
-                "dfee": store_data.get("delivery_fee", 0),
-                "ftype": store_data["fulfillment_type"],
-                "now": now
-            }
+            {"oid": order_id, "uid": user_id, "total": total_order, "now": now, "exp": expires_at}
         )
-        order_store_row = await database.fetch_one(
-            "SELECT id FROM order_stores WHERE order_id = :oid AND store_id = :sid",
-            {"oid": order_id, "sid": store_id}
-        )
-        order_store_id = order_store_row["id"]
 
-        for item in store_data["items"]:
+        # 3. Per-store rows
+        for store_id, store_data in store_totals.items():
+            storekeeper_row = await database.fetch_one(
+                "SELECT owner_id FROM stores WHERE store_id = :sid",
+                {"sid": store_id}
+            )
+            if not storekeeper_row:
+                raise HTTPException(status_code=400, detail=f"Store {store_id} not found")
+            storekeeper_id = storekeeper_row["owner_id"]
+
+            # Stock decrement per item — FOR UPDATE serializes concurrent
+            # checkouts on the same listing.
+            for item in store_data["items"]:
+                stock_row = await database.fetch_one(
+                    "SELECT quantity_available FROM listings WHERE listing_id = :lid FOR UPDATE",
+                    {"lid": item["listing_id"]}
+                )
+                if stock_row is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Listing {item['listing_id']} no longer exists."
+                    )
+                current_qty = stock_row["quantity_available"]
+                if current_qty is not None:
+                    if current_qty < item["quantity"]:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Stock changed for {item['listing_id']}. Please refresh your basket."
+                        )
+                    await database.execute(
+                        "UPDATE listings SET quantity_available = quantity_available - :qty WHERE listing_id = :lid",
+                        {"qty": item["quantity"], "lid": item["listing_id"]}
+                    )
+                # current_qty is NULL → listing doesn't track stock, skip.
+
+            # order_stores row
             await database.execute(
                 """
-                INSERT INTO order_items (order_id, listing_id, store_id, quantity, price, subtotal)
-                VALUES (:oid, :lid, :sid, :qty, :price, :subtotal)
+                INSERT INTO order_stores (order_id, store_id, subtotal, delivery_fee, fulfillment_type, status, created_at, updated_at)
+                VALUES (:oid, :sid, :subtotal, :dfee, :ftype, 'pending', :now, :now)
                 """,
                 {
                     "oid": order_id,
-                    "lid": item["listing_id"],
                     "sid": store_id,
-                    "qty": item["quantity"],
-                    "price": item["price"],
-                    "subtotal": item["subtotal"]
+                    "subtotal": store_data["subtotal"],
+                    "dfee": store_data["delivery_fee"],
+                    "ftype": store_data["fulfillment_type"],
+                    "now": now,
+                }
+            )
+            order_store_id = await database.fetch_val(
+                "SELECT id FROM order_stores WHERE order_id = :oid AND store_id = :sid",
+                {"oid": order_id, "sid": store_id}
+            )
+
+            # order_items
+            for item in store_data["items"]:
+                await database.execute(
+                    """
+                    INSERT INTO order_items (order_id, listing_id, store_id, quantity, price, subtotal)
+                    VALUES (:oid, :lid, :sid, :qty, :price, :subtotal)
+                    """,
+                    {
+                        "oid": order_id,
+                        "lid": item["listing_id"],
+                        "sid": store_id,
+                        "qty": item["quantity"],
+                        "price": item["price"],
+                        "subtotal": item["subtotal"],
+                    }
+                )
+
+            # escrow — one per order_store. Schema now allows this.
+            escrow_id = f"esc_{uuid.uuid4().hex[:12]}"
+            await database.execute(
+                """
+                INSERT INTO escrow (order_id, order_store_id, shopper_id, storekeeper_id,
+                                    listing_id, quantity, item_amount, delivery_fee, total_amount, status, expires_at)
+                VALUES (:oid, :osid, :sid, :skid, :lid, :qty, :item_amt, :dfee, :total, 'locked', :exp)
+                """,
+                {
+                    "oid": order_id,
+                    "osid": order_store_id,
+                    "sid": user_id,
+                    "skid": storekeeper_id,
+                    "lid": store_data["items"][0]["listing_id"],
+                    "qty": sum(i["quantity"] for i in store_data["items"]),
+                    "item_amt": store_data["subtotal"],
+                    "dfee": store_data["delivery_fee"],
+                    "total": store_data["subtotal"] + store_data["delivery_fee"],
+                    "exp": expires_at,
                 }
             )
 
             await database.execute(
-                "UPDATE listings SET quantity_available = quantity_available - :qty WHERE listing_id = :lid",
-                {"qty": item["quantity"], "lid": item["listing_id"]}
+                "UPDATE order_stores SET escrow_id = :eid WHERE id = :osid",
+                {"eid": escrow_id, "osid": order_store_id}
             )
 
-        storekeeper_row = await database.fetch_one(
-            "SELECT owner_id FROM stores WHERE store_id = :sid",
-            {"sid": store_id}
-        )
-        if not storekeeper_row:
-            continue
-        storekeeper_id = storekeeper_row["owner_id"]
-
-        escrow_id = f"esc_{uuid.uuid4().hex[:12]}"
+        # 4. Clear basket — inside the transaction so it rolls back on failure.
         await database.execute(
-            """
-            INSERT INTO escrow (order_id, order_store_id, shopper_id, storekeeper_id,
-                                listing_id, quantity, item_amount, delivery_fee, total_amount, status, expires_at)
-            VALUES (:oid, :osid, :sid, :skid, :lid, :qty, :item_amt, :dfee, :total, 'locked', :exp)
-            """,
-            {
-                "oid": order_id,
-                "osid": order_store_id,
-                "sid": user_id,
-                "skid": storekeeper_id,
-                "lid": store_data["items"][0]["listing_id"],
-                "qty": sum(item["quantity"] for item in store_data["items"]),
-                "item_amt": store_data["subtotal"],
-                "dfee": store_data.get("delivery_fee", 0),
-                "total": store_data["subtotal"] + store_data.get("delivery_fee", 0),
-                "exp": expires_at
-            }
+            "DELETE FROM basket_items WHERE basket_id = :bid",
+            {"bid": basket["basket_id"]}
         )
 
-        await database.execute(
-            "UPDATE order_stores SET escrow_id = :eid WHERE id = :osid",
-            {"eid": escrow_id, "osid": order_store_id}
-        )
-
-    await database.execute(
-        "UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid",
-        {"amt": total_order, "uid": user_id}
-    )
-
-    await database.execute(
-        "DELETE FROM basket_items WHERE basket_id = :bid",
-        {"bid": basket["basket_id"]}
-    )
-
+    # ── Post-commit: fire-and-forget pushes ─────────────────────────
+    # Firebase creds missing on Render → these log and move on.
     for store_id in store_totals.keys():
         store = await database.fetch_one(
             "SELECT owner_id FROM stores WHERE store_id = :sid",
             {"sid": store_id}
         )
         if store:
-            await send_push_to_user(
-                store["owner_id"],
-                "New Order!",
-                f"A shopper placed an order. Order #{order_id[:8]}",
-                {"order_id": order_id}
-            )
+            try:
+                await send_push_to_user(
+                    store["owner_id"],
+                    "New Order!",
+                    f"A shopper placed an order. Order #{order_id[:8]}",
+                    {"order_id": order_id}
+                )
+            except Exception as e:
+                print(f"⚠️  push failed for store {store_id}: {e}", flush=True)
 
     return {
         "order_id": order_id,
