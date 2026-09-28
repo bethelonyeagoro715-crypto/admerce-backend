@@ -1,13 +1,18 @@
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from app.db.database import database
 from .auth import get_current_user
 from app.services.image_processor import process_image
-from app.services.image_embedder import image_to_embedding, embedding_to_json
+from app.services.image_embedder import (
+    image_bytes_to_embedding,
+    embedding_to_json,
+    is_real_embedding,
+)
 from app.services.auto_fill import suggest_from_barcode
 from app.utils.category_utils import validate_product_category
-from app.services.cloudinary_service import upload_image   # ✅ Cloudinary helper
+from app.services.cloudinary_service import upload_image
 from fastapi.responses import FileResponse
 import uuid, os, json
 from datetime import datetime
@@ -29,11 +34,8 @@ class StoreCreateRequest(BaseModel):
     contact_preference: str = "in-app"
 
 class UpdateOrderRequest(BaseModel):
-    listing_ids: List[str]   # ordered list of listing IDs
+    listing_ids: List[str]
 
-# ✅ NEW — store verification submission. Evidence is a list of URLs; the
-#    storekeeper uploads files through the existing /upload-store-image
-#    endpoint (or any future media endpoint) and passes the returned URLs.
 class VerificationSubmitRequest(BaseModel):
     legal_name: str = Field(..., min_length=2, max_length=200)
     business_type: str = Field(..., min_length=2, max_length=100)
@@ -58,8 +60,6 @@ def compute_title_quality(title: str) -> float:
     score = min(max(length_score + bonus, 0.1), 0.95)
     return round(score, 4)
 
-# ✅ NEW — the single place that writes to store_verification_events.
-#    Append-only; nothing here can UPDATE or DELETE existing events.
 async def _log_store_verification_event(
     store_id: str,
     from_status: Optional[str],
@@ -100,7 +100,7 @@ async def create_store(
             raise HTTPException(status_code=400, detail="You already have a store")
 
         store_id = uuid.uuid4().hex[:12]
-        now = datetime.utcnow()   # ✅ datetime object
+        now = datetime.utcnow()
 
         category_json = json.dumps(store_data.category)
         hours_json = json.dumps(store_data.business_hours) if store_data.business_hours else "{}"
@@ -145,27 +145,11 @@ async def create_store(
         raise HTTPException(status_code=400, detail=f"Store creation failed: {str(e)}")
 
 # ==================== STORE VERIFICATION ====================
-# Admin-reviewed two-step flow:
-#   1. Storekeeper submits a request (this section).
-#   2. Admin approves / rejects (admin.py).
-#
-# Rules enforced here:
-#   - Only the store's owner can submit or cancel.
-#   - Store must be 'unverified' or 'rejected' to submit a new request.
-#   - A store with a pending request cannot submit a second one.
-#   - Cancelling reverts the store to 'unverified'; the storekeeper can
-#     then fix the submission and try again.
-#
-# Every transition writes an append-only row to store_verification_events.
-
 @router.get("/{store_id}/verification")
 async def get_store_verification_status(
     store_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Owner-side status: current state, latest request, full event history.
-    """
     store = await database.fetch_one(
         "SELECT store_id, owner_id, verification_status, verified, verified_at "
         "FROM stores WHERE store_id = :sid",
@@ -210,10 +194,6 @@ async def submit_store_verification(
     req: VerificationSubmitRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Submit a verification request. Only the owner can call this.
-    Fails 409 if a pending request already exists for the store.
-    """
     store = await database.fetch_one(
         "SELECT store_id, owner_id, name, verification_status FROM stores WHERE store_id = :sid",
         {"sid": store_id},
@@ -309,10 +289,6 @@ async def cancel_store_verification(
     store_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Cancel a pending verification request. Reverts store to 'unverified'.
-    Only the owner can cancel; only works when status is currently 'pending'.
-    """
     store = await database.fetch_one(
         "SELECT store_id, owner_id, verification_status FROM stores WHERE store_id = :sid",
         {"sid": store_id},
@@ -411,14 +387,16 @@ async def create_listing(
         if info.get("suggested_category"):
             suggested_category = info["suggested_category"]
 
-    # Process and upload image to Cloudinary
+    # Process + upload image to Cloudinary, keeping raw bytes for the embedder.
     image_url = None
+    raw_image_bytes: bytes | None = None
     if image and image.filename:
         image_bytes = await image.read()
         if image_bytes:
+            raw_image_bytes = image_bytes
             try:
                 processed = process_image(image_bytes, style=style)
-                image_url = upload_image(processed, folder="listings")   # ✅ Cloudinary
+                image_url = upload_image(processed, folder="listings")
             except Exception as e:
                 print(f"Image processing error: {e}")
                 try:
@@ -435,12 +413,25 @@ async def create_listing(
     listing_id = uuid.uuid4().hex[:8]
     final_title = suggested_title if suggested_title else title
     title_quality = compute_title_quality(final_title)
-    created_at = datetime.utcnow()   # ✅ datetime object
+    created_at = datetime.utcnow()
 
-    # Compute embedding (optional) – still may use local file? we can skip or use image_url
-    embedding = None
-    # embedding generation currently expects a local file path; we'll skip for now
-    # if you need embeddings, you can download from Cloudinary URL or process in memory
+    # ── Generate the CLIP embedding from the raw bytes ─────────────
+    # Runs in a threadpool because HF inference is a sync HTTP call.
+    # Failure is non-fatal — the listing still creates, just without
+    # visual search until a backfill or retry.
+    embedding_json: str | None = None
+    if raw_image_bytes:
+        try:
+            emb = await run_in_threadpool(image_bytes_to_embedding, raw_image_bytes)
+            if is_real_embedding(emb):
+                embedding_json = embedding_to_json(emb)
+            else:
+                print(
+                    f"⚠️  embedding for {listing_id} is a color fallback "
+                    f"({len(emb)} dims) — check HF_TOKEN"
+                )
+        except Exception as e:
+            print(f"⚠️  embedding failed for {listing_id}: {e}")
 
     query = """
     INSERT INTO listings (
@@ -464,7 +455,7 @@ async def create_listing(
         "ca": created_at,
         "tq": title_quality,
         "img": image_url,
-        "emb": embedding,
+        "emb": embedding_json,
         "qty": quantity,
     })
 
@@ -476,7 +467,7 @@ async def create_listing(
         "suggested_category": suggested_category,
         "title_quality": title_quality,
         "image_url": image_url,
-        "embedding_computed": embedding is not None,
+        "embedding_computed": embedding_json is not None,
         "quantity": quantity,
         "created_at": created_at,
         "message": "Listing created"
@@ -488,7 +479,7 @@ async def analyze_image(
     image: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
-    image_bytes = await image.read()
+    await image.read()
     mock_data = {
         "title": "Item from image",
         "category": "tech_electronics",
@@ -505,7 +496,7 @@ async def upload_store_image(
     current_user: dict = Depends(get_current_user)
 ):
     image_bytes = await image.read()
-    image_url = upload_image(image_bytes, folder="store_images")   # ✅ Cloudinary
+    image_url = upload_image(image_bytes, folder="store_images")
     return {"image_url": image_url}
 
 # ==================== PREVIEW IMAGE ====================
@@ -517,13 +508,12 @@ async def preview_image(
 ):
     image_bytes = await image.read()
     processed = process_image(image_bytes, style=style)
-    image_url = upload_image(processed, folder="previews")   # ✅ Cloudinary
+    image_url = upload_image(processed, folder="previews")
     return {"image_url": image_url}
 
-# ==================== SERVE UPLOADED FILES (kept for legacy) ====================
+# ==================== SERVE UPLOADED FILES (legacy) ====================
 @router.get("/uploads/{file_path:path}")
 async def get_upload(file_path: str):
-    # Since we now use Cloudinary, this may not be needed, but keep for compatibility.
     base_dir = os.getcwd()
     filepath = os.path.join(base_dir, "uploads", file_path)
     if os.path.exists(filepath):
@@ -560,7 +550,7 @@ async def get_store_items(store_id: str):
     )
     return [dict(row) for row in rows]
 
-# ==================== UPDATE ITEM ORDER (visual shelf) ====================
+# ==================== UPDATE ITEM ORDER ====================
 @router.put("/items/order")
 async def update_item_order(
     req: UpdateOrderRequest,
@@ -579,7 +569,7 @@ async def update_item_order(
         )
     return {"message": "Order updated"}
 
-# ==================== GET ORDERS FOR A STORE (FIXED) ====================
+# ==================== GET ORDERS FOR A STORE ====================
 @router.get("/orders/{store_id}")
 async def get_store_orders(store_id: str):
     store = await database.fetch_one(
@@ -676,7 +666,7 @@ async def update_store_image(
     store_id = store["store_id"]
 
     image_bytes = await image.read()
-    image_url = upload_image(image_bytes, folder="store_images")   # ✅ Cloudinary
+    image_url = upload_image(image_bytes, folder="store_images")
 
     await database.execute(
         "UPDATE stores SET store_image_url = :url WHERE store_id = :sid",
@@ -688,7 +678,7 @@ async def update_store_image(
         "message": "Store image updated successfully"
     }
 
-# ==================== STORE STATISTICS (FIXED) ====================
+# ==================== STORE STATISTICS ====================
 @router.get("/stats")
 async def get_store_stats(current_user: dict = Depends(get_current_user)):
     store = await database.fetch_one(
@@ -750,13 +740,13 @@ async def get_store_stats(current_user: dict = Depends(get_current_user)):
         "sold": sold,
         "revenue": revenue,
     }
+
 # ==================== DELETE LISTING ====================
 @router.delete("/listing/{listing_id}")
 async def delete_listing(
     listing_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    # 1. Confirm the listing exists
     listing = await database.fetch_one(
         "SELECT listing_id, store_id, image_url FROM listings WHERE listing_id = :lid",
         {"lid": listing_id}
@@ -764,7 +754,6 @@ async def delete_listing(
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
 
-    # 2. Confirm it belongs to this storekeeper's store
     store = await database.fetch_one(
         "SELECT store_id FROM stores WHERE store_id = :sid AND owner_id = :uid",
         {"sid": listing["store_id"], "uid": current_user["id"]}
@@ -772,7 +761,6 @@ async def delete_listing(
     if not store:
         raise HTTPException(status_code=403, detail="You can only delete your own listings")
 
-    # 3. Delete dependent rows (ignore failures for optional tables)
     try:
         await database.execute(
             "DELETE FROM listing_events WHERE listing_id = :lid",
@@ -781,7 +769,6 @@ async def delete_listing(
     except Exception as e:
         print(f"⚠️  listing_events cleanup skipped: {e}")
 
-    # 4. Delete the listing itself
     await database.execute(
         "DELETE FROM listings WHERE listing_id = :lid",
         {"lid": listing_id}
