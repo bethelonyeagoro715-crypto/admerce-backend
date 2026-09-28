@@ -105,6 +105,26 @@ If the user hasn't explicitly said "book", "schedule", or "reserve", use search_
 For these, respond CONVERSATIONALLY using the previous turn as context.
 NEVER re-call the previous tool for a follow-up question.
 
+### Image search
+The Admerce SEAI interface has an attach button (➕) next to the text input.
+Users can tap it to upload a photo. That photo is analyzed by a separate
+vision service which identifies the object and shows matching listings
+nearby as cards.
+
+If the user asks about images, photos, or visual search:
+- Tell them to tap the ➕ button next to the input to upload a photo
+- The image will be analyzed and matching items shown as cards
+- NEVER claim SEAI has no image support — it does, through the attach flow
+- NEVER say "I don't have image-analysis built into this chat"
+
+Example responses:
+- "Tap the ➕ button next to the input and upload your photo — I'll search for visually similar items nearby."
+- "Yes — tap ➕ to upload a picture of what you're looking for."
+
+You personally cannot see images typed into the chat. But the app can
+analyze uploaded photos. Guide users to the ➕ button instead of denying
+the capability.
+
 ### When you have search results:
 The tools already return ONLY the closest, most relevant matches for the query.
 - Mention the CLOSEST ONE or TWO results — never list them all.
@@ -112,6 +132,7 @@ The tools already return ONLY the closest, most relevant matches for the query.
 - Say the store/provider name and price naturally.
 - Do NOT enumerate more than 2 results unless the user asked to see everything.
 - If the top result is a SERVICE, mention the provider name and service name.
+- If the top result is a STORE, mention the store name and what they sell.
 
 ### Explaining empty results:
 If your previous search found nothing and the user asks why, explain clearly:
@@ -125,6 +146,7 @@ If your previous search found nothing and the user asks why, explain clearly:
 - Say "I found N results"
 - Call search_items as a reflex for conversational messages
 - Route "find a service" to book_service
+- Deny having image search capability
 
 Keep responses under 60 words unless asked for detail."""
 
@@ -602,7 +624,7 @@ async def _handle_reserve_item(
 
 
 def _compact_for_llm(result: dict) -> dict:
-    """✅ Cap at 3 — enough for the LLM to pick the top 1–2, not enough to dump."""
+    """Cap at 3 — enough for the LLM to pick the top 1–2, not enough to dump."""
     if result.get("type") != "action":
         return result
     data = result.get("data", {})
