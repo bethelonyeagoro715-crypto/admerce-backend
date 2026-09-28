@@ -14,11 +14,30 @@ from app.services.auto_fill import suggest_from_barcode
 from app.utils.category_utils import validate_product_category
 from app.services.cloudinary_service import upload_image
 from fastapi.responses import FileResponse
-import uuid, os, json
+from PIL import Image
+import uuid, os, json, io
 from datetime import datetime
 import traceback
 
 router = APIRouter(prefix="/storekeeper", tags=["Storekeeper"])
+
+
+# ---------- image dimensions helper ----------
+def _image_dimensions(image_bytes: bytes) -> tuple[Optional[int], Optional[int]]:
+    """Return (width, height) for the exact bytes being uploaded.
+
+    Returns (None, None) on any decode failure so the caller still proceeds —
+    the frontend falls back to a deterministic hash ratio for those rows.
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+        if w > 0 and h > 0:
+            return int(w), int(h)
+    except Exception as e:
+        print(f"⚠️  Could not read image dimensions: {e}")
+    return None, None
+
 
 # ---------- Pydantic models ----------
 class StoreCreateRequest(BaseModel):
@@ -43,6 +62,7 @@ class VerificationSubmitRequest(BaseModel):
     business_address: str = Field(..., min_length=4, max_length=400)
     contact_phone: str = Field(..., min_length=7, max_length=30)
     evidence: List[str] = Field(default_factory=list)
+
 
 # ---------- helper ----------
 def compute_title_quality(title: str) -> float:
@@ -388,8 +408,12 @@ async def create_listing(
             suggested_category = info["suggested_category"]
 
     # Process + upload image to Cloudinary, keeping raw bytes for the embedder.
+    # Also capture the exact pixel dimensions of the bytes we actually upload —
+    # this is what the masonry feed uses to size the card before render.
     image_url = None
     raw_image_bytes: bytes | None = None
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
     if image and image.filename:
         image_bytes = await image.read()
         if image_bytes:
@@ -397,10 +421,12 @@ async def create_listing(
             try:
                 processed = process_image(image_bytes, style=style)
                 image_url = upload_image(processed, folder="listings")
+                image_width, image_height = _image_dimensions(processed)
             except Exception as e:
                 print(f"Image processing error: {e}")
                 try:
                     image_url = upload_image(image_bytes, folder="listings")
+                    image_width, image_height = _image_dimensions(image_bytes)
                 except Exception as e2:
                     print(f"Upload error: {e2}")
 
@@ -416,9 +442,6 @@ async def create_listing(
     created_at = datetime.utcnow()
 
     # ── Generate the CLIP embedding from the raw bytes ─────────────
-    # Runs in a threadpool because HF inference is a sync HTTP call.
-    # Failure is non-fatal — the listing still creates, just without
-    # visual search until a backfill or retry.
     embedding_json: str | None = None
     if raw_image_bytes:
         try:
@@ -436,11 +459,11 @@ async def create_listing(
     query = """
     INSERT INTO listings (
         listing_id, store_id, title, price, lat, lng, category, created_at,
-        title_quality, image_url, embedding,
+        title_quality, image_url, image_width, image_height, embedding,
         quantity_total, quantity_available
     ) VALUES (
         :lid, :sid, :t, :p, :lat, :lng, :cat, :ca,
-        :tq, :img, :emb,
+        :tq, :img, :img_w, :img_h, :emb,
         :qty, :qty
     )
     """
@@ -455,6 +478,8 @@ async def create_listing(
         "ca": created_at,
         "tq": title_quality,
         "img": image_url,
+        "img_w": image_width,
+        "img_h": image_height,
         "emb": embedding_json,
         "qty": quantity,
     })
@@ -467,6 +492,8 @@ async def create_listing(
         "suggested_category": suggested_category,
         "title_quality": title_quality,
         "image_url": image_url,
+        "image_width": image_width,
+        "image_height": image_height,
         "embedding_computed": embedding_json is not None,
         "quantity": quantity,
         "created_at": created_at,
@@ -497,7 +524,12 @@ async def upload_store_image(
 ):
     image_bytes = await image.read()
     image_url = upload_image(image_bytes, folder="store_images")
-    return {"image_url": image_url}
+    image_width, image_height = _image_dimensions(image_bytes)
+    return {
+        "image_url": image_url,
+        "image_width": image_width,
+        "image_height": image_height,
+    }
 
 # ==================== PREVIEW IMAGE ====================
 @router.post("/preview-image")
@@ -534,10 +566,12 @@ async def get_store_locations():
     stores = await database.fetch_all(
         "SELECT s.store_id, s.name AS store_name, s.latitude, s.longitude, "
         "s.store_image_url AS image_url, "
+        "s.image_width, s.image_height, "
         "CASE WHEN COUNT(l.listing_id) > 0 THEN true ELSE false END AS has_stock "
         "FROM stores s "
         "LEFT JOIN listings l ON s.store_id = l.store_id AND l.quantity_available > 0 "
-        "GROUP BY s.store_id, s.name, s.latitude, s.longitude, s.store_image_url"
+        "GROUP BY s.store_id, s.name, s.latitude, s.longitude, "
+        "s.store_image_url, s.image_width, s.image_height"
     )
     return [dict(store) for store in stores]
 
@@ -667,14 +701,19 @@ async def update_store_image(
 
     image_bytes = await image.read()
     image_url = upload_image(image_bytes, folder="store_images")
+    image_width, image_height = _image_dimensions(image_bytes)
 
     await database.execute(
-        "UPDATE stores SET store_image_url = :url WHERE store_id = :sid",
-        {"url": image_url, "sid": store_id}
+        "UPDATE stores SET store_image_url = :url, "
+        "image_width = :w, image_height = :h "
+        "WHERE store_id = :sid",
+        {"url": image_url, "w": image_width, "h": image_height, "sid": store_id}
     )
 
     return {
         "store_image_url": image_url,
+        "image_width": image_width,
+        "image_height": image_height,
         "message": "Store image updated successfully"
     }
 

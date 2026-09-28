@@ -1,15 +1,28 @@
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Request
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
-import json
-import os
-import uuid
-import asyncio
 from app.db.database import database
 from app.utils.security import get_current_user
-from app.services.cloudinary_service import upload_image   # ✅ Cloudinary helper
+from app.services.cloudinary_service import upload_image
+from PIL import Image
+import json, os, uuid, asyncio, io
 
 router = APIRouter(prefix="/profile", tags=["Profile"])
+
+
+# ---------- image dimensions helper ----------
+def _image_dimensions(image_bytes: bytes) -> tuple[Optional[int], Optional[int]]:
+    """Return (width, height) for the exact bytes being uploaded.
+    Returns (None, None) on decode failure — frontend falls back to hash."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+        if w > 0 and h > 0:
+            return int(w), int(h)
+    except Exception as e:
+        print(f"⚠️  Could not read image dimensions: {e}")
+    return None, None
+
 
 # ---------- Models ----------
 class OnboardingCompleteRequest(BaseModel):
@@ -22,6 +35,7 @@ class SettingsUpdateRequest(BaseModel):
 class UpdateProviderProfileRequest(BaseModel):
     display_name: Optional[str] = None
     business_name: Optional[str] = None
+
 
 # ---------- Mark a role as onboarded ----------
 @router.post("/complete-onboarding")
@@ -40,6 +54,7 @@ async def complete_onboarding(
         )
     return {"message": f"Onboarding for role '{req.role}' recorded"}
 
+
 # ---------- Get onboarding status ----------
 @router.get("/onboarding-status")
 async def onboarding_status(current_user: dict = Depends(get_current_user)):
@@ -49,6 +64,7 @@ async def onboarding_status(current_user: dict = Depends(get_current_user)):
     )
     roles = [row["role"] for row in rows]
     return {"roles": roles}
+
 
 # ---------- Get settings for a specific role ----------
 @router.get("/settings/{role}")
@@ -64,6 +80,7 @@ async def get_settings(role: str, current_user: dict = Depends(get_current_user)
         except (json.JSONDecodeError, TypeError):
             settings[row["key"]] = row["value"]
     return {"settings": settings}
+
 
 # ---------- Save settings for a specific role ----------
 @router.put("/settings")
@@ -83,6 +100,7 @@ async def update_settings(
         )
     return {"message": "Settings saved"}
 
+
 # ---------- UPLOAD AVATAR (Cloudinary) ----------
 @router.post("/upload-avatar")
 async def upload_avatar(
@@ -94,14 +112,21 @@ async def upload_avatar(
         raise HTTPException(status_code=400, detail="Invalid file type")
 
     image_bytes = await avatar.read()
-    avatar_url = upload_image(image_bytes, folder="avatars")   # ✅ Cloudinary
+    avatar_url = upload_image(image_bytes, folder="avatars")
+    avatar_width, avatar_height = _image_dimensions(image_bytes)
 
-    # Update user's avatar_url with retry
     for attempt in range(3):
         try:
             await database.execute(
-                "UPDATE users SET avatar_url = :url WHERE id = :uid",
-                {"url": avatar_url, "uid": current_user["id"]}
+                "UPDATE users SET avatar_url = :url, "
+                "avatar_width = :w, avatar_height = :h "
+                "WHERE id = :uid",
+                {
+                    "url": avatar_url,
+                    "w": avatar_width,
+                    "h": avatar_height,
+                    "uid": current_user["id"],
+                }
             )
             break
         except Exception as e:
@@ -110,7 +135,12 @@ async def upload_avatar(
             else:
                 raise
 
-    return {"avatar_url": avatar_url}
+    return {
+        "avatar_url": avatar_url,
+        "avatar_width": avatar_width,
+        "avatar_height": avatar_height,
+    }
+
 
 # ---------- UPLOAD BUSINESS IMAGE (Cloudinary) ----------
 @router.post("/upload-business-image")
@@ -123,14 +153,21 @@ async def upload_business_image(
         raise HTTPException(status_code=400, detail="Invalid file type")
 
     image_bytes = await image.read()
-    business_image_url = upload_image(image_bytes, folder="business_images")   # ✅ Cloudinary
+    business_image_url = upload_image(image_bytes, folder="business_images")
+    business_image_width, business_image_height = _image_dimensions(image_bytes)
 
-    # Update user's business_image_url with retry
     for attempt in range(3):
         try:
             await database.execute(
-                "UPDATE users SET business_image_url = :url WHERE id = :uid",
-                {"url": business_image_url, "uid": current_user["id"]}
+                "UPDATE users SET business_image_url = :url, "
+                "business_image_width = :w, business_image_height = :h "
+                "WHERE id = :uid",
+                {
+                    "url": business_image_url,
+                    "w": business_image_width,
+                    "h": business_image_height,
+                    "uid": current_user["id"],
+                }
             )
             break
         except Exception as e:
@@ -139,7 +176,12 @@ async def upload_business_image(
             else:
                 raise
 
-    return {"business_image_url": business_image_url}
+    return {
+        "business_image_url": business_image_url,
+        "business_image_width": business_image_width,
+        "business_image_height": business_image_height,
+    }
+
 
 # ---------- UPDATE PROVIDER PROFILE (display name & business name) ----------
 @router.put("/update-provider-profile")
