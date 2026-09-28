@@ -54,7 +54,6 @@ async def verify_payment(
 
     # ── 2. Interpret Paystack's response ─────────────────────────────
     if not data.get("status"):
-        # Top-level `status: false` — bad reference, expired, etc.
         raise HTTPException(
             status_code=400,
             detail=data.get("message") or "Payment verification failed",
@@ -104,16 +103,21 @@ async def verify_payment(
     )
 
     # ── 6. Record transaction ────────────────────────────────────────
+    # FIXED:
+    #   type        : 'topup'   → 'credit'      (was misread as debit)
+    #   description : (missing) → 'Wallet top-up via Paystack'
+    #   status      : 'success' → 'completed'   (consistency with wallet.py)
     await database.execute(
         """
         INSERT INTO wallet_transactions
-            (user_id, amount, type, reference, status, created_at)
+            (user_id, amount, type, description, reference, status, created_at)
         VALUES
-            (:uid, :amt, 'topup', :ref, 'success', :now)
+            (:uid, :amt, 'credit', :desc, :ref, 'completed', :now)
         """,
         {
             "uid": user_id,
             "amt": amount,
+            "desc": "Wallet top-up via Paystack",
             "ref": reference,
             "now": datetime.utcnow(),
         },
