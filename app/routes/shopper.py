@@ -11,19 +11,24 @@ from app.services.image_embedder import json_to_embedding, cosine_similarity
 
 router = APIRouter(prefix="/shopper", tags=["Shopper"])
 
-# ✅ How many items rank can return in a single call.
 MAX_FEED_SIZE = 500
-
-# ✅ How many items from the same store can appear before we skip to
-#    other stores. Relaxed from 2 → 5 to allow the feed to grow.
 MAX_PER_STORE = 5
+
 
 # ---------- Helper ----------
 def _to_datetime(value):
-    """Return a datetime object from either a string or an existing datetime."""
     if isinstance(value, datetime):
         return value
     return datetime.fromisoformat(value) if value else None
+
+
+def _row_get(row, key):
+    """Safe accessor — asyncpg Record raises on missing key, dicts don't."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
+
 
 # ---------- Models ----------
 class FeedItem(BaseModel):
@@ -69,6 +74,7 @@ class WantedAlertResponse(BaseModel):
     created_at: Optional[str] = None
     expires_at: Optional[str] = None
 
+
 # ---------- Existing ranking endpoint (legacy) ----------
 @router.post("/feed")
 async def rank_feed(req: FeedRequest):
@@ -89,6 +95,7 @@ async def rank_feed(req: FeedRequest):
     scored.sort(key=lambda x: x["score"], reverse=True)
     return {"ranked_feed": scored}
 
+
 # ---------- Real feed (public, simple) ----------
 @router.get("/real-feed")
 async def real_feed(lat: float, lng: float):
@@ -107,7 +114,7 @@ async def real_feed(lat: float, lng: float):
         pos = 1 if row["price"] < 15000 else 2
         X = [[pos, dist, mins, row["title_quality"]]]
         score = model.predict_proba(X)[0, 1]
-        image_url = row["image_url"] if "image_url" in row else None
+        image_url = _row_get(row, "image_url")
         scored.append({
             "listing_id": row["listing_id"],
             "title": row["title"],
@@ -117,12 +124,15 @@ async def real_feed(lat: float, lng: float):
             "minutes_since_listed": round(mins, 1),
             "title_quality": row["title_quality"],
             "image_url": image_url,
+            # ✅ NEW — real image dimensions
+            "image_width": _row_get(row, "image_width"),
+            "image_height": _row_get(row, "image_height"),
             "store_name": row["store_name"] if "store_name" in row else row["store_id"],
-            # ✅ NEW — carry category through so client filters have data
-            "category": row["category"] if "category" in row else None,
+            "category": _row_get(row, "category"),
         })
     scored.sort(key=lambda x: x["score"], reverse=True)
     return {"feed": scored}
+
 
 # ---------- Listing detail ----------
 @router.get("/listing/{listing_id}")
@@ -131,6 +141,7 @@ async def get_listing(listing_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Listing not found")
     return dict(row)
+
 
 # ==================== PUBLIC RECALL ====================
 @router.post("/feed/recall")
@@ -161,7 +172,6 @@ async def feed_recall(req: RecallRequest, current_user: Optional[dict] = Depends
                 "title": item.get("title", ""),
                 "pool": "geo",
                 "distance_km": item.get("distance_km", 0),
-                # ✅ NEW — pass category through for filters
                 "category": item.get("category"),
             }
     except Exception as e:
@@ -223,6 +233,7 @@ async def feed_recall(req: RecallRequest, current_user: Optional[dict] = Depends
     result = list(candidates.values())[:total_candidates]
     return {"candidates": result, "total": len(result), "mix_weights": weights}
 
+
 # ==================== RANK ENDPOINT ====================
 @router.post("/feed/rank")
 async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = Depends(get_optional_user)):
@@ -242,7 +253,7 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
     if not rows:
         return {"feed": [], "total": 0, "model_used": model is not None}
 
-    # ── Fallback path (no ML model) — this is what runs in production ──
+    # ── Fallback path (no ML model) ──
     if model is None:
         rows_by_id = {row["listing_id"]: row for row in rows}
         fallback_feed = []
@@ -256,7 +267,7 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
             dist = haversine(req.lat, req.lng, row["lat"], row["lng"])
             created = _to_datetime(row["created_at"])
             mins = max((now - created).total_seconds() / 60.0, 0) if created else 0
-            image_url = row["image_url"] if "image_url" in row else None
+            image_url = _row_get(row, "image_url")
             fallback_feed.append({
                 "listing_id": row["listing_id"],
                 "title": row["title"],
@@ -266,11 +277,13 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
                 "minutes_since_listed": round(mins, 1),
                 "title_quality": row["title_quality"] if row["title_quality"] is not None else 0.5,
                 "image_url": image_url,
+                # ✅ NEW — real image dimensions
+                "image_width": _row_get(row, "image_width"),
+                "image_height": _row_get(row, "image_height"),
                 "store_name": row["store_name"] if "store_name" in row else row["store_id"],
                 "store_id": row["store_id"],
                 "fallback": True,
-                # ✅ NEW — carry category through
-                "category": row["category"] if "category" in row else None,
+                "category": _row_get(row, "category"),
             })
             shown_set.add(cid)
             if len(fallback_feed) >= MAX_FEED_SIZE:
@@ -289,7 +302,7 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
             score = model.predict_proba([features])[0, 1]
         except Exception:
             score = 0.5
-        image_url = row["image_url"] if "image_url" in row else None
+        image_url = _row_get(row, "image_url")
         scored.append({
             "listing_id": row["listing_id"],
             "title": row["title"],
@@ -299,10 +312,12 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
             "minutes_since_listed": round(mins, 1),
             "title_quality": row["title_quality"],
             "image_url": image_url,
+            # ✅ NEW — real image dimensions
+            "image_width": _row_get(row, "image_width"),
+            "image_height": _row_get(row, "image_height"),
             "store_name": row["store_name"] if "store_name" in row else row["store_id"],
             "store_id": row["store_id"],
-            # ✅ NEW — carry category through
-            "category": row["category"] if "category" in row else None,
+            "category": _row_get(row, "category"),
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
@@ -334,11 +349,11 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
 
     return {"feed": final_feed, "total": len(final_feed), "model_used": True}
 
+
 # ==================== RECALL HELPERS ====================
 async def _geo_recall(lat: float, lng: float, radius_km: float, limit: int):
     lat_diff = radius_km / 111.0
     lng_diff = radius_km / (111.0 * abs(math.cos(math.radians(lat))) + 1e-8)
-    # ✅ NEW — include category in the SELECT so the recall response carries it
     rows = await database.fetch_all(
         "SELECT listing_id, title, category, lat, lng FROM listings "
         "WHERE quantity_available > 0 AND lat BETWEEN :min_lat AND :max_lat "
@@ -349,6 +364,7 @@ async def _geo_recall(lat: float, lng: float, radius_km: float, limit: int):
     )
     return [dict(row) | {"distance_km": round(haversine(lat, lng, row["lat"], row["lng"]), 3)} for row in rows]
 
+
 async def _forage_recall(lat: float, lng: float, radius_km: float, limit: int):
     rows = await database.fetch_all(
         "SELECT listing_id FROM listings WHERE quantity_available > 0 "
@@ -356,6 +372,7 @@ async def _forage_recall(lat: float, lng: float, radius_km: float, limit: int):
         "ORDER BY created_at DESC LIMIT :lim", {"lim": limit}
     )
     return [dict(row) for row in rows]
+
 
 async def _trending_recall(lat: float, lng: float, radius_km: float, limit: int):
     rows = await database.fetch_all(
@@ -369,6 +386,7 @@ async def _trending_recall(lat: float, lng: float, radius_km: float, limit: int)
     )
     return [dict(row) for row in rows]
 
+
 async def _following_recall(user_id: str, lat: float, lng: float, radius_km: float, limit: int):
     rows = await database.fetch_all(
         "SELECT l.listing_id FROM listings l "
@@ -380,11 +398,14 @@ async def _following_recall(user_id: str, lat: float, lng: float, radius_km: flo
     )
     return [dict(row) for row in rows]
 
+
 async def _embedding_recall(user_id: str, lat: float, lng: float, radius_km: float, limit: int):
     return []
 
+
 async def _collab_recall(user_id: str, lat: float, lng: float, radius_km: float, limit: int):
     return []
+
 
 # ==================== FOLLOW / UNFOLLOW STORE ====================
 @router.post("/{store_id}/follow")
@@ -395,6 +416,7 @@ async def follow_store(store_id: str, current_user: dict = Depends(get_current_u
     )
     return {"message": "Followed"}
 
+
 @router.delete("/{store_id}/unfollow")
 async def unfollow_store(store_id: str, current_user: dict = Depends(get_current_user)):
     await database.execute(
@@ -403,6 +425,7 @@ async def unfollow_store(store_id: str, current_user: dict = Depends(get_current
     )
     return {"message": "Unfollowed"}
 
+
 @router.get("/{store_id}/follow-status")
 async def get_follow_status(store_id: str, current_user: dict = Depends(get_current_user)):
     row = await database.fetch_one(
@@ -410,6 +433,7 @@ async def get_follow_status(store_id: str, current_user: dict = Depends(get_curr
         {"uid": current_user["id"], "sid": store_id}
     )
     return {"following": row is not None}
+
 
 # ==================== SAVE / UNSAVE LISTING ====================
 @router.post("/save/{listing_id}")
@@ -420,6 +444,7 @@ async def save_listing(listing_id: str, current_user: dict = Depends(get_current
     )
     return {"message": "Saved"}
 
+
 @router.delete("/save/{listing_id}")
 async def unsave_listing(listing_id: str, current_user: dict = Depends(get_current_user)):
     await database.execute(
@@ -428,6 +453,7 @@ async def unsave_listing(listing_id: str, current_user: dict = Depends(get_curre
     )
     return {"message": "Unsaved"}
 
+
 @router.get("/save/{listing_id}/status")
 async def get_save_status(listing_id: str, current_user: dict = Depends(get_current_user)):
     row = await database.fetch_one(
@@ -435,6 +461,7 @@ async def get_save_status(listing_id: str, current_user: dict = Depends(get_curr
         {"uid": current_user["id"], "lid": listing_id}
     )
     return {"saved": row is not None}
+
 
 # ==================== SAVED ITEMS LIST ====================
 @router.get("/saved")
@@ -448,6 +475,8 @@ async def get_saved_items(current_user: dict = Depends(get_current_user)):
             l.title,
             l.price,
             l.image_url,
+            l.image_width,
+            l.image_height,
             l.store_id,
             s.name AS store_name
         FROM saved_items si
@@ -459,6 +488,7 @@ async def get_saved_items(current_user: dict = Depends(get_current_user)):
         {"uid": user_id},
     )
     return [dict(row) for row in rows]
+
 
 # ==================== WANTED ALERTS ====================
 @router.get("/wanted")
@@ -474,6 +504,7 @@ async def list_wanted_alerts(current_user: dict = Depends(get_current_user)):
         {"uid": current_user["id"]},
     )
     return [dict(row) for row in rows]
+
 
 @router.post("/wanted", status_code=201)
 async def create_wanted_alert(
@@ -509,6 +540,7 @@ async def create_wanted_alert(
     )
     return dict(row) if row else {"message": "Created"}
 
+
 @router.delete("/wanted/{alert_id}")
 async def delete_wanted_alert(
     alert_id: int,
@@ -528,6 +560,7 @@ async def delete_wanted_alert(
         {"aid": alert_id},
     )
     return {"message": "Deleted", "id": alert_id}
+
 
 @router.patch("/wanted/{alert_id}/toggle")
 async def toggle_wanted_alert(
@@ -550,6 +583,7 @@ async def toggle_wanted_alert(
     )
     return {"id": alert_id, "is_active": new_state}
 
+
 # ==================== PROVIDER SERVICES (public) ====================
 @router.get("/provider/{provider_id}")
 async def get_provider_services(provider_id: str):
@@ -559,10 +593,11 @@ async def get_provider_services(provider_id: str):
     )
     return rows
 
+
 # ── Helper for agentic SEAI search ───────────────────────────
 async def search_shopper_items(query: str, lat: float, lng: float, radius_km: float = 10, limit: int = 10):
     rows = await database.fetch_all(
-        "SELECT listing_id, title, price, lat, lng, image_url, store_id "
+        "SELECT listing_id, title, price, lat, lng, image_url, image_width, image_height, store_id "
         "FROM listings WHERE quantity_available > 0 AND title ILIKE :q "
         "ORDER BY created_at DESC LIMIT 100",
         {"q": f"%{query}%"}
@@ -578,6 +613,8 @@ async def search_shopper_items(query: str, lat: float, lng: float, radius_km: fl
                 "price": row_dict["price"],
                 "distance_km": round(dist, 3),
                 "image_url": row_dict["image_url"],
+                "image_width": row_dict.get("image_width"),
+                "image_height": row_dict.get("image_height"),
                 "store_id": row_dict["store_id"],
             })
     results.sort(key=lambda x: x["distance_km"])
