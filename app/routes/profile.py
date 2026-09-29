@@ -73,12 +73,39 @@ async def get_settings(role: str, current_user: dict = Depends(get_current_user)
         "SELECT key, value FROM user_settings WHERE user_id = :uid AND role = :role",
         {"uid": current_user["id"], "role": role}
     )
-    settings = {}
+    settings: Dict[str, Any] = {}
     for row in rows:
         try:
             settings[row["key"]] = json.loads(row["value"])
         except (json.JSONDecodeError, TypeError):
             settings[row["key"]] = row["value"]
+
+    # ── Merge live 2FA state from users ────────────────────────
+    # The /settings/{role}/account/2fa page reads these three keys.
+    # They live on `users`, not `user_settings`, so we splice them in.
+    try:
+        u = await database.fetch_one(
+            "SELECT two_factor_enabled, two_factor_method, two_factor_target "
+            "FROM users WHERE id = :uid",
+            {"uid": current_user["id"]},
+        )
+        if u:
+            row_dict = dict(u)
+            settings.setdefault(
+                "two_factor_enabled",
+                bool(row_dict.get("two_factor_enabled")),
+            )
+            settings.setdefault(
+                "two_factor_method",
+                row_dict.get("two_factor_method"),
+            )
+            settings.setdefault(
+                "two_factor_target",
+                row_dict.get("two_factor_target"),
+            )
+    except Exception as e:
+        print(f"⚠️  2FA settings merge skipped: {e}")
+
     return {"settings": settings}
 
 

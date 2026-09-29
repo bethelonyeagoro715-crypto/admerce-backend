@@ -56,7 +56,12 @@ from app.routes.notifications import router as notifications_router
 from app.routes.shopper import router as shopper_router
 from app.routes.seai_search import router as seai_search_router
 from app.routes.presence import router as presence_router
-from app.routes.community import router as community_router  # ✅ NEW
+from app.routes.community import router as community_router
+
+# ── NEW — settings-tree routers ────────────────────────────────
+from app.routes.auth_extras import router as auth_extras_router
+from app.routes.profile_extras import router as profile_extras_router
+from app.routes.feedback import router as feedback_router
 
 SKIP_MODELS = os.getenv("SKIP_MODELS") == "1"
 
@@ -356,10 +361,35 @@ async def lifespan(app: FastAPI):
             ("business_image_url", "TEXT"),
             ("business_name", "TEXT"),
             ("last_seen_at", "TIMESTAMPTZ"),
+            # ── NEW — settings-tree columns ────────────────────
+            ("bio", "TEXT"),
+            ("phone_verified", "BOOLEAN DEFAULT FALSE"),
+            ("email_verified", "BOOLEAN DEFAULT FALSE"),
+            ("two_factor_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("two_factor_method", "TEXT"),
+            ("two_factor_target", "TEXT"),
+            ("avatar_width", "INTEGER"),
+            ("avatar_height", "INTEGER"),
+            ("business_image_width", "INTEGER"),
+            ("business_image_height", "INTEGER"),
         ]:
             conn.exec_driver_sql(
                 f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
+
+        # ── NEW — image dims for listings + stores ─────────────
+        conn.exec_driver_sql(
+            "ALTER TABLE listings ADD COLUMN IF NOT EXISTS image_width INTEGER"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE listings ADD COLUMN IF NOT EXISTS image_height INTEGER"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE stores ADD COLUMN IF NOT EXISTS image_width INTEGER"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE stores ADD COLUMN IF NOT EXISTS image_height INTEGER"
+        )
 
         for col, dtype in [
             ("listing_id", "TEXT"),
@@ -413,6 +443,9 @@ async def lifespan(app: FastAPI):
             ("is_active", "BOOLEAN DEFAULT TRUE"),
             ("created_at", "TIMESTAMP DEFAULT NOW()"),
             ("updated_at", "TIMESTAMP DEFAULT NOW()"),
+            # ── NEW — image dims for services ──────────────────
+            ("image_width", "INTEGER"),
+            ("image_height", "INTEGER"),
         ]:
             conn.exec_driver_sql(
                 f"ALTER TABLE services ADD COLUMN IF NOT EXISTS {col} {dtype}"
@@ -667,7 +700,7 @@ async def lifespan(app: FastAPI):
             "ON users(last_seen_at DESC)"
         )
 
-        # ✅ NEW — community schema
+        # Community schema
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS community_messages (
                 id              SERIAL PRIMARY KEY,
@@ -691,6 +724,130 @@ async def lifespan(app: FastAPI):
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_community_sender "
             "ON community_messages(sender_id)"
+        )
+
+        # ── NEW — settings-tree tables ────────────────────────
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS addresses (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id         TEXT NOT NULL,
+                label           TEXT,
+                recipient_name  TEXT,
+                phone           TEXT,
+                line1           TEXT NOT NULL,
+                line2           TEXT,
+                city            TEXT,
+                state           TEXT,
+                country         TEXT DEFAULT 'Nigeria',
+                postal_code     TEXT,
+                is_default      BOOLEAN DEFAULT FALSE,
+                kind            TEXT DEFAULT 'home',
+                latitude        DOUBLE PRECISION,
+                longitude       DOUBLE PRECISION,
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_addresses_user "
+            "ON addresses (user_id, created_at DESC)"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_user_default_address "
+            "ON addresses (user_id) WHERE is_default = TRUE"
+        )
+
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS user_blocks (
+                id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                blocker_id   TEXT NOT NULL,
+                blocked_id   TEXT NOT NULL,
+                created_at   TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (blocker_id, blocked_id)
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_user_blocks_blocker "
+            "ON user_blocks (blocker_id, created_at DESC)"
+        )
+
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS login_activity (
+                id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id       TEXT NOT NULL,
+                action        TEXT NOT NULL,
+                device_kind   TEXT,
+                device_name   TEXT,
+                browser       TEXT,
+                os            TEXT,
+                ip            TEXT,
+                city          TEXT,
+                country       TEXT,
+                success       BOOLEAN DEFAULT TRUE,
+                created_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_login_activity_user "
+            "ON login_activity (user_id, created_at DESC)"
+        )
+
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id      TEXT NOT NULL,
+                type         TEXT NOT NULL,
+                category     TEXT,
+                area         TEXT,
+                description  TEXT,
+                image_url    TEXT,
+                rating       INT,
+                kind         TEXT,
+                comment      TEXT,
+                status       TEXT DEFAULT 'open',
+                created_at   TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_feedback_user "
+            "ON feedback (user_id, created_at DESC)"
+        )
+
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS pending_contact_changes (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id     TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                target      TEXT NOT NULL,
+                code        TEXT NOT NULL,
+                expires_at  TIMESTAMPTZ NOT NULL,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_pending_contact_changes_user "
+            "ON pending_contact_changes (user_id, kind, created_at DESC)"
+        )
+
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id         TEXT NOT NULL,
+                token_hash      TEXT,
+                device_kind     TEXT,
+                device_name     TEXT,
+                browser         TEXT,
+                os              TEXT,
+                ip              TEXT,
+                city            TEXT,
+                country         TEXT,
+                last_active_at  TIMESTAMPTZ DEFAULT NOW(),
+                created_at      TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_user_sessions_user "
+            "ON user_sessions (user_id, last_active_at DESC)"
         )
 
     print("✅ Schema migrations complete.")
@@ -873,13 +1030,15 @@ app.include_router(courier_router)
 app.include_router(wallet_router)
 app.include_router(order_router)
 app.include_router(profile_router)
+app.include_router(profile_extras_router)   # ✅ NEW — /profile/me, addresses, blocked, activity
 app.include_router(events_router)
 app.include_router(flipper_router)
 app.include_router(services_router)
 app.include_router(auth_router)
+app.include_router(auth_extras_router)      # ✅ NEW — /auth/2fa, sessions, phone/email change
 app.include_router(seai_search_router)
 app.include_router(presence_router)
-app.include_router(community_router)  # ✅ NEW
+app.include_router(community_router)
 if ai_tools_router:
     app.include_router(ai_tools_router)
 if seai_ask_router:
@@ -898,6 +1057,7 @@ if businesses_router:
 app.include_router(basket_router)
 app.include_router(settings.router)
 app.include_router(notifications_router)
+app.include_router(feedback_router)         # ✅ NEW — /feedback/*
 
 
 @app.exception_handler(RequestValidationError)
