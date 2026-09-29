@@ -11,7 +11,6 @@ from pydantic import BaseModel
 
 from .auth import get_current_user
 
-# ── Gemini SDK ────────────────────────────────────────────────
 try:
     import google.generativeai as genai
     _GEMINI_SDK_AVAILABLE = True
@@ -23,16 +22,63 @@ router = APIRouter(prefix="/storekeeper", tags=["AI Tools"])
 
 
 # ═══════════════════════════════════════════════════════════════
+# Timeouts — every provider must fail fast, never hang
+# ═══════════════════════════════════════════════════════════════
+GEMINI_TIMEOUT_SEC = 60
+OPENROUTER_TIMEOUT_SEC = 60
+GROQ_TIMEOUT_SEC = 20
+NVIDIA_TIMEOUT_SEC = 60
+PROVIDER_OVERALL_TIMEOUT_SEC = 90
+
+
+# ═══════════════════════════════════════════════════════════════
 # Clients
 # ═══════════════════════════════════════════════════════════════
 
-# ── Groq (chat + vision fallback) ─────────────────────────────
+# ── OpenRouter (vision — free tier via `:free` models) ────────
+try:
+    from openai import OpenAI as _OpenAIForOpenRouter
+    _openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    _openrouter_client = (
+        _OpenAIForOpenRouter(
+            api_key=_openrouter_key,
+            base_url="https://openrouter.ai/api/v1",
+            timeout=OPENROUTER_TIMEOUT_SEC,
+            max_retries=0,
+            default_headers={
+                # Optional — helps OpenRouter attribute traffic; not required.
+                "HTTP-Referer": "https://admerce-web-app-ashy.vercel.app",
+                "X-Title": "Admerce SEAI",
+            },
+        )
+        if _openrouter_key
+        else None
+    )
+    if _openrouter_client:
+        print(
+            f"✅ AI Tools: OpenRouter vision enabled "
+            f"(timeout={OPENROUTER_TIMEOUT_SEC}s)"
+        )
+    else:
+        print("⚠️ AI Tools: OPENROUTER_API_KEY not set, OpenRouter disabled")
+except ImportError:
+    _openrouter_client = None
+    print("⚠️ AI Tools: openai package not installed (OpenRouter unavailable)")
+
+
+# ── Groq (chat + optional vision) ─────────────────────────────
 try:
     from groq import Groq
     _groq_key = os.getenv("GROQ_API_KEY")
-    _groq_client = Groq(api_key=_groq_key) if _groq_key else None
+    _groq_client = (
+        Groq(api_key=_groq_key, timeout=GROQ_TIMEOUT_SEC)
+        if _groq_key
+        else None
+    )
     if _groq_client:
-        print("✅ AI Tools: Groq rewrite enabled")
+        print(
+            f"✅ AI Tools: Groq rewrite enabled (timeout={GROQ_TIMEOUT_SEC}s)"
+        )
     else:
         print("⚠️ AI Tools: GROQ_API_KEY not set, AI endpoints will return 503")
 except ImportError:
@@ -48,12 +94,17 @@ try:
         OpenAI(
             api_key=_nvidia_key,
             base_url="https://integrate.api.nvidia.com/v1",
+            timeout=NVIDIA_TIMEOUT_SEC,
+            max_retries=0,
         )
         if _nvidia_key
         else None
     )
     if _nvidia_client:
-        print("✅ AI Tools: NVIDIA NIM vision enabled")
+        print(
+            f"✅ AI Tools: NVIDIA NIM vision enabled "
+            f"(timeout={NVIDIA_TIMEOUT_SEC}s)"
+        )
     else:
         print("⚠️ AI Tools: NVIDIA_API_KEY not set, NVIDIA fallback disabled")
 except ImportError:
@@ -80,22 +131,22 @@ except Exception as e:
         "gemini-flash-latest",
     ]
     GEMINI_ENABLED = _GEMINI_SDK_AVAILABLE
-    # Fallback no-op implementations
+
     def should_skip_model(_: str) -> bool:
         return False
+
     def mark_model_rate_limited(_: str, __: int = 60) -> None:
         pass
+
     def classify_error(_: str) -> str:
         return "other"
 
 
-# ── Groq vision candidates ────────────────────────────────────
-# NOTE: Groq rotates its vision lineup frequently. Run
-# `GET /storekeeper/groq-models` to see the LIVE list for your
-# account, then trim this list to what's available. Dead models
-# are skipped automatically — keeping extras costs one wasted
-# request the first time, then they're marked unusable for the
-# process lifetime.
+# ═══════════════════════════════════════════════════════════════
+# Candidate lists
+# ═══════════════════════════════════════════════════════════════
+# Groq's vision lineup is dead as of Sept 2026 — all 404 — but kept
+# here so if they ship one, we pick it up automatically.
 GROQ_VISION_CANDIDATES = [
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
@@ -104,10 +155,6 @@ GROQ_VISION_CANDIDATES = [
     "meta-llama/llama-3.2-11b-vision-preview",
 ]
 
-
-# ── NVIDIA NIM vision candidates ──────────────────────────────
-# NVIDIA NIM exposes OpenAI-compatible vision endpoints. Model
-# IDs tend to be stable across quarters.
 NVIDIA_VISION_CANDIDATES = [
     "meta/llama-3.2-90b-vision-instruct",
     "meta/llama-3.2-11b-vision-instruct",
@@ -115,26 +162,36 @@ NVIDIA_VISION_CANDIDATES = [
     "microsoft/phi-3.5-vision-instruct",
 ]
 
+# OpenRouter free vision models — the `:free` suffix is what makes
+# them cost $0. Order matters: put the model you like best first.
+# Swap by hitting https://openrouter.ai/models?modality=text%2Bimage
+# and filtering to free.
+OPENROUTER_VISION_CANDIDATES = [
+    "inclusionai/ling-3.0-flash-vl:free",
+    "qwen/qwen2.5-vl-72b-instruct:free",
+    "google/gemini-2.0-flash-exp:free",
+    "meta-llama/llama-3.2-90b-vision-instruct:free",
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+]
 
-# ── Sticky working model per provider ─────────────────────────
-# We use mutable single-element lists so helper functions can
-# mutate them (Python has no `global` for dict entries).
+DEAD_MODEL_COOLDOWN_SEC = 3600
+
 _gemini_sticky: list[Optional[str]] = [None]
 _groq_sticky: list[Optional[str]] = [None]
 _nvidia_sticky: list[Optional[str]] = [None]
+_openrouter_sticky: list[Optional[str]] = [None]
 
 
 # ═══════════════════════════════════════════════════════════════
-# Response cache (image hash → result)
+# Response cache
 # ═══════════════════════════════════════════════════════════════
-# In-process; survives until the worker restarts. On a single
-# Render worker this is more than enough — the same photo re-
-# uploaded within a day returns instantly with zero API calls.
 _VISION_CACHE: dict[str, tuple[dict, float]] = {}
 VISION_CACHE_TTL_SEC = 24 * 60 * 60
 
 
-def _cache_key(image_bytes: bytes, title: str, description: str, category: str) -> str:
+def _cache_key(
+    image_bytes: bytes, title: str, description: str, category: str
+) -> str:
     h = hashlib.sha256()
     h.update(image_bytes)
     h.update(b"|")
@@ -159,7 +216,6 @@ def _cache_get(key: str) -> Optional[dict]:
 
 def _cache_set(key: str, data: dict) -> None:
     _VISION_CACHE[key] = (data, time.time())
-    # Light eviction — cap at 5,000 entries
     if len(_VISION_CACHE) > 5000:
         oldest = sorted(_VISION_CACHE.items(), key=lambda kv: kv[1][1])[:500]
         for k, _ in oldest:
@@ -167,7 +223,7 @@ def _cache_set(key: str, data: dict) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Text rewrite endpoint (unchanged)
+# Text rewrite (unchanged)
 # ═══════════════════════════════════════════════════════════════
 
 class RewriteRequest(BaseModel):
@@ -254,7 +310,9 @@ Return STRICT JSON with EXACTLY these keys, no markdown, no explanation, no extr
 Output ONLY the JSON object. Nothing before it. Nothing after it."""
 
 
-def _detect_image_mime(content_type: Optional[str], filename: Optional[str]) -> str:
+def _detect_image_mime(
+    content_type: Optional[str], filename: Optional[str]
+) -> str:
     if content_type and content_type.startswith("image/"):
         return content_type
     if filename:
@@ -287,11 +345,6 @@ def _extract_json(text: str) -> dict:
         return json.loads(m.group(0))
 
 
-def _is_model_unusable(err_text: str) -> bool:
-    """Detect dead/unknown model names."""
-    return classify_error(err_text) == "model"
-
-
 # ═══════════════════════════════════════════════════════════════
 # Generic provider runner
 # ═══════════════════════════════════════════════════════════════
@@ -301,11 +354,9 @@ async def _try_provider_vision(
     sticky_ref: list[Optional[str]],
     call_model: Callable[[str], Awaitable[str]],
 ) -> tuple[Optional[dict], Optional[str]]:
-    """
-    Try each candidate model in order. Sticky-first, then all others.
-    Skips models in the 60s cooldown. Marks 429s for cooldown.
-    Returns (parsed_dict, error_message).
-    """
+    if not candidates:
+        return None, f"{provider_label}: no models configured"
+
     sticky = sticky_ref[0]
     ordered: list[str] = []
     if sticky and sticky in candidates:
@@ -314,15 +365,21 @@ async def _try_provider_vision(
         if m != sticky:
             ordered.append(m)
 
-    # Drop any currently rate-limited models
     viable = [m for m in ordered if not should_skip_model(m)]
     if not viable:
         return None, f"{provider_label}: all models rate-limited"
 
     last_err: Optional[str] = None
     for model_name in viable:
+        print(
+            f"🤖 [vision/{provider_label}] trying model={model_name}",
+            flush=True,
+        )
         try:
-            raw = await call_model(model_name)
+            raw = await asyncio.wait_for(
+                call_model(model_name),
+                timeout=PROVIDER_OVERALL_TIMEOUT_SEC,
+            )
             if not raw or not raw.strip():
                 raise ValueError("empty response")
             parsed = _extract_json(raw)
@@ -332,6 +389,15 @@ async def _try_provider_vision(
                 flush=True,
             )
             return parsed, None
+        except asyncio.TimeoutError:
+            last_err = (
+                f"{model_name}: timed out after {PROVIDER_OVERALL_TIMEOUT_SEC}s"
+            )
+            print(
+                f"⏱️  [vision/{provider_label}] {model_name} timed out",
+                flush=True,
+            )
+            continue
         except Exception as e:
             err_text = str(e)
             last_err = err_text
@@ -339,17 +405,21 @@ async def _try_provider_vision(
             if kind == "quota":
                 mark_model_rate_limited(model_name)
                 print(
-                    f"⏸️  [vision/{provider_label}] {model_name} rate-limited, trying next",
+                    f"⏸️  [vision/{provider_label}] {model_name} rate-limited, "
+                    f"trying next",
                     flush=True,
                 )
             elif kind == "model":
+                mark_model_rate_limited(model_name, DEAD_MODEL_COOLDOWN_SEC)
                 print(
-                    f"⚠️ [vision/{provider_label}] {model_name} not usable, trying next",
+                    f"☠️  [vision/{provider_label}] {model_name} dead, "
+                    f"skipping for 1h",
                     flush=True,
                 )
             else:
                 print(
-                    f"⚠️ [vision/{provider_label}] {model_name} error: {err_text[:200]}",
+                    f"⚠️ [vision/{provider_label}] {model_name} error: "
+                    f"{err_text[:200]}",
                     flush=True,
                 )
             continue
@@ -364,7 +434,6 @@ async def _try_provider_vision(
 async def _gemini_call(
     prompt: str, image_bytes: bytes, mime: str
 ) -> Callable[[str], Awaitable[str]]:
-    """Returns an async callable for the generic runner."""
     async def _call(model_name: str) -> str:
         def _sync():
             model = genai.GenerativeModel(model_name)
@@ -380,7 +449,9 @@ async def _gemini_call(
 def _groq_call(
     prompt: str, image_bytes: bytes, mime: str
 ) -> Callable[[str], Awaitable[str]]:
-    data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    data_url = (
+        f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    )
 
     async def _call(model_name: str) -> str:
         response = await asyncio.to_thread(
@@ -403,7 +474,9 @@ def _groq_call(
 def _nvidia_call(
     prompt: str, image_bytes: bytes, mime: str
 ) -> Callable[[str], Awaitable[str]]:
-    data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    data_url = (
+        f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    )
 
     async def _call(model_name: str) -> str:
         response = await asyncio.to_thread(
@@ -423,8 +496,33 @@ def _nvidia_call(
     return _call
 
 
+def _openrouter_call(
+    prompt: str, image_bytes: bytes, mime: str
+) -> Callable[[str], Awaitable[str]]:
+    data_url = (
+        f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    )
+
+    async def _call(model_name: str) -> str:
+        response = await asyncio.to_thread(
+            _openrouter_client.chat.completions.create,
+            model=model_name,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }],
+            temperature=0.7,
+            max_tokens=800,
+        )
+        return response.choices[0].message.content or ""
+    return _call
+
+
 # ═══════════════════════════════════════════════════════════════
-# Vision endpoint — 3 providers, cache, cooldown
+# Vision endpoint
 # ═══════════════════════════════════════════════════════════════
 @router.post("/rewrite-listing-vision")
 async def rewrite_listing_vision(
@@ -443,20 +541,17 @@ async def rewrite_listing_vision(
             detail="Image too large. Please use a photo under 8MB.",
         )
 
-    # ── Cache hit? ────────────────────────────────────────────
     cache_key = _cache_key(image_bytes, title, description, category)
     cached = _cache_get(cache_key)
     if cached is not None:
         print(
-            f"🎯 [vision] cache hit, saved an API call "
-            f"(bytes={len(image_bytes)})",
+            f"🎯 [vision] cache hit (bytes={len(image_bytes)})",
             flush=True,
         )
         return cached
 
     mime = _detect_image_mime(image.content_type, image.filename)
 
-    # ── Build prompt ──────────────────────────────────────────
     categories_line = ""
     if category.strip():
         categories_line = (
@@ -473,7 +568,9 @@ async def rewrite_listing_vision(
     if existing_parts:
         existing_line = (
             "\n\nThe seller has already typed the following — improve on it, "
-            "don't discard their intent:\n" + "\n".join(existing_parts) + "\n"
+            "don't discard their intent:\n"
+            + "\n".join(existing_parts)
+            + "\n"
         )
 
     prompt = _VISION_PROMPT_TEMPLATE.format(
@@ -481,9 +578,9 @@ async def rewrite_listing_vision(
         existing_line=existing_line,
     )
 
-    # ── Provider chain ────────────────────────────────────────
     attempts: list[str] = []
     parsed: Optional[dict] = None
+    started_at = time.time()
 
     # 1. Gemini
     if GEMINI_ENABLED and genai is not None and GEMINI_VISION_CANDIDATES:
@@ -501,7 +598,41 @@ async def rewrite_listing_vision(
             attempts.append(f"gemini={err}")
             print(f"↩️ [vision] Gemini exhausted: {err}", flush=True)
 
-    # 2. Groq
+    # 2. OpenRouter
+    if (
+        parsed is None
+        and _openrouter_client is not None
+        and OPENROUTER_VISION_CANDIDATES
+    ):
+        print("↩️ [vision] falling back to OpenRouter", flush=True)
+        parsed, err = await _try_provider_vision(
+            "openrouter",
+            OPENROUTER_VISION_CANDIDATES,
+            _openrouter_sticky,
+            _openrouter_call(prompt, image_bytes, mime),
+        )
+        if parsed is None:
+            attempts.append(f"openrouter={err}")
+            print(f"↩️ [vision] OpenRouter exhausted: {err}", flush=True)
+
+    # 3. NVIDIA NIM
+    if (
+        parsed is None
+        and _nvidia_client is not None
+        and NVIDIA_VISION_CANDIDATES
+    ):
+        print("↩️ [vision] falling back to NVIDIA", flush=True)
+        parsed, err = await _try_provider_vision(
+            "nvidia",
+            NVIDIA_VISION_CANDIDATES,
+            _nvidia_sticky,
+            _nvidia_call(prompt, image_bytes, mime),
+        )
+        if parsed is None:
+            attempts.append(f"nvidia={err}")
+            print(f"↩️ [vision] NVIDIA exhausted: {err}", flush=True)
+
+    # 4. Groq (vision lineup dead — kept for future)
     if parsed is None and _groq_client is not None and GROQ_VISION_CANDIDATES:
         print("↩️ [vision] falling back to Groq", flush=True)
         parsed, err = await _try_provider_vision(
@@ -514,32 +645,23 @@ async def rewrite_listing_vision(
             attempts.append(f"groq={err}")
             print(f"↩️ [vision] Groq exhausted: {err}", flush=True)
 
-    # 3. NVIDIA NIM
-    if parsed is None and _nvidia_client is not None and NVIDIA_VISION_CANDIDATES:
-        print("↩️ [vision] falling back to NVIDIA", flush=True)
-        parsed, err = await _try_provider_vision(
-            "nvidia",
-            NVIDIA_VISION_CANDIDATES,
-            _nvidia_sticky,
-            _nvidia_call(prompt, image_bytes, mime),
-        )
-        if parsed is None:
-            attempts.append(f"nvidia={err}")
-            print(f"↩️ [vision] NVIDIA exhausted: {err}", flush=True)
+    elapsed = round(time.time() - started_at, 1)
 
-    # ── All failed ────────────────────────────────────────────
     if parsed is None:
-        print(f"❌ [vision] all providers failed. {' | '.join(attempts)}", flush=True)
+        print(
+            f"❌ [vision] all providers failed in {elapsed}s. "
+            f"{' | '.join(attempts)}",
+            flush=True,
+        )
         raise HTTPException(
             status_code=503,
             detail=(
-                "AI vision is temporarily unavailable. This usually means "
-                "our AI providers have hit their rate limit. Try again in "
-                "a minute, or fill in the details manually."
+                "AI vision is temporarily unavailable — all providers are "
+                "rate-limited or offline. Try again in a few minutes, or "
+                "fill in the details manually."
             ),
         )
 
-    # ── Shape + cache ─────────────────────────────────────────
     result = {
         "item_identified": str(parsed.get("item_identified", ""))[:120],
         "title": str(parsed.get("title", ""))[:200],
@@ -550,7 +672,10 @@ async def rewrite_listing_vision(
     }
 
     _cache_set(cache_key, result)
-    print(f"✅ [vision] parsed keys={list(result.keys())}", flush=True)
+    print(
+        f"✅ [vision] parsed keys={list(result.keys())} in {elapsed}s",
+        flush=True,
+    )
     return result
 
 
@@ -559,7 +684,6 @@ async def rewrite_listing_vision(
 # ═══════════════════════════════════════════════════════════════
 @router.get("/groq-models")
 async def list_groq_models(current_user: dict = Depends(get_current_user)):
-    """Every model the current Groq account can access."""
     if _groq_client is None:
         raise HTTPException(status_code=503, detail="Groq not configured.")
     try:
@@ -574,12 +698,13 @@ async def list_groq_models(current_user: dict = Depends(get_current_user)):
         entries.sort(key=lambda e: (e["id"] or "").lower())
         return {"count": len(entries), "models": entries}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not list models: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Could not list models: {e}"
+        )
 
 
 @router.get("/gemini-models")
 async def list_gemini_models(current_user: dict = Depends(get_current_user)):
-    """Every model the current Gemini API key can access."""
     if not GEMINI_ENABLED or genai is None:
         raise HTTPException(status_code=503, detail="Gemini not configured.")
     try:
@@ -598,33 +723,84 @@ async def list_gemini_models(current_user: dict = Depends(get_current_user)):
         entries.sort(key=lambda e: (e["name"] or "").lower())
         return {"count": len(entries), "models": entries}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not list models: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Could not list models: {e}"
+        )
+
+
+@router.get("/openrouter-models")
+async def list_openrouter_models(
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Every OpenRouter vision-capable model on this API key.
+    Filter for those with ":free" to build a free-tier chain.
+    """
+    if _openrouter_client is None:
+        raise HTTPException(status_code=503, detail="OpenRouter not configured.")
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={
+                    "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY', '')}",
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+            data = r.json().get("data", [])
+        entries = []
+        for m in data:
+            modality = (m.get("architecture") or {}).get("input_modalities") or []
+            if "image" not in modality:
+                continue
+            entries.append({
+                "id": m.get("id"),
+                "name": m.get("name"),
+                "context_length": m.get("context_length"),
+                "pricing": m.get("pricing"),
+            })
+        entries.sort(key=lambda e: (e["id"] or "").lower())
+        return {"count": len(entries), "models": entries}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Could not list models: {e}"
+        )
 
 
 @router.get("/vision-status")
 async def vision_status(current_user: dict = Depends(get_current_user)):
-    """
-    Snapshot of vision config + recent quota state. Handy for
-    debugging which models are alive on this process.
-    """
     return {
         "gemini": {
             "enabled": bool(GEMINI_ENABLED and genai is not None),
             "candidates": GEMINI_VISION_CANDIDATES,
             "sticky": _gemini_sticky[0],
         },
-        "groq": {
-            "enabled": _groq_client is not None,
-            "candidates": GROQ_VISION_CANDIDATES,
-            "sticky": _groq_sticky[0],
+        "openrouter": {
+            "enabled": _openrouter_client is not None,
+            "candidates": OPENROUTER_VISION_CANDIDATES,
+            "sticky": _openrouter_sticky[0],
         },
         "nvidia": {
             "enabled": _nvidia_client is not None,
             "candidates": NVIDIA_VISION_CANDIDATES,
             "sticky": _nvidia_sticky[0],
         },
+        "groq": {
+            "enabled": _groq_client is not None,
+            "candidates": GROQ_VISION_CANDIDATES,
+            "sticky": _groq_sticky[0],
+        },
         "cache": {
             "entries": len(_VISION_CACHE),
             "ttl_sec": VISION_CACHE_TTL_SEC,
+        },
+        "timeouts": {
+            "gemini_sec": GEMINI_TIMEOUT_SEC,
+            "openrouter_sec": OPENROUTER_TIMEOUT_SEC,
+            "groq_sec": GROQ_TIMEOUT_SEC,
+            "nvidia_sec": NVIDIA_TIMEOUT_SEC,
+            "provider_overall_sec": PROVIDER_OVERALL_TIMEOUT_SEC,
         },
     }
