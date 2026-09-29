@@ -11,7 +11,6 @@ import logging
 from datetime import datetime, timedelta
 
 from app.db.database import database
-from app.utils.security import get_current_user
 from app.services.email_service import send_otp_email
 from app.services.sms_service import send_otp_sms, is_sms_configured
 
