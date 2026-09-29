@@ -1,31 +1,110 @@
 import os
 import json
 import asyncio
+import time
 from typing import Optional
 
 # ── Groq (primary — fastest, best free tier for chat) ────────
 GROQ_MODEL = "openai/gpt-oss-120b"
 
-# ⚠️ Groq's vision lineup is volatile — previews get decommissioned
-#    without notice and access varies by account tier. We keep this
-#    as an opportunistic fallback; Gemini is the primary vision path.
-GROQ_VISION_MODELS = [
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
-]
+# ⚠️ Groq retired its vision lineup in 2025. These entries were
+#    returning 404 as of Sept 2026:
+#      - meta-llama/llama-4-scout-17b-16e-instruct
+#      - meta-llama/llama-4-maverick-17b-128e-instruct
+#    We keep the list EMPTY so the caller skips Groq for vision
+#    instead of trying (and 500ing on) non-existent models.
+#    If Groq ships a new vision model, add it back here.
+GROQ_VISION_MODELS: list[str] = []
 
-# Backward-compat alias.
-GROQ_VISION_MODEL = GROQ_VISION_MODELS[0]
+# Backward-compat alias. Empty string is safer than a 404 model name.
+GROQ_VISION_MODEL = GROQ_VISION_MODELS[0] if GROQ_VISION_MODELS else ""
 
-# ✅ Gemini vision chain. Google's vision models are stable and widely
-#    available on every tier. We try them in order; the first one that
-#    returns a valid JSON response wins and is cached for the session.
+# ✅ Gemini vision chain. This list contains models that exist on
+#    the public API today (Sept 2026). `gemini-3.6-flash` is the
+#    primary; the `.5` models are GA fallbacks. `gemini-flash-latest`
+#    is a rolling alias to whatever Google currently calls the
+#    newest flash — useful when they deprecate a version.
+#
+#    Note: all Gemini models share one rate limit per Google Cloud
+#    project. Free tier = 5 req/min. Fallback across the Gemini
+#    family only helps when a specific model is quarantined, not
+#    when the whole project is over quota.
 GEMINI_VISION_MODELS = [
-    "gemini-3.6-flash",       # matches the chat model — has vision
-    "gemini-2.0-flash-exp",
-    "gemini-1.5-flash",
+    "gemini-3.6-flash",        # primary — matches the chat model
+    "gemini-2.5-flash",        # GA fallback
+    "gemini-2.5-flash-lite",   # cheapest GA tier
+    "gemini-flash-latest",     # rolling alias
 ]
 
+# ── 429 short-circuit ────────────────────────────────────────
+# When a model returns a quota error, we mark it unavailable for
+# QUOTA_COOLDOWN_SEC seconds. The vision retry loop in ai_tools.py
+# calls `should_skip_model(name)` before trying a model, which
+# avoids hammering the same quota bucket three times in a row.
+#
+# In-process only. On a single Render worker that's fine; if you
+# ever scale to multiple instances, move this to Redis.
+QUOTA_COOLDOWN_SEC = 60
+_quota_blocked_until: dict[str, float] = {}
+
+
+def should_skip_model(model_name: str) -> bool:
+    """Return True if this model is currently rate-limited."""
+    until = _quota_blocked_until.get(model_name, 0)
+    if until and time.time() < until:
+        return True
+    if until and time.time() >= until:
+        # Cooldown expired — clean up
+        _quota_blocked_until.pop(model_name, None)
+    return False
+
+
+def mark_model_rate_limited(model_name: str, seconds: int = QUOTA_COOLDOWN_SEC) -> None:
+    """Mark a model as rate-limited for `seconds`."""
+    _quota_blocked_until[model_name] = time.time() + seconds
+    print(
+        f"⏸️  [llm_agent] {model_name} rate-limited for {seconds}s",
+        flush=True,
+    )
+
+
+def _is_quota_error(err_text: str) -> bool:
+    """Best-effort detection of a quota/rate-limit error."""
+    lower = err_text.lower()
+    return (
+        "429" in err_text
+        or "quota" in lower
+        or "rate limit" in lower
+        or "rate-limit" in lower
+    )
+
+
+def _is_model_error(err_text: str) -> bool:
+    """Best-effort detection of a dead/unknown model."""
+    lower = err_text.lower()
+    return (
+        "404" in err_text
+        or "not found" in lower
+        or "does not exist" in lower
+        or "not supported" in lower
+        or "not usable" in lower
+    )
+
+
+def classify_error(err_text: str) -> str:
+    """
+    'quota'   → temporarily rate-limited, retry later
+    'model'   → permanently dead, remove from list
+    'other'   → transient/unknown
+    """
+    if _is_quota_error(err_text):
+        return "quota"
+    if _is_model_error(err_text):
+        return "model"
+    return "other"
+
+
+# ── Groq client ──────────────────────────────────────────────
 try:
     from groq import AsyncGroq
     _groq_key = os.getenv("GROQ_API_KEY")
@@ -39,6 +118,7 @@ except ImportError:
     _groq_client = None
     GROQ_ENABLED = False
     print("⚠️ groq package not installed. Install with: pip install groq")
+
 
 # ── Google Gemini (secondary — strongest for agent + tools) ──
 GEMINI_MODEL = "gemini-3.6-flash"
@@ -55,6 +135,7 @@ try:
 except ImportError:
     GEMINI_ENABLED = False
     print("⚠️ google-generativeai not installed. Install with: pip install google-generativeai")
+
 
 # ── NVIDIA NIM (tertiary — OpenAI-compatible) ────────────────
 NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b"
