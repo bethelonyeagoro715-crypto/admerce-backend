@@ -1,60 +1,101 @@
-from fastapi import APIRouter, HTTPException, Depends, Query, Body
-from pydantic import BaseModel
-from typing import Optional, List
+import asyncio
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Depends, Query
+from pydantic import BaseModel, Field
+
 from app.db.database import database
 from app.utils.security import get_current_user
-from datetime import datetime, timedelta
-import asyncio
-import uuid
 from app.routes.notifications import send_push_to_user
 
+# NOTE: hash_password / verify_password should live in app.utils.security.
+# Importing from a route module creates a hidden wallet→auth coupling.
 from app.routes.auth import hash_password, verify_password
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/wallet", tags=["Wallet"])
 
-# ---------- Models ----------
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
 class ReserveRequest(BaseModel):
-    order_id: str
-    storekeeper_id: str
-    item_amount: float
-    listing_id: str
-    quantity: int = 1
-    courier_id: Optional[str] = None
-    delivery_fee: float = 0.0
+    order_id: str = Field(..., min_length=1, max_length=128)
+    storekeeper_id: str = Field(..., min_length=1, max_length=128)
+    listing_id: str = Field(..., min_length=1, max_length=128)
+    quantity: int = Field(1, ge=1, le=1000)
+    delivery_fee: float = Field(0.0, ge=0, le=50_000)
     pickup_window_hours: int = 3
+    # courier_id is intentionally NOT accepted from the client.
+    # Courier assignment must come from a dedicated dispatch flow.
 
 class ConfirmRequest(BaseModel):
-    order_id: str
+    order_id: str = Field(..., min_length=1, max_length=128)
 
 class AcceptRequest(BaseModel):
-    order_id: str
+    order_id: str = Field(..., min_length=1, max_length=128)
 
-# ✅ NEW — decline is storekeeper-initiated. Reason is optional but
-#    recommended; it goes into the shopper's notification and the audit row.
 class DeclineRequest(BaseModel):
-    order_id: str
-    reason: Optional[str] = None
+    order_id: str = Field(..., min_length=1, max_length=128)
+    reason: Optional[str] = Field(None, max_length=500)
 
 class SetPinRequest(BaseModel):
-    pin: str
+    pin: str = Field(..., min_length=4, max_length=6, pattern=r"^\d{4,6}$")
+    current_pin: Optional[str] = Field(None, min_length=4, max_length=6)
 
 class WithdrawRequest(BaseModel):
-    amount: float
-    method: str = "mobile_money"
-    account_number: str
-    pin: str
+    amount: float = Field(..., gt=0, le=10_000_000)
+    method: str = Field("mobile_money", max_length=32)
+    account_number: str = Field(..., min_length=4, max_length=32)
+    pin: str = Field(..., min_length=4, max_length=6)
+    idempotency_key: Optional[str] = Field(None, max_length=64)
 
 class InstantPickupRequest(BaseModel):
-    listing_id: str
-    storekeeper_id: str
-    amount: float
-    quantity: int = 1
+    listing_id: str = Field(..., min_length=1, max_length=128)
+    storekeeper_id: str = Field(..., min_length=1, max_length=128)
+    quantity: int = Field(1, ge=1, le=1000)
+    # amount is intentionally NOT accepted from the client.
 
-# ---------- Helpers ----------
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_background_tasks: set = set()
+
+
+def _fire_and_forget(coro) -> None:
+    """Schedule a background coroutine, holding a reference so it isn't GC'd."""
+    async def _run():
+        try:
+            await coro
+        except Exception:
+            logger.exception("Background task failed")
+    try:
+        task = asyncio.create_task(_run())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    except Exception:
+        logger.exception("Failed to schedule background task")
+
+
 def _update_won(result) -> bool:
+    """Return True if the last UPDATE/INSERT/DELETE matched at least one row.
+
+    `databases.execute` returns a status string like 'UPDATE 1' for asyncpg,
+    'INSERT 0 1' for inserts, or a plain int for some drivers.
+    """
+    if isinstance(result, int):
+        return result > 0
     if isinstance(result, str):
-        return not result.strip().endswith("0")
-    return True
+        try:
+            return int(result.rsplit(" ", 1)[-1]) > 0
+        except (ValueError, IndexError):
+            return False
+    return False
 
 
 async def _log_wallet_transaction(
@@ -63,14 +104,17 @@ async def _log_wallet_transaction(
     type: str,
     description: str,
     reference: str,
-    status: str = 'completed'
+    status: str = "completed",
 ):
     if amount <= 0 or not user_id:
+        logger.warning("Skipping wallet txn log: amount=%s user=%s", amount, user_id)
         return
     await database.execute(
         """
-        INSERT INTO wallet_transactions (user_id, amount, type, description, reference, status, created_at)
-        VALUES (:uid, :amt, :type, :desc, :ref, :status, NOW())
+        INSERT INTO wallet_transactions
+            (user_id, amount, type, description, reference, status, created_at)
+        VALUES
+            (:uid, :amt, :type, :desc, :ref, :status, NOW())
         """,
         {
             "uid": user_id,
@@ -82,66 +126,59 @@ async def _log_wallet_transaction(
         },
     )
 
-# ---------- Create Wallet ----------
+# ---------------------------------------------------------------------------
+# Create Wallet
+# ---------------------------------------------------------------------------
+
 @router.post("/create")
 async def create_wallet(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
     existing = await database.fetch_one(
-        "SELECT user_id, balance, withdrawal_pin FROM wallets WHERE user_id = :uid",
+        "SELECT balance FROM wallets WHERE user_id = :uid",
         {"uid": user_id},
     )
     if existing:
-        return {"user_id": user_id, "balance": existing["balance"], "message": "Wallet already exists"}
+        return {
+            "user_id": user_id,
+            "balance": float(existing["balance"]),
+            "message": "Wallet already exists",
+        }
     await database.execute(
-        "INSERT INTO wallets (user_id, balance) VALUES (:uid, 0.0)", {"uid": user_id}
+        "INSERT INTO wallets (user_id, balance) VALUES (:uid, 0.0)",
+        {"uid": user_id},
     )
     return {"user_id": user_id, "balance": 0.0, "message": "Wallet created"}
 
-# ---------- Topup ----------
+# ---------------------------------------------------------------------------
+# Topup — REMOVED
+# ---------------------------------------------------------------------------
+
 @router.post("/topup")
-async def topup(
-    amount: float = Body(..., embed=True),
-    current_user: dict = Depends(get_current_user),
-):
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be positive")
-    user_id = current_user["id"]
-    wallet = await database.fetch_one(
-        "SELECT user_id FROM wallets WHERE user_id = :uid", {"uid": user_id}
-    )
-    if not wallet:
-        await database.execute(
-            "INSERT INTO wallets (user_id, balance) VALUES (:uid, 0.0)", {"uid": user_id}
-        )
-
-    await database.execute(
-        "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-        {"amt": amount, "uid": user_id},
-    )
-    updated = await database.fetch_one(
-        "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": user_id}
+async def topup(current_user: dict = Depends(get_current_user)):
+    """
+    REMOVED. This endpoint used to credit the caller's wallet for any
+    client-supplied amount with no payment verification — a free-money
+    printer. All top-ups must go through /payments/verify after a real
+    Paystack checkout completes.
+    """
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Direct top-up is no longer available. "
+            "Please top up via the in-app payment flow."
+        ),
     )
 
-    await _log_wallet_transaction(
-        user_id=user_id,
-        amount=amount,
-        type='credit',
-        description='Wallet top-up',
-        reference=f"topup_{uuid.uuid4().hex[:8]}",
-    )
+# ---------------------------------------------------------------------------
+# Get Balance
+# ---------------------------------------------------------------------------
 
-    return {
-        "user_id": user_id,
-        "new_balance": updated["balance"],
-        "message": f"Top-up of {amount} successful",
-    }
-
-# ---------- Get Balance ----------
 @router.get("/balance")
 async def get_balance(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
     wallet = await database.fetch_one(
-        "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": user_id}
+        "SELECT balance FROM wallets WHERE user_id = :uid",
+        {"uid": user_id},
     )
     if not wallet:
         await database.execute(
@@ -151,17 +188,25 @@ async def get_balance(current_user: dict = Depends(get_current_user)):
         return {"user_id": user_id, "balance": 0.0}
     return {"user_id": user_id, "balance": float(wallet["balance"])}
 
-# ---------- Set Withdrawal PIN ----------
+# ---------------------------------------------------------------------------
+# Set / Change Withdrawal PIN
+# ---------------------------------------------------------------------------
+
 @router.post("/set-pin")
 async def set_pin(req: SetPinRequest, current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
     wallet = await database.fetch_one(
-        "SELECT user_id FROM wallets WHERE user_id = :uid", {"uid": user_id}
+        "SELECT withdrawal_pin FROM wallets WHERE user_id = :uid",
+        {"uid": user_id},
     )
     if not wallet:
         raise HTTPException(status_code=404, detail="Wallet not found")
-    if len(req.pin) < 4:
-        raise HTTPException(status_code=400, detail="PIN must be at least 4 digits")
+
+    existing_pin = wallet["withdrawal_pin"]
+    if existing_pin:
+        # Changing an existing PIN requires the current PIN.
+        if not req.current_pin or not verify_password(req.current_pin, existing_pin):
+            raise HTTPException(status_code=403, detail="Current PIN is incorrect")
 
     hashed_pin = hash_password(req.pin)
     await database.execute(
@@ -170,8 +215,13 @@ async def set_pin(req: SetPinRequest, current_user: dict = Depends(get_current_u
     )
     return {"message": "Withdrawal PIN set successfully"}
 
-# ---------- Withdraw ----------
-# ⚠️ STILL LEDGER-ONLY. No Paystack Transfers. Does not move real money.
+# ---------------------------------------------------------------------------
+# Withdraw
+# ---------------------------------------------------------------------------
+# ⚠️ STILL LEDGER-ONLY. Paystack Transfers is NOT integrated. The response
+# copy below has been changed from "Withdrawal successful" to a "pending"
+# message so the API stops claiming money moved when it did not.
+
 @router.post("/withdraw")
 async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
@@ -185,64 +235,100 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
 
     wallet = dict(row)
     withdrawal_pin = wallet.get("withdrawal_pin")
-    balance = float(wallet.get("balance") or 0)
-
     if not withdrawal_pin:
         raise HTTPException(
             status_code=403,
             detail="Withdrawal PIN not set. Please set a PIN first.",
         )
 
+    # NOTE: no per-user rate limit / lockout yet. A 4–6 digit PIN is
+    # brute-forceable. Needs a `pin_attempts` table or Redis counter with
+    # a lockout after N failures. Flagged.
     if not verify_password(req.pin, withdrawal_pin):
         raise HTTPException(status_code=403, detail="Incorrect PIN")
 
-    if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be positive")
+    txn_id = f"wdr_{uuid.uuid4().hex[:12]}"
 
-    if balance < req.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
+    try:
+        async with database.transaction():
+            # Atomic debit — check + decrement in one statement, so two
+            # concurrent withdraws cannot both pass the balance check.
+            result = await database.execute(
+                """
+                UPDATE wallets
+                   SET balance = balance - :amt
+                 WHERE user_id = :uid AND balance >= :amt
+                """,
+                {"amt": req.amount, "uid": user_id},
+            )
+            if not _update_won(result):
+                raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    new_balance = balance - req.amount
-    await database.execute(
-        "UPDATE wallets SET balance = :bal WHERE user_id = :uid",
-        {"bal": new_balance, "uid": user_id},
-    )
+            await _log_wallet_transaction(
+                user_id=user_id,
+                amount=req.amount,
+                type="debit",
+                description=f"Withdrawal via {req.method} (pending)",
+                reference=txn_id,
+                status="pending",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("withdraw failed user=%s", user_id)
+        raise HTTPException(status_code=500, detail="Withdrawal failed. Please try again.")
 
-    txn_id = f"wdr_{uuid.uuid4().hex[:8]}"
-    await _log_wallet_transaction(
-        user_id=user_id,
-        amount=req.amount,
-        type='debit',
-        description=f"Withdrawal via {req.method}",
-        reference=txn_id,
+    updated = await database.fetch_one(
+        "SELECT balance FROM wallets WHERE user_id = :uid",
+        {"uid": user_id},
     )
 
     return {
-        "message": "Withdrawal successful",
+        "message": (
+            "Withdrawal request received. Funds will be sent to your account "
+            "once processing completes."
+        ),
+        "status": "pending",
         "transaction_id": txn_id,
         "amount": req.amount,
-        "new_balance": new_balance,
+        "new_balance": float(updated["balance"]) if updated else None,
     }
 
-# ---------- Instant Pickup ----------
-@router.post("/instant-pickup")
-async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends(get_current_user)):
-    shopper_id = current_user["id"]
-    if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be positive")
+# ---------------------------------------------------------------------------
+# Instant Pickup
+# ---------------------------------------------------------------------------
 
-    quantity = max(1, int(req.quantity or 1))
+@router.post("/instant-pickup")
+async def instant_pickup(
+    req: InstantPickupRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    shopper_id = current_user["id"]
+    quantity = req.quantity
 
     row = await database.fetch_one(
-        "SELECT * FROM listings WHERE listing_id = :lid AND store_id IN "
-        "(SELECT store_id FROM stores WHERE owner_id = :oid)",
+        """
+        SELECT l.*, s.owner_id AS store_owner_id
+          FROM listings l
+          JOIN stores   s ON l.store_id = s.store_id
+         WHERE l.listing_id = :lid AND s.owner_id = :oid
+        """,
         {"lid": req.listing_id, "oid": req.storekeeper_id},
     )
     if not row:
-        raise HTTPException(status_code=404, detail="Listing not found or not owned by that storekeeper")
+        raise HTTPException(
+            status_code=404,
+            detail="Listing not found or not owned by that storekeeper",
+        )
 
     listing = dict(row)
+    store_owner_id = listing["store_owner_id"]
 
+    unit_price = float(listing.get("price") or 0)
+    if unit_price <= 0:
+        raise HTTPException(status_code=500, detail="Listing has no price configured")
+
+    total = round(unit_price * quantity, 2)
     available = listing.get("quantity_available")
     if available is not None and available < quantity:
         raise HTTPException(
@@ -250,141 +336,198 @@ async def instant_pickup(req: InstantPickupRequest, current_user: dict = Depends
             detail=f"Only {available} item(s) left in stock.",
         )
 
-    wallet = await database.fetch_one(
-        "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": shopper_id}
-    )
-    if not wallet or float(wallet["balance"]) < req.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
+    txn_id = f"pickup_{uuid.uuid4().hex[:12]}"
 
-    await database.execute(
-        "UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid",
-        {"amt": req.amount, "uid": shopper_id},
-    )
-    await database.execute(
-        "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-        {"amt": req.amount, "uid": req.storekeeper_id},
-    )
+    try:
+        async with database.transaction():
+            debit = await database.execute(
+                "UPDATE wallets SET balance = balance - :amt "
+                "WHERE user_id = :uid AND balance >= :amt",
+                {"amt": total, "uid": shopper_id},
+            )
+            if not _update_won(debit):
+                raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    if available is not None:
-        await database.execute(
-            "UPDATE listings SET quantity_available = quantity_available - :qty "
-            "WHERE listing_id = :lid AND quantity_available >= :qty",
-            {"qty": quantity, "lid": req.listing_id},
-        )
+            if available is not None:
+                stock = await database.execute(
+                    "UPDATE listings SET quantity_available = quantity_available - :qty "
+                    "WHERE listing_id = :lid AND quantity_available >= :qty",
+                    {"qty": quantity, "lid": req.listing_id},
+                )
+                if not _update_won(stock):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Item just sold out. Please try again.",
+                    )
 
-    txn_id = f"pickup_{uuid.uuid4().hex[:8]}"
-    await _log_wallet_transaction(
-        user_id=shopper_id,
-        amount=req.amount,
-        type='debit',
-        description=f"Instant pickup ({quantity} item{'s' if quantity > 1 else ''})",
-        reference=txn_id,
-    )
-    await _log_wallet_transaction(
-        user_id=req.storekeeper_id,
-        amount=req.amount,
-        type='credit',
-        description=f"Instant pickup payment ({quantity} item{'s' if quantity > 1 else ''})",
-        reference=f"{txn_id}:credit",
-    )
+            await database.execute(
+                "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+                {"amt": total, "uid": store_owner_id},
+            )
+
+            await _log_wallet_transaction(
+                user_id=shopper_id,
+                amount=total,
+                type="debit",
+                description=f"Instant pickup ({quantity} item{'s' if quantity > 1 else ''})",
+                reference=txn_id,
+            )
+            await _log_wallet_transaction(
+                user_id=store_owner_id,
+                amount=total,
+                type="credit",
+                description=f"Instant pickup payment ({quantity} item{'s' if quantity > 1 else ''})",
+                reference=f"{txn_id}:credit",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("instant_pickup failed shopper=%s", shopper_id)
+        raise HTTPException(status_code=500, detail="Payment failed. Please try again.")
 
     return {
         "message": "Payment successful",
         "transaction_id": txn_id,
-        "amount": req.amount,
+        "amount": total,
         "quantity": quantity,
     }
 
-# ---------- Reserve ----------
+# ---------------------------------------------------------------------------
+# Reserve
+# ---------------------------------------------------------------------------
+
 @router.post("/reserve")
 async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
-    total = req.item_amount + req.delivery_fee
-
-    if total <= 0:
-        raise HTTPException(status_code=400, detail="Item amount must be positive")
-
-    quantity = max(1, int(req.quantity or 1))
+    quantity = req.quantity
     window_hours = max(3, min(168, int(req.pickup_window_hours or 3)))
 
-    wallet = await database.fetch_one(
-        "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": shopper_id}
-    )
-    if not wallet:
-        raise HTTPException(status_code=400, detail="Wallet not found. Please create a wallet first.")
-    if float(wallet["balance"]) < total:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient balance. Your balance: ₦{wallet['balance']}, required: ₦{total}",
-        )
-
-    existing = await database.fetch_one(
-        "SELECT order_id FROM escrow WHERE order_id = :oid", {"oid": req.order_id}
-    )
-    if existing:
-        raise HTTPException(status_code=400, detail=f"Order {req.order_id} already reserved")
-
     row = await database.fetch_one(
-        "SELECT * FROM listings WHERE listing_id = :lid AND store_id IN "
-        "(SELECT store_id FROM stores WHERE owner_id = :oid)",
+        """
+        SELECT l.*, s.owner_id AS store_owner_id
+          FROM listings l
+          JOIN stores   s ON l.store_id = s.store_id
+         WHERE l.listing_id = :lid AND s.owner_id = :oid
+        """,
         {"lid": req.listing_id, "oid": req.storekeeper_id},
     )
     if not row:
         raise HTTPException(
             status_code=400,
-            detail=f"Listing {req.listing_id} not found or not owned by storekeeper {req.storekeeper_id}",
+            detail=(
+                f"Listing {req.listing_id} not found or not owned by "
+                f"storekeeper {req.storekeeper_id}"
+            ),
         )
+
     listing = dict(row)
+    store_owner_id = listing["store_owner_id"]
 
-    if listing.get("quantity_available") is not None and listing["quantity_available"] < quantity:
-        raise HTTPException(status_code=400, detail=f"Only {listing['quantity_available']} items available")
+    unit_price = float(listing.get("price") or 0)
+    if unit_price <= 0:
+        raise HTTPException(status_code=500, detail="Listing has no price configured")
 
-    await database.execute(
-        "UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid",
-        {"amt": total, "uid": shopper_id},
-    )
+    item_amount = round(unit_price * quantity, 2)
+    total = round(item_amount + req.delivery_fee, 2)
 
-    now = datetime.utcnow()
+    available = listing.get("quantity_available")
+    if available is not None and available < quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only {available} items available",
+        )
+
+    now = datetime.now(timezone.utc)
     expires_at = now + timedelta(hours=window_hours)
 
-    query = """
-    INSERT INTO escrow (
-        order_id, shopper_id, storekeeper_id, courier_id,
-        listing_id, quantity, item_amount, delivery_fee, total_amount,
-        status, expires_at, created_at
-    )
-    VALUES (
-        :order_id, :shopper_id, :storekeeper_id, :courier_id,
-        :listing_id, :quantity, :item_amount, :delivery_fee, :total_amount,
-        'locked', :expires_at, :created_at
-    )
-    """
-    await database.execute(query, {
-        "order_id": req.order_id,
-        "shopper_id": shopper_id,
-        "storekeeper_id": req.storekeeper_id,
-        "courier_id": req.courier_id,
-        "listing_id": req.listing_id,
-        "quantity": quantity,
-        "item_amount": float(req.item_amount),
-        "delivery_fee": float(req.delivery_fee),
-        "total_amount": float(total),
-        "expires_at": expires_at,
-        "created_at": now,
-    })
+    try:
+        async with database.transaction():
+            existing = await database.fetch_one(
+                "SELECT 1 AS x FROM escrow WHERE order_id = :oid",
+                {"oid": req.order_id},
+            )
+            if existing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Order {req.order_id} already reserved",
+                )
 
-    await _log_wallet_transaction(
-        user_id=shopper_id,
-        amount=total,
-        type='debit',
-        description=f"Reservation ({quantity} item{'s' if quantity > 1 else ''}, {window_hours}h window)",
-        reference=req.order_id,
-    )
+            debit = await database.execute(
+                "UPDATE wallets SET balance = balance - :amt "
+                "WHERE user_id = :uid AND balance >= :amt",
+                {"amt": total, "uid": shopper_id},
+            )
+            if not _update_won(debit):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Insufficient balance",
+                )
 
-    asyncio.create_task(send_push_to_user(
-        req.storekeeper_id,
+            if available is not None:
+                stock = await database.execute(
+                    "UPDATE listings SET quantity_available = quantity_available - :qty "
+                    "WHERE listing_id = :lid AND quantity_available >= :qty",
+                    {"qty": quantity, "lid": req.listing_id},
+                )
+                if not _update_won(stock):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Item just sold out. Please try again.",
+                    )
+
+            await database.execute(
+                """
+                INSERT INTO escrow (
+                    order_id, shopper_id, storekeeper_id, courier_id,
+                    listing_id, quantity, item_amount, delivery_fee, total_amount,
+                    status, expires_at, created_at
+                )
+                VALUES (
+                    :order_id, :shopper_id, :storekeeper_id, NULL,
+                    :listing_id, :quantity, :item_amount, :delivery_fee, :total_amount,
+                    'locked', :expires_at, :created_at
+                )
+                """,
+                {
+                    "order_id": req.order_id,
+                    "shopper_id": shopper_id,
+                    "storekeeper_id": store_owner_id,
+                    "listing_id": req.listing_id,
+                    "quantity": quantity,
+                    "item_amount": item_amount,
+                    "delivery_fee": float(req.delivery_fee),
+                    "total_amount": total,
+                    "expires_at": expires_at,
+                    "created_at": now,
+                },
+            )
+
+            await _log_wallet_transaction(
+                user_id=shopper_id,
+                amount=total,
+                type="debit",
+                description=(
+                    f"Reservation ({quantity} item{'s' if quantity > 1 else ''}, "
+                    f"{window_hours}h window)"
+                ),
+                reference=req.order_id,
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("reserve failed order=%s user=%s", req.order_id, shopper_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create reservation. Please try again.",
+        )
+
+    _fire_and_forget(send_push_to_user(
+        store_owner_id,
         "New Reservation!",
-        f"A shopper reserved {quantity} item{'s' if quantity > 1 else ''}. Order #{req.order_id[:8]}",
+        (
+            f"A shopper reserved {quantity} item"
+            f"{'s' if quantity > 1 else ''}. Order #{req.order_id[:8]}"
+        ),
         {"order_id": req.order_id},
     ))
 
@@ -398,52 +541,79 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
         "message": "Funds reserved",
     }
 
-# ---------- Accept Reservation ----------
-# ✅ Storekeeper-only. Flips locked → accepted. No wallet mutation.
+# ---------------------------------------------------------------------------
+# Accept Reservation
+# ---------------------------------------------------------------------------
+
 @router.post("/accept")
-async def accept_reservation(req: AcceptRequest, current_user: dict = Depends(get_current_user)):
+async def accept_reservation(
+    req: AcceptRequest,
+    current_user: dict = Depends(get_current_user),
+):
     user_id = current_user["id"]
     escrow = await database.fetch_one(
-        "SELECT * FROM escrow WHERE order_id = :oid", {"oid": req.order_id}
+        "SELECT shopper_id, storekeeper_id, status FROM escrow WHERE order_id = :oid",
+        {"oid": req.order_id},
     )
     if not escrow:
         raise HTTPException(status_code=404, detail="Order not found")
     if escrow["storekeeper_id"] != user_id:
-        raise HTTPException(status_code=403, detail="You are not the storekeeper for this order")
+        raise HTTPException(
+            status_code=403,
+            detail="You are not the storekeeper for this order",
+        )
     if escrow["status"] != "locked":
-        raise HTTPException(status_code=400, detail="Order is not in a reservable state (status must be 'locked')")
+        raise HTTPException(
+            status_code=400,
+            detail="Order is not in a reservable state (status must be 'locked')",
+        )
 
     result = await database.execute(
-        "UPDATE escrow SET status = 'accepted' WHERE order_id = :oid AND status = 'locked'",
+        "UPDATE escrow SET status = 'accepted' "
+        "WHERE order_id = :oid AND status = 'locked'",
         {"oid": req.order_id},
     )
     if not _update_won(result):
-        return {"order_id": req.order_id, "status": "accepted", "message": "Already accepted."}
+        return {
+            "order_id": req.order_id,
+            "status": "accepted",
+            "message": "Already accepted.",
+        }
 
-    await send_push_to_user(
+    _fire_and_forget(send_push_to_user(
         escrow["shopper_id"],
         "Reservation Accepted!",
         f"Your order #{req.order_id[:8]} has been accepted by the storekeeper.",
         {"order_id": req.order_id},
-    )
+    ))
 
-    return {"order_id": req.order_id, "status": "accepted", "message": "Reservation accepted"}
+    return {
+        "order_id": req.order_id,
+        "status": "accepted",
+        "message": "Reservation accepted",
+    }
 
-# ---------- Decline Reservation ----------
-# ✅ NEW — storekeeper-only. Flips locked → declined, refunds the shopper.
-#    Only valid on 'locked' — once the storekeeper has accepted, they've
-#    committed; declining after that is a support case, not a button.
-#    Atomic flip first, refund only if this caller won the race.
+# ---------------------------------------------------------------------------
+# Decline Reservation
+# ---------------------------------------------------------------------------
+
 @router.post("/decline")
-async def decline_reservation(req: DeclineRequest, current_user: dict = Depends(get_current_user)):
+async def decline_reservation(
+    req: DeclineRequest,
+    current_user: dict = Depends(get_current_user),
+):
     user_id = current_user["id"]
     escrow = await database.fetch_one(
-        "SELECT * FROM escrow WHERE order_id = :oid", {"oid": req.order_id}
+        "SELECT * FROM escrow WHERE order_id = :oid",
+        {"oid": req.order_id},
     )
     if not escrow:
         raise HTTPException(status_code=404, detail="Order not found")
     if escrow["storekeeper_id"] != user_id:
-        raise HTTPException(status_code=403, detail="You are not the storekeeper for this order")
+        raise HTTPException(
+            status_code=403,
+            detail="You are not the storekeeper for this order",
+        )
 
     current_status = (escrow["status"] or "").lower()
     if current_status != "locked":
@@ -451,59 +621,73 @@ async def decline_reservation(req: DeclineRequest, current_user: dict = Depends(
             status_code=400,
             detail=(
                 f"Cannot decline a reservation with status '{current_status}'. "
-                "Only pending reservations can be declined. If you've already "
-                "held the item, contact support."
+                "Only pending reservations can be declined."
             ),
         )
 
-    # Optional reason — cap at 500 chars to prevent abuse.
     reason = (req.reason or "").strip()
-    if len(reason) > 500:
-        raise HTTPException(status_code=400, detail="Reason too long (max 500 characters)")
-
     shopper_id = escrow["shopper_id"]
     total = float(escrow["total_amount"] or 0)
+    listing_id = escrow["listing_id"]
+    qty = escrow["quantity"] or 0
     short = req.order_id[:8]
-    now = datetime.utcnow()
-
-    # ✅ Atomic flip FIRST. Refund only if we won the race.
-    result = await database.execute(
-        "UPDATE escrow SET status = 'declined' WHERE order_id = :oid AND status = 'locked'",
-        {"oid": req.order_id},
-    )
-    if not _update_won(result):
-        return {
-            "order_id": req.order_id,
-            "status": "declined",
-            "refunded": 0,
-            "reason": reason or None,
-            "message": "Reservation was already processed.",
-        }
 
     refunded = 0.0
-    if total > 0 and shopper_id:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": total, "uid": shopper_id},
-        )
-        refunded = total
-        audit_desc = f"Refund: reservation {short} declined by store"
-        if reason:
-            audit_desc += f" — {reason}"
-        await _log_wallet_transaction(
-            user_id=shopper_id,
-            amount=total,
-            type='credit',
-            description=audit_desc,
-            reference=f"decline:{req.order_id}",
-        )
 
-    # Push to shopper — includes the reason when provided.
-    notify_body = f"Your order #{short} couldn't be fulfilled. ₦{refunded:,.0f} has been refunded to your wallet."
+    try:
+        async with database.transaction():
+            result = await database.execute(
+                "UPDATE escrow SET status = 'declined' "
+                "WHERE order_id = :oid AND status = 'locked'",
+                {"oid": req.order_id},
+            )
+            if not _update_won(result):
+                return {
+                    "order_id": req.order_id,
+                    "status": "declined",
+                    "refunded": 0,
+                    "reason": reason or None,
+                    "message": "Reservation was already processed.",
+                }
+
+            # Restore stock (mirrors the decrement in /reserve).
+            if listing_id and qty:
+                await database.execute(
+                    "UPDATE listings SET quantity_available = quantity_available + :qty "
+                    "WHERE listing_id = :lid AND quantity_available IS NOT NULL",
+                    {"qty": qty, "lid": listing_id},
+                )
+
+            if total > 0 and shopper_id:
+                await database.execute(
+                    "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+                    {"amt": total, "uid": shopper_id},
+                )
+                refunded = total
+                audit_desc = f"Refund: reservation {short} declined by store"
+                if reason:
+                    audit_desc += f" — {reason}"
+                await _log_wallet_transaction(
+                    user_id=shopper_id,
+                    amount=total,
+                    type="credit",
+                    description=audit_desc,
+                    reference=f"decline:{req.order_id}",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("decline failed order=%s", req.order_id)
+        raise HTTPException(status_code=500, detail="Could not decline reservation.")
+
+    notify_body = (
+        f"Your order #{short} couldn't be fulfilled. "
+        f"₦{refunded:,.0f} has been refunded to your wallet."
+    )
     if reason:
         notify_body += f" Reason: {reason}"
 
-    asyncio.create_task(send_push_to_user(
+    _fire_and_forget(send_push_to_user(
         shopper_id,
         "Reservation Declined",
         notify_body,
@@ -522,173 +706,253 @@ async def decline_reservation(req: DeclineRequest, current_user: dict = Depends(
         ),
     }
 
-# ---------- Confirm ----------
-# ⚠️ Shopper-only. Storekeepers calling this get 403. That's by design.
+# ---------------------------------------------------------------------------
+# Confirm (shopper releases escrow)
+# ---------------------------------------------------------------------------
+
 @router.post("/confirm")
 async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
     escrow = await database.fetch_one(
-        "SELECT * FROM escrow WHERE order_id = :oid", {"oid": req.order_id}
+        "SELECT * FROM escrow WHERE order_id = :oid",
+        {"oid": req.order_id},
     )
     if not escrow:
         raise HTTPException(status_code=404, detail="Order not found")
     if escrow["shopper_id"] != shopper_id:
-        raise HTTPException(status_code=403, detail="You can only confirm your own orders")
+        raise HTTPException(
+            status_code=403,
+            detail="You can only confirm your own orders",
+        )
     if escrow["status"] not in ("accepted", "locked"):
-        raise HTTPException(status_code=400, detail="Order is not in a confirmable state")
+        raise HTTPException(
+            status_code=400,
+            detail="Order is not in a confirmable state",
+        )
 
-    item_amount = float(escrow["item_amount"])
-    delivery_fee = float(escrow["delivery_fee"])
+    item_amount = float(escrow["item_amount"] or 0)
+    delivery_fee = float(escrow["delivery_fee"] or 0)
     courier_id = escrow["courier_id"]
     storekeeper_id = escrow["storekeeper_id"]
 
-    result = await database.execute(
-        "UPDATE escrow SET status = 'picked_up' WHERE order_id = :oid AND status IN ('accepted', 'locked')",
-        {"oid": req.order_id},
-    )
-    if not _update_won(result):
-        return {"order_id": req.order_id, "status": "picked_up", "message": "Order was already processed."}
+    # Refuse to pay a party to themselves.
+    if courier_id in (shopper_id, storekeeper_id):
+        courier_id = None
 
-    if item_amount > 0:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": item_amount, "uid": storekeeper_id},
-        )
-        await _log_wallet_transaction(
-            user_id=storekeeper_id,
-            amount=item_amount,
-            type='credit',
-            description=f"Order #{req.order_id[:8]} picked up",
-            reference=f"{req.order_id}:storekeeper",
-        )
+    try:
+        async with database.transaction():
+            result = await database.execute(
+                "UPDATE escrow SET status = 'picked_up' "
+                "WHERE order_id = :oid AND status IN ('accepted', 'locked')",
+                {"oid": req.order_id},
+            )
+            if not _update_won(result):
+                return {
+                    "order_id": req.order_id,
+                    "status": "picked_up",
+                    "message": "Order was already processed.",
+                }
 
-    if delivery_fee > 0 and courier_id:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": delivery_fee, "uid": courier_id},
-        )
-        await _log_wallet_transaction(
-            user_id=courier_id,
-            amount=delivery_fee,
-            type='credit',
-            description=f"Delivery fee for #{req.order_id[:8]}",
-            reference=f"{req.order_id}:courier",
-        )
+            if item_amount > 0:
+                await database.execute(
+                    "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+                    {"amt": item_amount, "uid": storekeeper_id},
+                )
+                await _log_wallet_transaction(
+                    user_id=storekeeper_id,
+                    amount=item_amount,
+                    type="credit",
+                    description=f"Order #{req.order_id[:8]} picked up",
+                    reference=f"{req.order_id}:storekeeper",
+                )
 
-    return {"order_id": req.order_id, "status": "picked_up", "message": "Order marked as picked up. Funds released."}
+            if delivery_fee > 0 and courier_id:
+                await database.execute(
+                    "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+                    {"amt": delivery_fee, "uid": courier_id},
+                )
+                await _log_wallet_transaction(
+                    user_id=courier_id,
+                    amount=delivery_fee,
+                    type="credit",
+                    description=f"Delivery fee for #{req.order_id[:8]}",
+                    reference=f"{req.order_id}:courier",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("confirm failed order=%s", req.order_id)
+        raise HTTPException(status_code=500, detail="Could not confirm order.")
 
-# ---------- Dispatch ----------
+    return {
+        "order_id": req.order_id,
+        "status": "picked_up",
+        "message": "Order marked as picked up. Funds released.",
+    }
+
+# ---------------------------------------------------------------------------
+# Dispatch (shopper releases escrow before pickup)
+# ---------------------------------------------------------------------------
+
 @router.post("/dispatch")
 async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
     escrow = await database.fetch_one(
-        "SELECT * FROM escrow WHERE order_id = :oid", {"oid": req.order_id}
+        "SELECT * FROM escrow WHERE order_id = :oid",
+        {"oid": req.order_id},
     )
     if not escrow:
         raise HTTPException(status_code=404, detail="Order not found")
     if escrow["shopper_id"] != shopper_id:
         raise HTTPException(status_code=403, detail="Only the shopper can dispatch")
     if escrow["status"] not in ("accepted", "locked"):
-        raise HTTPException(status_code=400, detail="Order must be accepted or locked to dispatch")
+        raise HTTPException(
+            status_code=400,
+            detail="Order must be accepted or locked to dispatch",
+        )
 
-    item_amount = float(escrow["item_amount"])
-    delivery_fee = float(escrow["delivery_fee"])
+    item_amount = float(escrow["item_amount"] or 0)
+    delivery_fee = float(escrow["delivery_fee"] or 0)
     courier_id = escrow["courier_id"]
     storekeeper_id = escrow["storekeeper_id"]
 
-    result = await database.execute(
-        "UPDATE escrow SET status = 'dispatched' WHERE order_id = :oid AND status IN ('accepted', 'locked')",
-        {"oid": req.order_id},
-    )
-    if not _update_won(result):
-        return {"order_id": req.order_id, "status": "dispatched", "message": "Order was already processed."}
+    if courier_id in (shopper_id, storekeeper_id):
+        courier_id = None
 
-    if item_amount > 0:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": item_amount, "uid": storekeeper_id},
-        )
-        await _log_wallet_transaction(
-            user_id=storekeeper_id,
-            amount=item_amount,
-            type='credit',
-            description=f"Order #{req.order_id[:8]} dispatched",
-            reference=f"{req.order_id}:storekeeper",
-        )
+    try:
+        async with database.transaction():
+            result = await database.execute(
+                "UPDATE escrow SET status = 'dispatched' "
+                "WHERE order_id = :oid AND status IN ('accepted', 'locked')",
+                {"oid": req.order_id},
+            )
+            if not _update_won(result):
+                return {
+                    "order_id": req.order_id,
+                    "status": "dispatched",
+                    "message": "Order was already processed.",
+                }
 
-    if delivery_fee > 0 and courier_id:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": delivery_fee, "uid": courier_id},
-        )
-        await _log_wallet_transaction(
-            user_id=courier_id,
-            amount=delivery_fee,
-            type='credit',
-            description=f"Delivery fee for #{req.order_id[:8]}",
-            reference=f"{req.order_id}:courier",
-        )
+            if item_amount > 0:
+                await database.execute(
+                    "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+                    {"amt": item_amount, "uid": storekeeper_id},
+                )
+                await _log_wallet_transaction(
+                    user_id=storekeeper_id,
+                    amount=item_amount,
+                    type="credit",
+                    description=f"Order #{req.order_id[:8]} dispatched",
+                    reference=f"{req.order_id}:storekeeper",
+                )
 
-    return {"order_id": req.order_id, "status": "dispatched", "message": "Order dispatched. Funds released."}
+            if delivery_fee > 0 and courier_id:
+                await database.execute(
+                    "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+                    {"amt": delivery_fee, "uid": courier_id},
+                )
+                await _log_wallet_transaction(
+                    user_id=courier_id,
+                    amount=delivery_fee,
+                    type="credit",
+                    description=f"Delivery fee for #{req.order_id[:8]}",
+                    reference=f"{req.order_id}:courier",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("dispatch failed order=%s", req.order_id)
+        raise HTTPException(status_code=500, detail="Could not dispatch order.")
 
-# ---------- Return ----------
+    return {
+        "order_id": req.order_id,
+        "status": "dispatched",
+        "message": "Order dispatched. Funds released.",
+    }
+
+# ---------------------------------------------------------------------------
+# Return
+# ---------------------------------------------------------------------------
+
 @router.post("/return")
 async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
     shopper_id = current_user["id"]
     escrow = await database.fetch_one(
-        "SELECT * FROM escrow WHERE order_id = :oid", {"oid": req.order_id}
+        "SELECT * FROM escrow WHERE order_id = :oid",
+        {"oid": req.order_id},
     )
     if not escrow:
         raise HTTPException(status_code=404, detail="Order not found")
     if escrow["shopper_id"] != shopper_id:
         raise HTTPException(status_code=403, detail="Only the shopper can return")
     if escrow["status"] not in ("locked", "accepted"):
-        raise HTTPException(status_code=400, detail="Order must be in 'locked' or 'accepted' state to return")
-
-    escrow_d = dict(escrow)
-    listing_id = escrow_d.get("listing_id")
-    quantity = escrow_d.get("quantity")
-    item_amount = float(escrow["item_amount"])
-
-    result = await database.execute(
-        "UPDATE escrow SET status = 'returned' WHERE order_id = :oid AND status IN ('locked', 'accepted')",
-        {"oid": req.order_id},
-    )
-    if not _update_won(result):
-        return {"order_id": req.order_id, "status": "returned", "message": "Order was already processed."}
-
-    if listing_id and quantity:
-        listing = await database.fetch_one(
-            "SELECT quantity_available FROM listings WHERE listing_id = :lid",
-            {"lid": listing_id},
+        raise HTTPException(
+            status_code=400,
+            detail="Order must be in 'locked' or 'accepted' state to return",
         )
-        if listing and listing["quantity_available"] is not None:
-            await database.execute(
-                "UPDATE listings SET quantity_available = quantity_available + :qty WHERE listing_id = :lid",
-                {"qty": quantity, "lid": listing_id},
+
+    listing_id = escrow["listing_id"]
+    quantity = escrow["quantity"] or 0
+    item_amount = float(escrow["item_amount"] or 0)
+
+    try:
+        async with database.transaction():
+            result = await database.execute(
+                "UPDATE escrow SET status = 'returned' "
+                "WHERE order_id = :oid AND status IN ('locked', 'accepted')",
+                {"oid": req.order_id},
             )
+            if not _update_won(result):
+                return {
+                    "order_id": req.order_id,
+                    "status": "returned",
+                    "message": "Order was already processed.",
+                }
 
-    if item_amount > 0:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": item_amount, "uid": escrow["shopper_id"]},
-        )
-        await _log_wallet_transaction(
-            user_id=escrow["shopper_id"],
-            amount=item_amount,
-            type='credit',
-            description=f"Refund for order #{req.order_id[:8]}",
-            reference=f"{req.order_id}:refund",
-        )
+            if listing_id and quantity:
+                await database.execute(
+                    "UPDATE listings SET quantity_available = quantity_available + :qty "
+                    "WHERE listing_id = :lid AND quantity_available IS NOT NULL",
+                    {"qty": quantity, "lid": listing_id},
+                )
 
-    return {"order_id": req.order_id, "status": "returned", "message": "Item cost refunded. Stock restored."}
+            if item_amount > 0:
+                await database.execute(
+                    "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+                    {"amt": item_amount, "uid": shopper_id},
+                )
+                await _log_wallet_transaction(
+                    user_id=shopper_id,
+                    amount=item_amount,
+                    type="credit",
+                    description=f"Refund for order #{req.order_id[:8]}",
+                    reference=f"{req.order_id}:refund",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("return failed order=%s", req.order_id)
+        raise HTTPException(status_code=500, detail="Could not process return.")
 
-# ---------- Reversed Package ----------
+    return {
+        "order_id": req.order_id,
+        "status": "returned",
+        "message": "Item cost refunded. Stock restored.",
+    }
+
+# ---------------------------------------------------------------------------
+# Reversed Package
+# ---------------------------------------------------------------------------
+
 @router.post("/reversed-package")
-async def reversed_package(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
+async def reversed_package(
+    req: ConfirmRequest,
+    current_user: dict = Depends(get_current_user),
+):
     storekeeper_id = current_user["id"]
     escrow = await database.fetch_one(
-        "SELECT * FROM escrow WHERE order_id = :oid", {"oid": req.order_id}
+        "SELECT * FROM escrow WHERE order_id = :oid",
+        {"oid": req.order_id},
     )
     if not escrow:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -697,32 +961,55 @@ async def reversed_package(req: ConfirmRequest, current_user: dict = Depends(get
     if escrow["status"] != "returned":
         raise HTTPException(status_code=400, detail="Order not in returned state")
 
-    delivery_fee = float(escrow["delivery_fee"])
+    delivery_fee = float(escrow["delivery_fee"] or 0)
     courier_id = escrow["courier_id"]
+    shopper_id = escrow["shopper_id"]
 
-    result = await database.execute(
-        "UPDATE escrow SET status = 'reversed' WHERE order_id = :oid AND status = 'returned'",
-        {"oid": req.order_id},
-    )
-    if not _update_won(result):
-        return {"order_id": req.order_id, "status": "reversed", "message": "Already reversed."}
+    if courier_id in (storekeeper_id, shopper_id):
+        courier_id = None
 
-    if delivery_fee > 0 and courier_id:
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": delivery_fee, "uid": courier_id},
-        )
-        await _log_wallet_transaction(
-            user_id=courier_id,
-            amount=delivery_fee,
-            type='credit',
-            description=f"Reversed package fee for #{req.order_id[:8]}",
-            reference=f"{req.order_id}:reversed",
-        )
+    try:
+        async with database.transaction():
+            result = await database.execute(
+                "UPDATE escrow SET status = 'reversed' "
+                "WHERE order_id = :oid AND status = 'returned'",
+                {"oid": req.order_id},
+            )
+            if not _update_won(result):
+                return {
+                    "order_id": req.order_id,
+                    "status": "reversed",
+                    "message": "Already reversed.",
+                }
 
-    return {"order_id": req.order_id, "status": "reversed", "message": "Courier fee released"}
+            if delivery_fee > 0 and courier_id:
+                await database.execute(
+                    "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
+                    {"amt": delivery_fee, "uid": courier_id},
+                )
+                await _log_wallet_transaction(
+                    user_id=courier_id,
+                    amount=delivery_fee,
+                    type="credit",
+                    description=f"Reversed package fee for #{req.order_id[:8]}",
+                    reference=f"{req.order_id}:reversed",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("reversed_package failed order=%s", req.order_id)
+        raise HTTPException(status_code=500, detail="Could not process reversal.")
 
-# ---------- Get Escrows ----------
+    return {
+        "order_id": req.order_id,
+        "status": "reversed",
+        "message": "Courier fee released",
+    }
+
+# ---------------------------------------------------------------------------
+# Reads
+# ---------------------------------------------------------------------------
+
 @router.get("/escrows")
 async def get_escrows(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
@@ -732,7 +1019,7 @@ async def get_escrows(current_user: dict = Depends(get_current_user)):
     )
     return [dict(row) for row in rows]
 
-# ---------- Get Orders ----------
+
 @router.get("/orders")
 async def get_orders(
     current_user: dict = Depends(get_current_user),
@@ -771,9 +1058,12 @@ async def get_orders(
     rows = await database.fetch_all(query, params)
     return [dict(row) for row in rows]
 
-# ---------- Get Order Detail ----------
+
 @router.get("/order/{order_id}")
-async def get_order_detail(order_id: str, current_user: dict = Depends(get_current_user)):
+async def get_order_detail(
+    order_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     order = await database.fetch_one(
         """
         SELECT e.*,
@@ -801,10 +1091,10 @@ async def get_order_detail(order_id: str, current_user: dict = Depends(get_curre
                l.image_url        AS listing_image_url,
                l.category         AS listing_category
         FROM escrow e
-        LEFT JOIN users    u ON e.shopper_id     = u.id
+        LEFT JOIN users    u  ON e.shopper_id     = u.id
         LEFT JOIN users    sk ON e.storekeeper_id = sk.id
-        LEFT JOIN listings l ON e.listing_id      = l.listing_id
-        LEFT JOIN stores   s ON l.store_id        = s.store_id
+        LEFT JOIN listings l  ON e.listing_id     = l.listing_id
+        LEFT JOIN stores   s  ON l.store_id       = s.store_id
         WHERE e.order_id = :oid
         """,
         {"oid": order_id},
@@ -818,11 +1108,11 @@ async def get_order_detail(order_id: str, current_user: dict = Depends(get_curre
 
     return dict(order)
 
-# ---------- Get Wallet Transactions ----------
+
 @router.get("/transactions")
 async def get_wallet_transactions(
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0, le=100_000),
     current_user: dict = Depends(get_current_user),
 ):
     user_id = current_user["id"]
@@ -838,11 +1128,20 @@ async def get_wallet_transactions(
     )
     return [dict(row) for row in rows]
 
-# ---------- Schedule Reminder ----------
-async def schedule_reminder(user_id: str, order_id: str, delay_seconds: float, fraction: float):
+# ---------------------------------------------------------------------------
+# Reminder (currently unused — kept for compatibility)
+# ---------------------------------------------------------------------------
+
+async def schedule_reminder(
+    user_id: str,
+    order_id: str,
+    delay_seconds: float,
+    fraction: float,
+):
     await asyncio.sleep(delay_seconds)
     escrow = await database.fetch_one(
-        "SELECT status FROM escrow WHERE order_id = :oid", {"oid": order_id}
+        "SELECT status FROM escrow WHERE order_id = :oid",
+        {"oid": order_id},
     )
     if escrow and escrow["status"] in ("locked", "accepted"):
         await send_push_to_user(
