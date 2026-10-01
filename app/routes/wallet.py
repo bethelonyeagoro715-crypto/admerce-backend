@@ -11,13 +11,12 @@ from app.db.database import database
 from app.utils.security import get_current_user
 from app.routes.notifications import send_push_to_user
 
-# NOTE: hash_password / verify_password should live in app.utils.security.
-# Importing from a route module creates a hidden wallet→auth coupling.
 from app.routes.auth import hash_password, verify_password
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/wallet", tags=["Wallet"])
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -30,22 +29,25 @@ class ReserveRequest(BaseModel):
     quantity: int = Field(1, ge=1, le=1000)
     delivery_fee: float = Field(0.0, ge=0, le=50_000)
     pickup_window_hours: int = 3
-    # courier_id is intentionally NOT accepted from the client.
-    # Courier assignment must come from a dedicated dispatch flow.
+
 
 class ConfirmRequest(BaseModel):
     order_id: str = Field(..., min_length=1, max_length=128)
 
+
 class AcceptRequest(BaseModel):
     order_id: str = Field(..., min_length=1, max_length=128)
+
 
 class DeclineRequest(BaseModel):
     order_id: str = Field(..., min_length=1, max_length=128)
     reason: Optional[str] = Field(None, max_length=500)
 
+
 class SetPinRequest(BaseModel):
     pin: str = Field(..., min_length=4, max_length=6, pattern=r"^\d{4,6}$")
     current_pin: Optional[str] = Field(None, min_length=4, max_length=6)
+
 
 class WithdrawRequest(BaseModel):
     amount: float = Field(..., gt=0, le=10_000_000)
@@ -54,11 +56,12 @@ class WithdrawRequest(BaseModel):
     pin: str = Field(..., min_length=4, max_length=6)
     idempotency_key: Optional[str] = Field(None, max_length=64)
 
+
 class InstantPickupRequest(BaseModel):
     listing_id: str = Field(..., min_length=1, max_length=128)
     storekeeper_id: str = Field(..., min_length=1, max_length=128)
     quantity: int = Field(1, ge=1, le=1000)
-    # amount is intentionally NOT accepted from the client.
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,7 +71,6 @@ _background_tasks: set = set()
 
 
 def _fire_and_forget(coro) -> None:
-    """Schedule a background coroutine, holding a reference so it isn't GC'd."""
     async def _run():
         try:
             await coro
@@ -83,11 +85,6 @@ def _fire_and_forget(coro) -> None:
 
 
 def _update_won(result) -> bool:
-    """Return True if the last UPDATE/INSERT/DELETE matched at least one row.
-
-    `databases.execute` returns a status string like 'UPDATE 1' for asyncpg,
-    'INSERT 0 1' for inserts, or a plain int for some drivers.
-    """
     if isinstance(result, int):
         return result > 0
     if isinstance(result, str):
@@ -155,12 +152,6 @@ async def create_wallet(current_user: dict = Depends(get_current_user)):
 
 @router.post("/topup")
 async def topup(current_user: dict = Depends(get_current_user)):
-    """
-    REMOVED. This endpoint used to credit the caller's wallet for any
-    client-supplied amount with no payment verification — a free-money
-    printer. All top-ups must go through /payments/verify after a real
-    Paystack checkout completes.
-    """
     raise HTTPException(
         status_code=410,
         detail=(
@@ -204,7 +195,6 @@ async def set_pin(req: SetPinRequest, current_user: dict = Depends(get_current_u
 
     existing_pin = wallet["withdrawal_pin"]
     if existing_pin:
-        # Changing an existing PIN requires the current PIN.
         if not req.current_pin or not verify_password(req.current_pin, existing_pin):
             raise HTTPException(status_code=403, detail="Current PIN is incorrect")
 
@@ -218,9 +208,6 @@ async def set_pin(req: SetPinRequest, current_user: dict = Depends(get_current_u
 # ---------------------------------------------------------------------------
 # Withdraw
 # ---------------------------------------------------------------------------
-# ⚠️ STILL LEDGER-ONLY. Paystack Transfers is NOT integrated. The response
-# copy below has been changed from "Withdrawal successful" to a "pending"
-# message so the API stops claiming money moved when it did not.
 
 @router.post("/withdraw")
 async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_current_user)):
@@ -241,9 +228,6 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
             detail="Withdrawal PIN not set. Please set a PIN first.",
         )
 
-    # NOTE: no per-user rate limit / lockout yet. A 4–6 digit PIN is
-    # brute-forceable. Needs a `pin_attempts` table or Redis counter with
-    # a lockout after N failures. Flagged.
     if not verify_password(req.pin, withdrawal_pin):
         raise HTTPException(status_code=403, detail="Incorrect PIN")
 
@@ -251,8 +235,6 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
 
     try:
         async with database.transaction():
-            # Atomic debit — check + decrement in one statement, so two
-            # concurrent withdraws cannot both pass the balance check.
             result = await database.execute(
                 """
                 UPDATE wallets
@@ -544,6 +526,10 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
 # ---------------------------------------------------------------------------
 # Accept Reservation
 # ---------------------------------------------------------------------------
+# 🔒 FIXED: order_id is NOT unique in escrow — multi-store baskets create
+#    multiple rows sharing the same order_id. Scope the lookup to the
+#    caller's own row (storekeeper_id = caller). Previously this fetched an
+#    arbitrary row and rejected the legitimate owner with a 403.
 
 @router.post("/accept")
 async def accept_reservation(
@@ -551,17 +537,24 @@ async def accept_reservation(
     current_user: dict = Depends(get_current_user),
 ):
     user_id = current_user["id"]
+
     escrow = await database.fetch_one(
-        "SELECT shopper_id, storekeeper_id, status FROM escrow WHERE order_id = :oid",
-        {"oid": req.order_id},
+        "SELECT * FROM escrow WHERE order_id = :oid AND storekeeper_id = :uid",
+        {"oid": req.order_id, "uid": user_id},
     )
     if not escrow:
-        raise HTTPException(status_code=404, detail="Order not found")
-    if escrow["storekeeper_id"] != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You are not the storekeeper for this order",
+        # Distinguish "not your order" from "doesn't exist" for better UX.
+        exists = await database.fetch_one(
+            "SELECT 1 AS x FROM escrow WHERE order_id = :oid",
+            {"oid": req.order_id},
         )
+        if exists:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not the storekeeper for this order",
+            )
+        raise HTTPException(status_code=404, detail="Order not found")
+
     if escrow["status"] != "locked":
         raise HTTPException(
             status_code=400,
@@ -570,8 +563,8 @@ async def accept_reservation(
 
     result = await database.execute(
         "UPDATE escrow SET status = 'accepted' "
-        "WHERE order_id = :oid AND status = 'locked'",
-        {"oid": req.order_id},
+        "WHERE order_id = :oid AND storekeeper_id = :uid AND status = 'locked'",
+        {"oid": req.order_id, "uid": user_id},
     )
     if not _update_won(result):
         return {
@@ -596,6 +589,7 @@ async def accept_reservation(
 # ---------------------------------------------------------------------------
 # Decline Reservation
 # ---------------------------------------------------------------------------
+# 🔒 FIXED: same multi-store scoping as accept.
 
 @router.post("/decline")
 async def decline_reservation(
@@ -603,17 +597,22 @@ async def decline_reservation(
     current_user: dict = Depends(get_current_user),
 ):
     user_id = current_user["id"]
+
     escrow = await database.fetch_one(
-        "SELECT * FROM escrow WHERE order_id = :oid",
-        {"oid": req.order_id},
+        "SELECT * FROM escrow WHERE order_id = :oid AND storekeeper_id = :uid",
+        {"oid": req.order_id, "uid": user_id},
     )
     if not escrow:
-        raise HTTPException(status_code=404, detail="Order not found")
-    if escrow["storekeeper_id"] != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You are not the storekeeper for this order",
+        exists = await database.fetch_one(
+            "SELECT 1 AS x FROM escrow WHERE order_id = :oid",
+            {"oid": req.order_id},
         )
+        if exists:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not the storekeeper for this order",
+            )
+        raise HTTPException(status_code=404, detail="Order not found")
 
     current_status = (escrow["status"] or "").lower()
     if current_status != "locked":
@@ -638,8 +637,8 @@ async def decline_reservation(
         async with database.transaction():
             result = await database.execute(
                 "UPDATE escrow SET status = 'declined' "
-                "WHERE order_id = :oid AND status = 'locked'",
-                {"oid": req.order_id},
+                "WHERE order_id = :oid AND storekeeper_id = :uid AND status = 'locked'",
+                {"oid": req.order_id, "uid": user_id},
             )
             if not _update_won(result):
                 return {
@@ -650,7 +649,6 @@ async def decline_reservation(
                     "message": "Reservation was already processed.",
                 }
 
-            # Restore stock (mirrors the decrement in /reserve).
             if listing_id and qty:
                 await database.execute(
                     "UPDATE listings SET quantity_available = quantity_available + :qty "
@@ -672,7 +670,7 @@ async def decline_reservation(
                     amount=total,
                     type="credit",
                     description=audit_desc,
-                    reference=f"decline:{req.order_id}",
+                    reference=f"decline:{req.order_id}:{user_id[:8]}",
                 )
     except HTTPException:
         raise
@@ -709,6 +707,11 @@ async def decline_reservation(
 # ---------------------------------------------------------------------------
 # Confirm (shopper releases escrow)
 # ---------------------------------------------------------------------------
+# ⚠️  STILL BROKEN FOR MULTI-STORE ORDERS: this fetches an arbitrary row of
+#     the order and pays out only that store. For a two-store basket, the
+#     shopper needs to confirm pickup per-store. Fix requires an API contract
+#     change — the request must carry an order_store_id (or store_id) so we
+#     know WHICH row to confirm. Left as-is pending that decision.
 
 @router.post("/confirm")
 async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
@@ -735,7 +738,6 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
     courier_id = escrow["courier_id"]
     storekeeper_id = escrow["storekeeper_id"]
 
-    # Refuse to pay a party to themselves.
     if courier_id in (shopper_id, storekeeper_id):
         courier_id = None
 
@@ -763,7 +765,7 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
                     amount=item_amount,
                     type="credit",
                     description=f"Order #{req.order_id[:8]} picked up",
-                    reference=f"{req.order_id}:storekeeper",
+                    reference=f"{req.order_id}:{storekeeper_id[:8]}:storekeeper",
                 )
 
             if delivery_fee > 0 and courier_id:
@@ -776,7 +778,7 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
                     amount=delivery_fee,
                     type="credit",
                     description=f"Delivery fee for #{req.order_id[:8]}",
-                    reference=f"{req.order_id}:courier",
+                    reference=f"{req.order_id}:{storekeeper_id[:8]}:courier",
                 )
     except HTTPException:
         raise
@@ -791,8 +793,9 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
     }
 
 # ---------------------------------------------------------------------------
-# Dispatch (shopper releases escrow before pickup)
+# Dispatch
 # ---------------------------------------------------------------------------
+# ⚠️  Same multi-store caveat as confirm.
 
 @router.post("/dispatch")
 async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
@@ -843,7 +846,7 @@ async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current
                     amount=item_amount,
                     type="credit",
                     description=f"Order #{req.order_id[:8]} dispatched",
-                    reference=f"{req.order_id}:storekeeper",
+                    reference=f"{req.order_id}:{storekeeper_id[:8]}:storekeeper",
                 )
 
             if delivery_fee > 0 and courier_id:
@@ -856,7 +859,7 @@ async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current
                     amount=delivery_fee,
                     type="credit",
                     description=f"Delivery fee for #{req.order_id[:8]}",
-                    reference=f"{req.order_id}:courier",
+                    reference=f"{req.order_id}:{storekeeper_id[:8]}:courier",
                 )
     except HTTPException:
         raise
@@ -873,6 +876,7 @@ async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current
 # ---------------------------------------------------------------------------
 # Return
 # ---------------------------------------------------------------------------
+# ⚠️  Same multi-store caveat as confirm.
 
 @router.post("/return")
 async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
@@ -926,7 +930,7 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
                     amount=item_amount,
                     type="credit",
                     description=f"Refund for order #{req.order_id[:8]}",
-                    reference=f"{req.order_id}:refund",
+                    reference=f"{req.order_id}:{listing_id}:refund",
                 )
     except HTTPException:
         raise
@@ -943,6 +947,7 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
 # ---------------------------------------------------------------------------
 # Reversed Package
 # ---------------------------------------------------------------------------
+# 🔒 FIXED: same multi-store scoping as accept — this is storekeeper-initiated.
 
 @router.post("/reversed-package")
 async def reversed_package(
@@ -950,14 +955,23 @@ async def reversed_package(
     current_user: dict = Depends(get_current_user),
 ):
     storekeeper_id = current_user["id"]
+
     escrow = await database.fetch_one(
-        "SELECT * FROM escrow WHERE order_id = :oid",
-        {"oid": req.order_id},
+        "SELECT * FROM escrow WHERE order_id = :oid AND storekeeper_id = :uid",
+        {"oid": req.order_id, "uid": storekeeper_id},
     )
     if not escrow:
+        exists = await database.fetch_one(
+            "SELECT 1 AS x FROM escrow WHERE order_id = :oid",
+            {"oid": req.order_id},
+        )
+        if exists:
+            raise HTTPException(
+                status_code=403,
+                detail="Only the storekeeper can release",
+            )
         raise HTTPException(status_code=404, detail="Order not found")
-    if escrow["storekeeper_id"] != storekeeper_id:
-        raise HTTPException(status_code=403, detail="Only the storekeeper can release")
+
     if escrow["status"] != "returned":
         raise HTTPException(status_code=400, detail="Order not in returned state")
 
@@ -972,8 +986,8 @@ async def reversed_package(
         async with database.transaction():
             result = await database.execute(
                 "UPDATE escrow SET status = 'reversed' "
-                "WHERE order_id = :oid AND status = 'returned'",
-                {"oid": req.order_id},
+                "WHERE order_id = :oid AND storekeeper_id = :uid AND status = 'returned'",
+                {"oid": req.order_id, "uid": storekeeper_id},
             )
             if not _update_won(result):
                 return {
@@ -992,7 +1006,7 @@ async def reversed_package(
                     amount=delivery_fee,
                     type="credit",
                     description=f"Reversed package fee for #{req.order_id[:8]}",
-                    reference=f"{req.order_id}:reversed",
+                    reference=f"{req.order_id}:{storekeeper_id[:8]}:reversed",
                 )
     except HTTPException:
         raise
@@ -1053,7 +1067,7 @@ async def get_orders(
                 params[ph] = s
             query += f" AND e.status IN ({', '.join(placeholders)})"
 
-    query += " ORDER BY e.created_at DESC"
+    query += " ORDER BY e.created_at DESC NULLS LAST"
 
     rows = await database.fetch_all(query, params)
     return [dict(row) for row in rows]
@@ -1129,7 +1143,7 @@ async def get_wallet_transactions(
     return [dict(row) for row in rows]
 
 # ---------------------------------------------------------------------------
-# Reminder (currently unused — kept for compatibility)
+# Reminder (currently unused)
 # ---------------------------------------------------------------------------
 
 async def schedule_reminder(
