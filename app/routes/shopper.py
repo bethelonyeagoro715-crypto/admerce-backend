@@ -3,7 +3,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.db.database import database
 from app.utils import model, haversine
 from app.routes.auth import get_current_user, get_optional_user
@@ -17,9 +17,26 @@ MAX_PER_STORE = 5
 
 # ---------- Helper ----------
 def _to_datetime(value):
+    """
+    Coerce a DB value into a timezone-aware UTC datetime.
+
+    Always returns aware, even if the input is a naive datetime (from a
+    still-naive TIMESTAMP column) or a naive ISO string. This makes
+    subtraction with `datetime.now(timezone.utc)` safe regardless of
+    which side of the TIMESTAMPTZ migration the column is on.
+    """
+    if value is None:
+        return None
     if isinstance(value, datetime):
-        return value
-    return datetime.fromisoformat(value) if value else None
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except (ValueError, TypeError):
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _row_get(row, key):
@@ -105,7 +122,7 @@ async def real_feed(lat: float, lng: float):
         "SELECT l.*, s.name AS store_name FROM listings l "
         "JOIN stores s ON l.store_id = s.store_id "
     )
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     scored = []
     for row in rows:
         dist = haversine(lat, lng, row["lat"], row["lng"])
@@ -124,7 +141,6 @@ async def real_feed(lat: float, lng: float):
             "minutes_since_listed": round(mins, 1),
             "title_quality": row["title_quality"],
             "image_url": image_url,
-            # ✅ NEW — real image dimensions
             "image_width": _row_get(row, "image_width"),
             "image_height": _row_get(row, "image_height"),
             "store_name": row["store_name"] if "store_name" in row else row["store_id"],
@@ -240,7 +256,7 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
     if not req.candidate_ids:
         return {"feed": [], "total": 0, "model_used": model is not None}
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     id_params = {f"id_{i}": cid for i, cid in enumerate(req.candidate_ids)}
     placeholders = ",".join(f":{k}" for k in id_params.keys())
     rows = await database.fetch_all(
@@ -277,7 +293,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
                 "minutes_since_listed": round(mins, 1),
                 "title_quality": row["title_quality"] if row["title_quality"] is not None else 0.5,
                 "image_url": image_url,
-                # ✅ NEW — real image dimensions
                 "image_width": _row_get(row, "image_width"),
                 "image_height": _row_get(row, "image_height"),
                 "store_name": row["store_name"] if "store_name" in row else row["store_id"],
@@ -312,7 +327,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
             "minutes_since_listed": round(mins, 1),
             "title_quality": row["title_quality"],
             "image_url": image_url,
-            # ✅ NEW — real image dimensions
             "image_width": _row_get(row, "image_width"),
             "image_height": _row_get(row, "image_height"),
             "store_name": row["store_name"] if "store_name" in row else row["store_id"],
@@ -514,7 +528,7 @@ async def create_wanted_alert(
     if req.budget is not None and req.budget < 0:
         raise HTTPException(status_code=400, detail="Budget cannot be negative")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     expires_at = now + timedelta(days=30)
 
     row = await database.fetch_one(
@@ -591,7 +605,10 @@ async def get_provider_services(provider_id: str):
         "SELECT * FROM services WHERE provider_id = :pid",
         {"pid": provider_id}
     )
-    return rows
+    # FIXED: serialize Record objects to dicts. Previously returned
+    # `rows` raw, which FastAPI cannot JSON-encode → 500 on any non-empty
+    # result.
+    return [dict(row) for row in rows]
 
 
 # ── Helper for agentic SEAI search ───────────────────────────
