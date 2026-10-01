@@ -378,9 +378,13 @@ async def cancel_store_verification(
     }
 
 # ==================== CREATE LISTING ====================
+# 🔒 FIXED: added auth + store ownership check. Previously this route had NO
+#    auth dependency at all — any anonymous caller could create a listing on
+#    any store by supplying that store's store_id.
 @router.post("/listing")
 async def create_listing(
     request: Request,
+    current_user: dict = Depends(get_current_user),
     store_id: str = Form(...),
     title: str = Form(""),
     price: float = Form(...),
@@ -398,6 +402,16 @@ async def create_listing(
             detail=f"Invalid category: '{category}'. Valid categories are: tech_electronics, food_beverage, health_wellness, fashion_apparel, building_industrial, home_garden, kids_toys, sports_outdoors, automotive, media_office"
         )
 
+    # ── Ownership check: caller must own the store they're listing into.
+    existing_store = await database.fetch_one(
+        "SELECT store_id, owner_id FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
+    )
+    if not existing_store:
+        raise HTTPException(status_code=404, detail="Store not found. Please create a store first.")
+    if existing_store["owner_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You don't own this store")
+
     suggested_title = title
     suggested_category = ""
     if barcode:
@@ -408,8 +422,6 @@ async def create_listing(
             suggested_category = info["suggested_category"]
 
     # Process + upload image to Cloudinary, keeping raw bytes for the embedder.
-    # Also capture the exact pixel dimensions of the bytes we actually upload —
-    # this is what the masonry feed uses to size the card before render.
     image_url = None
     raw_image_bytes: bytes | None = None
     image_width: Optional[int] = None
@@ -430,18 +442,11 @@ async def create_listing(
                 except Exception as e2:
                     print(f"Upload error: {e2}")
 
-    existing_store = await database.fetch_one(
-        "SELECT store_id FROM stores WHERE store_id = :sid", {"sid": store_id}
-    )
-    if not existing_store:
-        raise HTTPException(status_code=404, detail="Store not found. Please create a store first.")
-
     listing_id = uuid.uuid4().hex[:8]
     final_title = suggested_title if suggested_title else title
     title_quality = compute_title_quality(final_title)
     created_at = datetime.utcnow()
 
-    # ── Generate the CLIP embedding from the raw bytes ─────────────
     embedding_json: str | None = None
     if raw_image_bytes:
         try:
@@ -532,9 +537,12 @@ async def upload_store_image(
     }
 
 # ==================== PREVIEW IMAGE ====================
+# 🔒 FIXED: added auth. Previously anonymous callers could pump arbitrary
+#    images through Cloudinary on the app's account — cost / storage abuse.
 @router.post("/preview-image")
 async def preview_image(
     request: Request,
+    current_user: dict = Depends(get_current_user),
     image: UploadFile = File(...),
     style: str = Form("warm"),
 ):
@@ -544,11 +552,17 @@ async def preview_image(
     return {"image_url": image_url}
 
 # ==================== SERVE UPLOADED FILES (legacy) ====================
+# 🔒 FIXED: path traversal. Previously `os.path.join(cwd, "uploads", file_path)`
+#    with a `..`-containing file_path could escape the uploads directory and
+#    serve arbitrary files (e.g. `.env`, source code).
 @router.get("/uploads/{file_path:path}")
 async def get_upload(file_path: str):
-    base_dir = os.getcwd()
-    filepath = os.path.join(base_dir, "uploads", file_path)
-    if os.path.exists(filepath):
+    base_dir = os.path.realpath(os.path.join(os.getcwd(), "uploads"))
+    filepath = os.path.realpath(os.path.join(base_dir, file_path))
+    # Must be inside base_dir (allows the dir itself, blocks "../")
+    if filepath != base_dir and not filepath.startswith(base_dir + os.sep):
+        raise HTTPException(status_code=404, detail="Image not found")
+    if os.path.isfile(filepath):
         return FileResponse(filepath)
     raise HTTPException(status_code=404, detail="Image not found")
 
@@ -604,14 +618,22 @@ async def update_item_order(
     return {"message": "Order updated"}
 
 # ==================== GET ORDERS FOR A STORE ====================
+# 🔒 FIXED: added auth + ownership check. Previously anonymous callers could
+#    enumerate any store's escrow rows (customer names, amounts, timestamps).
+#    This is the IDOR behind the "You are not the storekeeper" incident.
 @router.get("/orders/{store_id}")
-async def get_store_orders(store_id: str):
+async def get_store_orders(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     store = await database.fetch_one(
         "SELECT owner_id FROM stores WHERE store_id = :sid",
         {"sid": store_id}
     )
     if not store:
         raise HTTPException(status_code=404, detail="Store not found")
+    if store["owner_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not your store")
 
     owner_id = store["owner_id"]
 
@@ -621,7 +643,7 @@ async def get_store_orders(store_id: str):
         FROM escrow e
         LEFT JOIN users u ON e.shopper_id = u.id
         WHERE e.storekeeper_id = :owner_id
-        ORDER BY e.created_at DESC
+        ORDER BY e.created_at DESC NULLS LAST
     """
     rows = await database.fetch_all(query, {"owner_id": owner_id})
     return [dict(row) for row in rows]
