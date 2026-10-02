@@ -23,7 +23,7 @@ router = APIRouter(prefix="/wallet", tags=["Wallet"])
 
 
 # ---------------------------------------------------------------------------
-# In-process rate limiter (per-worker; replace with Redis for multi-worker)
+# Rate limiter
 # ---------------------------------------------------------------------------
 _rate_buckets: dict[str, list[float]] = {}
 
@@ -113,6 +113,40 @@ def _fire_and_forget(coro) -> None:
         logger.exception("Failed to schedule background task")
 
 
+async def notify_user(
+    user_id: str,
+    kind: str,
+    title: str,
+    body: str,
+    data: Optional[dict] = None,
+) -> None:
+    """
+    Write a user_notifications row and best-effort push. Failure is
+    non-fatal — the wallet operation must not fail because the notification
+    store is misconfigured.
+    """
+    try:
+        await database.execute(
+            """
+            INSERT INTO user_notifications
+                (user_id, kind, title, body, data, is_read, created_at)
+            VALUES
+                (:uid, :kind, :title, :body, :data, FALSE, NOW())
+            """,
+            {
+                "uid": user_id,
+                "kind": kind,
+                "title": title,
+                "body": body,
+                "data": json.dumps(data or {}),
+            },
+        )
+    except Exception as e:
+        logger.warning("user_notifications write failed user=%s kind=%s err=%s", user_id, kind, e)
+
+    _fire_and_forget(send_push_to_user(user_id, title, body, data or {}))
+
+
 async def _flip_escrow_status(
     order_id: str,
     from_status: str,
@@ -120,21 +154,12 @@ async def _flip_escrow_status(
     *,
     storekeeper_id: Optional[str] = None,
 ) -> bool:
-    """
-    Atomically transition escrow status. Returns True iff a row actually flipped.
-
-    Uses RETURNING 1 so the outcome does not depend on driver-specific
-    rowcount reporting.
-    """
     where = ["order_id = :oid", "status = :from_s"]
     params: dict = {"oid": order_id, "from_s": from_status, "to_s": to_status}
     if storekeeper_id is not None:
         where.append("storekeeper_id = :skid")
         params["skid"] = storekeeper_id
-    sql = (
-        f"UPDATE escrow SET status = :to_s "
-        f"WHERE {' AND '.join(where)} RETURNING 1"
-    )
+    sql = f"UPDATE escrow SET status = :to_s WHERE {' AND '.join(where)} RETURNING 1"
     row = await database.fetch_val(sql, params)
     return row is not None
 
@@ -144,12 +169,6 @@ async def _pick_escrow_row(
     shopper_id: str,
     order_store_id: Optional[int],
 ) -> dict:
-    """
-    Resolve the correct escrow row for a shopper-side action.
-
-    Multi-store orders share order_id. If more than one row exists, the
-    caller must supply order_store_id.
-    """
     rows = await database.fetch_all(
         "SELECT * FROM escrow WHERE order_id = :oid AND shopper_id = :uid",
         {"oid": order_id, "uid": shopper_id},
@@ -199,16 +218,54 @@ async def _log_wallet_transaction(
 
 
 def _booking_link_candidates(ref: str) -> list[str]:
-    """
-    If `ref` is a booking-lifecycle reference, return all variants.
-    Booking refs: book:<bid>, confirm:<bid>, complete:<bid>,
-                  cancel:<bid>, decline:<bid>
-    """
     m = re.match(r"^(book|confirm|complete|cancel|decline):(.+)$", ref)
     if not m:
         return []
     bid = m.group(2)
     return [f"{p}:{bid}" for p in ("book", "confirm", "complete", "cancel", "decline")]
+
+
+def _display_name(u: dict) -> Optional[str]:
+    if not u:
+        return None
+    real = (u.get("real_name") or "").strip()
+    nick = (u.get("nickname") or "").strip()
+    fn = (u.get("first_name") or "").strip()
+    ln = (u.get("last_name") or "").strip()
+    full = f"{fn} {ln}".strip()
+    return real or nick or full or None
+
+
+async def _lookup_counterparty_user(user_id: str) -> dict:
+    """Fetch the user row + their store/business names (if any)."""
+    row = await database.fetch_one(
+        """
+        SELECT u.id, u.real_name, u.nickname, u.first_name, u.last_name,
+               u.role, u.business_name,
+               s.name AS store_name
+          FROM users u
+          LEFT JOIN stores s ON s.owner_id = u.id
+         WHERE u.id = :uid
+         LIMIT 1
+        """,
+        {"uid": user_id},
+    )
+    if not row:
+        return {
+            "user_id": user_id,
+            "display_name": "Admerce user",
+            "role": None,
+            "store_name": None,
+            "business_name": None,
+        }
+    r = dict(row)
+    return {
+        "user_id": user_id,
+        "display_name": _display_name(r) or "Admerce user",
+        "role": r.get("role"),
+        "store_name": r.get("store_name"),
+        "business_name": r.get("business_name"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -236,17 +293,14 @@ async def create_wallet(current_user: dict = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# Topup — REMOVED (free-money printer)
+# Topup — REMOVED
 # ---------------------------------------------------------------------------
 
 @router.post("/topup")
 async def topup(current_user: dict = Depends(get_current_user)):
     raise HTTPException(
         status_code=410,
-        detail=(
-            "Direct top-up is no longer available. "
-            "Please top up via the in-app payment flow."
-        ),
+        detail="Direct top-up is no longer available. Please top up via the in-app payment flow.",
     )
 
 
@@ -313,7 +367,6 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
     user_id = current_user["id"]
     _rate_limit(f"withdraw:{user_id}", max_calls=10, window_sec=900)
 
-    # Idempotency replay check
     if req.idempotency_key:
         replay = await database.fetch_one(
             "SELECT response_json FROM withdraw_idempotency "
@@ -321,7 +374,6 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
             {"k": req.idempotency_key, "u": user_id},
         )
         if replay:
-            logger.info("withdraw idempotent replay user=%s key=%s", user_id, req.idempotency_key)
             payload = replay["response_json"]
             if isinstance(payload, str):
                 payload = json.loads(payload)
@@ -338,12 +390,8 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
     wallet = dict(row)
     withdrawal_pin = wallet.get("withdrawal_pin")
     if not withdrawal_pin:
-        raise HTTPException(
-            status_code=403,
-            detail="Withdrawal PIN not set. Please set a PIN first.",
-        )
+        raise HTTPException(status_code=403, detail="Withdrawal PIN not set. Please set a PIN first.")
 
-    # PIN lockout check
     now = datetime.now(timezone.utc)
     locked_until = wallet.get("pin_locked_until")
     if locked_until is not None:
@@ -362,14 +410,10 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
         if failed >= 5:
             lock = now + timedelta(minutes=15)
             await database.execute(
-                "UPDATE wallets SET pin_failed_count = 0, pin_locked_until = :lu "
-                "WHERE user_id = :uid",
+                "UPDATE wallets SET pin_failed_count = 0, pin_locked_until = :lu WHERE user_id = :uid",
                 {"lu": lock, "uid": user_id},
             )
-            raise HTTPException(
-                status_code=429,
-                detail="Too many failed attempts. Locked for 15 minutes.",
-            )
+            raise HTTPException(status_code=429, detail="Too many failed attempts. Locked for 15 minutes.")
         await database.execute(
             "UPDATE wallets SET pin_failed_count = :c WHERE user_id = :uid",
             {"c": failed, "uid": user_id},
@@ -413,10 +457,7 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
         raise HTTPException(status_code=500, detail="Withdrawal failed. Please try again.")
 
     response = {
-        "message": (
-            "Withdrawal request received. Funds will be sent to your account "
-            "once processing completes."
-        ),
+        "message": "Withdrawal request received. Funds will be sent to your account once processing completes.",
         "status": "pending",
         "transaction_id": txn_id,
         "amount": req.amount,
@@ -426,8 +467,7 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
     if req.idempotency_key:
         try:
             await database.execute(
-                "INSERT INTO withdraw_idempotency "
-                "(idempotency_key, user_id, response_json) VALUES (:k, :u, :r)",
+                "INSERT INTO withdraw_idempotency (idempotency_key, user_id, response_json) VALUES (:k, :u, :r)",
                 {"k": req.idempotency_key, "u": user_id, "r": json.dumps(response)},
             )
         except UniqueViolationError:
@@ -451,7 +491,7 @@ async def instant_pickup(
 
     row = await database.fetch_one(
         """
-        SELECT l.*, s.owner_id AS store_owner_id
+        SELECT l.*, s.owner_id AS store_owner_id, s.name AS store_name
           FROM listings l
           JOIN stores   s ON l.store_id = s.store_id
          WHERE l.listing_id = :lid AND s.owner_id = :oid
@@ -466,6 +506,8 @@ async def instant_pickup(
 
     listing = dict(row)
     store_owner_id = listing["store_owner_id"]
+    store_name = listing.get("store_name") or "Store"
+    listing_title = listing.get("title") or "Item"
 
     unit_price = float(listing.get("price") or 0)
     if unit_price <= 0:
@@ -506,10 +548,7 @@ async def instant_pickup(
                     {"qty": quantity, "lid": req.listing_id},
                 )
                 if stock_after is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Item just sold out. Please try again.",
-                    )
+                    raise HTTPException(status_code=400, detail="Item just sold out. Please try again.")
 
             await database.execute(
                 "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
@@ -520,14 +559,14 @@ async def instant_pickup(
                 user_id=shopper_id,
                 amount=total,
                 type="debit",
-                description=f"Instant pickup ({quantity} item{'s' if quantity > 1 else ''})",
+                description=f"Instant pickup · {listing_title} ({quantity} item{'s' if quantity > 1 else ''})",
                 reference=txn_id,
             )
             await _log_wallet_transaction(
                 user_id=store_owner_id,
                 amount=total,
                 type="credit",
-                description=f"Instant pickup payment ({quantity} item{'s' if quantity > 1 else ''})",
+                description=f"Instant pickup payment · {listing_title} ({quantity} item{'s' if quantity > 1 else ''})",
                 reference=f"{txn_id}:credit",
             )
     except HTTPException:
@@ -536,11 +575,22 @@ async def instant_pickup(
         logger.exception("instant_pickup failed shopper=%s", shopper_id)
         raise HTTPException(status_code=500, detail="Payment failed. Please try again.")
 
+    # Notify storekeeper (in-app + push)
+    _fire_and_forget(notify_user(
+        store_owner_id,
+        "order",
+        "New instant pickup",
+        f"{quantity} × {listing_title} — {store_name}",
+        {"reference": txn_id, "kind": "pickup"},
+    ))
+
     return {
         "message": "Payment successful",
         "transaction_id": txn_id,
         "amount": total,
         "quantity": quantity,
+        "store_name": store_name,
+        "listing_title": listing_title,
     }
 
 
@@ -557,7 +607,7 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
 
     row = await database.fetch_one(
         """
-        SELECT l.*, s.owner_id AS store_owner_id
+        SELECT l.*, s.owner_id AS store_owner_id, s.name AS store_name
           FROM listings l
           JOIN stores   s ON l.store_id = s.store_id
          WHERE l.listing_id = :lid AND s.owner_id = :oid
@@ -567,14 +617,13 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
     if not row:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Listing {req.listing_id} not found or not owned by "
-                f"storekeeper {req.storekeeper_id}"
-            ),
+            detail=f"Listing {req.listing_id} not found or not owned by storekeeper {req.storekeeper_id}",
         )
 
     listing = dict(row)
     store_owner_id = listing["store_owner_id"]
+    store_name = listing.get("store_name") or "Store"
+    listing_title = listing.get("title") or "Item"
 
     unit_price = float(listing.get("price") or 0)
     if unit_price <= 0:
@@ -585,10 +634,7 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
 
     available = listing.get("quantity_available")
     if available is not None and available < quantity:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Only {available} items available",
-        )
+        raise HTTPException(status_code=400, detail=f"Only {available} items available")
 
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(hours=window_hours)
@@ -596,15 +642,11 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
     try:
         async with database.transaction():
             existing = await database.fetch_one(
-                "SELECT 1 AS x FROM escrow "
-                "WHERE order_id = :oid AND order_store_id IS NULL",
+                "SELECT 1 AS x FROM escrow WHERE order_id = :oid AND order_store_id IS NULL",
                 {"oid": req.order_id},
             )
             if existing:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Order {req.order_id} already reserved",
-                )
+                raise HTTPException(status_code=400, detail=f"Order {req.order_id} already reserved")
 
             debited = await database.fetch_val(
                 """
@@ -616,10 +658,7 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
                 {"amt": total, "uid": shopper_id},
             )
             if debited is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Insufficient balance",
-                )
+                raise HTTPException(status_code=400, detail="Insufficient balance")
 
             if available is not None:
                 stock_after = await database.fetch_val(
@@ -632,10 +671,7 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
                     {"qty": quantity, "lid": req.listing_id},
                 )
                 if stock_after is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Item just sold out. Please try again.",
-                    )
+                    raise HTTPException(status_code=400, detail="Item just sold out. Please try again.")
 
             await database.execute(
                 """
@@ -668,34 +704,23 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
                 user_id=shopper_id,
                 amount=total,
                 type="debit",
-                description=(
-                    f"Reservation ({quantity} item{'s' if quantity > 1 else ''}, "
-                    f"{window_hours}h window)"
-                ),
+                description=f"Reservation · {listing_title} ({quantity} item{'s' if quantity > 1 else ''}, {window_hours}h window)",
                 reference=req.order_id,
             )
     except HTTPException:
         raise
     except UniqueViolationError:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Order {req.order_id} already reserved",
-        )
+        raise HTTPException(status_code=400, detail=f"Order {req.order_id} already reserved")
     except Exception:
         logger.exception("reserve failed order=%s user=%s", req.order_id, shopper_id)
-        raise HTTPException(
-            status_code=500,
-            detail="Could not create reservation. Please try again.",
-        )
+        raise HTTPException(status_code=500, detail="Could not create reservation. Please try again.")
 
-    _fire_and_forget(send_push_to_user(
+    _fire_and_forget(notify_user(
         store_owner_id,
-        "New Reservation!",
-        (
-            f"A shopper reserved {quantity} item"
-            f"{'s' if quantity > 1 else ''}. Order #{req.order_id[:8]}"
-        ),
-        {"order_id": req.order_id},
+        "order",
+        "New reservation",
+        f"{quantity} × {listing_title} from {store_name} — awaiting your hold",
+        {"order_id": req.order_id, "kind": "reservation"},
     ))
 
     return {
@@ -710,7 +735,7 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
 
 
 # ---------------------------------------------------------------------------
-# Accept Reservation
+# Accept
 # ---------------------------------------------------------------------------
 
 @router.post("/accept")
@@ -725,43 +750,28 @@ async def accept_reservation(
         {"oid": req.order_id, "uid": user_id},
     )
     if not escrow:
-        exists = await database.fetch_one(
-            "SELECT 1 AS x FROM escrow WHERE order_id = :oid",
-            {"oid": req.order_id},
-        )
+        exists = await database.fetch_one("SELECT 1 AS x FROM escrow WHERE order_id = :oid", {"oid": req.order_id})
         if exists:
-            raise HTTPException(
-                status_code=403,
-                detail="You are not the storekeeper for this order",
-            )
+            raise HTTPException(status_code=403, detail="You are not the storekeeper for this order")
         raise HTTPException(status_code=404, detail="Order not found")
 
-    flipped = await _flip_escrow_status(
-        req.order_id, "locked", "accepted", storekeeper_id=user_id,
-    )
+    flipped = await _flip_escrow_status(req.order_id, "locked", "accepted", storekeeper_id=user_id)
     if not flipped:
-        return {
-            "order_id": req.order_id,
-            "status": "accepted",
-            "message": "Already accepted.",
-        }
+        return {"order_id": req.order_id, "status": "accepted", "message": "Already accepted."}
 
-    _fire_and_forget(send_push_to_user(
+    _fire_and_forget(notify_user(
         escrow["shopper_id"],
-        "Reservation Accepted!",
-        f"Your order #{req.order_id[:8]} has been accepted by the storekeeper.",
-        {"order_id": req.order_id},
+        "order",
+        "Reservation accepted",
+        f"Your order #{req.order_id[:8]} is on hold. Pick it up soon.",
+        {"order_id": req.order_id, "kind": "reservation_accepted"},
     ))
 
-    return {
-        "order_id": req.order_id,
-        "status": "accepted",
-        "message": "Reservation accepted",
-    }
+    return {"order_id": req.order_id, "status": "accepted", "message": "Reservation accepted"}
 
 
 # ---------------------------------------------------------------------------
-# Decline Reservation
+# Decline
 # ---------------------------------------------------------------------------
 
 @router.post("/decline")
@@ -776,25 +786,16 @@ async def decline_reservation(
         {"oid": req.order_id, "uid": user_id},
     )
     if not escrow:
-        exists = await database.fetch_one(
-            "SELECT 1 AS x FROM escrow WHERE order_id = :oid",
-            {"oid": req.order_id},
-        )
+        exists = await database.fetch_one("SELECT 1 AS x FROM escrow WHERE order_id = :oid", {"oid": req.order_id})
         if exists:
-            raise HTTPException(
-                status_code=403,
-                detail="You are not the storekeeper for this order",
-            )
+            raise HTTPException(status_code=403, detail="You are not the storekeeper for this order")
         raise HTTPException(status_code=404, detail="Order not found")
 
     current_status = (escrow["status"] or "").lower()
     if current_status != "locked":
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Cannot decline a reservation with status '{current_status}'. "
-                "Only pending reservations can be declined."
-            ),
+            detail=f"Cannot decline a reservation with status '{current_status}'. Only pending reservations can be declined.",
         )
 
     reason = (req.reason or "").strip()
@@ -805,12 +806,15 @@ async def decline_reservation(
     short = req.order_id[:8]
 
     refunded = 0.0
+    storekeeper_name_row = await database.fetch_one(
+        "SELECT COALESCE(NULLIF(real_name,''), NULLIF(nickname,''), 'Store') AS n FROM users WHERE id = :uid",
+        {"uid": user_id},
+    )
+    storekeeper_label = (storekeeper_name_row["n"] if storekeeper_name_row else "Store") or "Store"
 
     try:
         async with database.transaction():
-            flipped = await _flip_escrow_status(
-                req.order_id, "locked", "declined", storekeeper_id=user_id,
-            )
+            flipped = await _flip_escrow_status(req.order_id, "locked", "declined", storekeeper_id=user_id)
             if not flipped:
                 return {
                     "order_id": req.order_id,
@@ -857,18 +861,16 @@ async def decline_reservation(
         logger.exception("decline failed order=%s", req.order_id)
         raise HTTPException(status_code=500, detail="Could not decline reservation.")
 
-    notify_body = (
-        f"Your order #{short} couldn't be fulfilled. "
-        f"₦{refunded:,.0f} has been refunded to your wallet."
-    )
+    # 🔔 Tell the shopper
+    notify_body = f"{storekeeper_label} declined your order #{short}. ₦{refunded:,.0f} has been refunded to your wallet."
     if reason:
         notify_body += f" Reason: {reason}"
-
-    _fire_and_forget(send_push_to_user(
+    _fire_and_forget(notify_user(
         shopper_id,
-        "Reservation Declined",
+        "order",
+        "Reservation declined",
         notify_body,
-        {"order_id": req.order_id, "reason": reason or ""},
+        {"order_id": req.order_id, "kind": "reservation_declined", "reason": reason or ""},
     ))
 
     return {
@@ -885,7 +887,7 @@ async def decline_reservation(
 
 
 # ---------------------------------------------------------------------------
-# Confirm (shopper releases escrow)
+# Confirm / Dispatch / Return / Reversed (same as before, with notifications)
 # ---------------------------------------------------------------------------
 
 @router.post("/confirm")
@@ -894,10 +896,7 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
     escrow = await _pick_escrow_row(req.order_id, shopper_id, req.order_store_id)
 
     if escrow["status"] not in ("accepted", "locked"):
-        raise HTTPException(
-            status_code=400,
-            detail="Order is not in a confirmable state",
-        )
+        raise HTTPException(status_code=400, detail="Order is not in a confirmable state")
 
     item_amount = float(escrow["item_amount"] or 0)
     delivery_fee = float(escrow["delivery_fee"] or 0)
@@ -910,9 +909,7 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
 
     try:
         async with database.transaction():
-            flipped = await _flip_escrow_status(
-                req.order_id, escrow["status"], "picked_up",
-            )
+            flipped = await _flip_escrow_status(req.order_id, escrow["status"], "picked_up")
             if not flipped:
                 flipped = await _flip_escrow_status(
                     req.order_id,
@@ -920,11 +917,7 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
                     "picked_up",
                 )
             if not flipped:
-                return {
-                    "order_id": req.order_id,
-                    "status": "picked_up",
-                    "message": "Order was already processed.",
-                }
+                return {"order_id": req.order_id, "status": "picked_up", "message": "Order was already processed."}
 
             if item_amount > 0:
                 await database.execute(
@@ -954,25 +947,21 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
     except HTTPException:
         raise
     except UniqueViolationError:
-        return {
-            "order_id": req.order_id,
-            "status": "picked_up",
-            "message": "Order was already processed.",
-        }
+        return {"order_id": req.order_id, "status": "picked_up", "message": "Order was already processed."}
     except Exception:
         logger.exception("confirm failed order=%s", req.order_id)
         raise HTTPException(status_code=500, detail="Could not confirm order.")
 
-    return {
-        "order_id": req.order_id,
-        "status": "picked_up",
-        "message": "Order marked as picked up. Funds released.",
-    }
+    _fire_and_forget(notify_user(
+        storekeeper_id,
+        "order",
+        "Item picked up",
+        f"Order #{req.order_id[:8]} picked up. ₦{item_amount:,.0f} credited to your wallet.",
+        {"order_id": req.order_id, "kind": "order_picked_up"},
+    ))
 
+    return {"order_id": req.order_id, "status": "picked_up", "message": "Order marked as picked up. Funds released."}
 
-# ---------------------------------------------------------------------------
-# Dispatch
-# ---------------------------------------------------------------------------
 
 @router.post("/dispatch")
 async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
@@ -980,10 +969,7 @@ async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current
     escrow = await _pick_escrow_row(req.order_id, shopper_id, req.order_store_id)
 
     if escrow["status"] not in ("accepted", "locked"):
-        raise HTTPException(
-            status_code=400,
-            detail="Order must be accepted or locked to dispatch",
-        )
+        raise HTTPException(status_code=400, detail="Order must be accepted or locked to dispatch")
 
     item_amount = float(escrow["item_amount"] or 0)
     delivery_fee = float(escrow["delivery_fee"] or 0)
@@ -996,9 +982,7 @@ async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current
 
     try:
         async with database.transaction():
-            flipped = await _flip_escrow_status(
-                req.order_id, escrow["status"], "dispatched",
-            )
+            flipped = await _flip_escrow_status(req.order_id, escrow["status"], "dispatched")
             if not flipped:
                 flipped = await _flip_escrow_status(
                     req.order_id,
@@ -1006,11 +990,7 @@ async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current
                     "dispatched",
                 )
             if not flipped:
-                return {
-                    "order_id": req.order_id,
-                    "status": "dispatched",
-                    "message": "Order was already processed.",
-                }
+                return {"order_id": req.order_id, "status": "dispatched", "message": "Order was already processed."}
 
             if item_amount > 0:
                 await database.execute(
@@ -1040,25 +1020,13 @@ async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current
     except HTTPException:
         raise
     except UniqueViolationError:
-        return {
-            "order_id": req.order_id,
-            "status": "dispatched",
-            "message": "Order was already processed.",
-        }
+        return {"order_id": req.order_id, "status": "dispatched", "message": "Order was already processed."}
     except Exception:
         logger.exception("dispatch failed order=%s", req.order_id)
         raise HTTPException(status_code=500, detail="Could not dispatch order.")
 
-    return {
-        "order_id": req.order_id,
-        "status": "dispatched",
-        "message": "Order dispatched. Funds released.",
-    }
+    return {"order_id": req.order_id, "status": "dispatched", "message": "Order dispatched. Funds released."}
 
-
-# ---------------------------------------------------------------------------
-# Return
-# ---------------------------------------------------------------------------
 
 @router.post("/return")
 async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_current_user)):
@@ -1066,19 +1034,15 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
     escrow = await _pick_escrow_row(req.order_id, shopper_id, req.order_store_id)
 
     if escrow["status"] not in ("locked", "accepted"):
-        raise HTTPException(
-            status_code=400,
-            detail="Order must be in 'locked' or 'accepted' state to return",
-        )
+        raise HTTPException(status_code=400, detail="Order must be in 'locked' or 'accepted' state to return")
 
     item_amount = float(escrow["item_amount"] or 0)
     order_store_id = escrow.get("order_store_id")
+    storekeeper_id = escrow["storekeeper_id"]
 
     try:
         async with database.transaction():
-            flipped = await _flip_escrow_status(
-                req.order_id, escrow["status"], "returned",
-            )
+            flipped = await _flip_escrow_status(req.order_id, escrow["status"], "returned")
             if not flipped:
                 flipped = await _flip_escrow_status(
                     req.order_id,
@@ -1086,13 +1050,8 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
                     "returned",
                 )
             if not flipped:
-                return {
-                    "order_id": req.order_id,
-                    "status": "returned",
-                    "message": "Order was already processed.",
-                }
+                return {"order_id": req.order_id, "status": "returned", "message": "Order was already processed."}
 
-            # Restore stock
             restored_items = 0
             if order_store_id is not None:
                 store_row = await database.fetch_one(
@@ -1101,17 +1060,13 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
                 )
                 if store_row:
                     items = await database.fetch_all(
-                        """
-                        SELECT listing_id, quantity FROM order_items
-                        WHERE order_id = :oid AND store_id = :sid
-                        """,
+                        "SELECT listing_id, quantity FROM order_items WHERE order_id = :oid AND store_id = :sid",
                         {"oid": req.order_id, "sid": store_row["store_id"]},
                     )
                     for item in items:
                         await database.execute(
-                            "UPDATE listings "
-                            "   SET quantity_available = quantity_available + :qty "
-                            " WHERE listing_id = :lid AND quantity_available IS NOT NULL",
+                            "UPDATE listings SET quantity_available = quantity_available + :qty "
+                            "WHERE listing_id = :lid AND quantity_available IS NOT NULL",
                             {"qty": item["quantity"], "lid": item["listing_id"]},
                         )
                         restored_items += 1
@@ -1121,12 +1076,10 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
                 qty = escrow["quantity"] or 0
                 if listing_id and qty:
                     await database.execute(
-                        "UPDATE listings "
-                        "   SET quantity_available = quantity_available + :qty "
-                        " WHERE listing_id = :lid AND quantity_available IS NOT NULL",
+                        "UPDATE listings SET quantity_available = quantity_available + :qty "
+                        "WHERE listing_id = :lid AND quantity_available IS NOT NULL",
                         {"qty": qty, "lid": listing_id},
                     )
-                    restored_items += 1
 
             if item_amount > 0:
                 await database.execute(
@@ -1143,25 +1096,21 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
     except HTTPException:
         raise
     except UniqueViolationError:
-        return {
-            "order_id": req.order_id,
-            "status": "returned",
-            "message": "Order was already processed.",
-        }
+        return {"order_id": req.order_id, "status": "returned", "message": "Order was already processed."}
     except Exception:
         logger.exception("return failed order=%s", req.order_id)
         raise HTTPException(status_code=500, detail="Could not process return.")
 
-    return {
-        "order_id": req.order_id,
-        "status": "returned",
-        "message": "Item cost refunded. Stock restored.",
-    }
+    _fire_and_forget(notify_user(
+        storekeeper_id,
+        "order",
+        "Order returned",
+        f"Order #{req.order_id[:8]} was returned by the shopper.",
+        {"order_id": req.order_id, "kind": "order_returned"},
+    ))
 
+    return {"order_id": req.order_id, "status": "returned", "message": "Item cost refunded. Stock restored."}
 
-# ---------------------------------------------------------------------------
-# Reversed Package
-# ---------------------------------------------------------------------------
 
 @router.post("/reversed-package")
 async def reversed_package(
@@ -1175,15 +1124,9 @@ async def reversed_package(
         {"oid": req.order_id, "uid": storekeeper_id},
     )
     if not escrow:
-        exists = await database.fetch_one(
-            "SELECT 1 AS x FROM escrow WHERE order_id = :oid",
-            {"oid": req.order_id},
-        )
+        exists = await database.fetch_one("SELECT 1 AS x FROM escrow WHERE order_id = :oid", {"oid": req.order_id})
         if exists:
-            raise HTTPException(
-                status_code=403,
-                detail="Only the storekeeper can release",
-            )
+            raise HTTPException(status_code=403, detail="Only the storekeeper can release")
         raise HTTPException(status_code=404, detail="Order not found")
 
     if escrow["status"] != "returned":
@@ -1199,16 +1142,9 @@ async def reversed_package(
 
     try:
         async with database.transaction():
-            flipped = await _flip_escrow_status(
-                req.order_id, "returned", "reversed",
-                storekeeper_id=storekeeper_id,
-            )
+            flipped = await _flip_escrow_status(req.order_id, "returned", "reversed", storekeeper_id=storekeeper_id)
             if not flipped:
-                return {
-                    "order_id": req.order_id,
-                    "status": "reversed",
-                    "message": "Already reversed.",
-                }
+                return {"order_id": req.order_id, "status": "reversed", "message": "Already reversed."}
 
             if delivery_fee > 0 and courier_id:
                 await database.execute(
@@ -1225,24 +1161,16 @@ async def reversed_package(
     except HTTPException:
         raise
     except UniqueViolationError:
-        return {
-            "order_id": req.order_id,
-            "status": "reversed",
-            "message": "Already reversed.",
-        }
+        return {"order_id": req.order_id, "status": "reversed", "message": "Already reversed."}
     except Exception:
         logger.exception("reversed_package failed order=%s", req.order_id)
         raise HTTPException(status_code=500, detail="Could not process reversal.")
 
-    return {
-        "order_id": req.order_id,
-        "status": "reversed",
-        "message": "Courier fee released",
-    }
+    return {"order_id": req.order_id, "status": "reversed", "message": "Courier fee released"}
 
 
 # ---------------------------------------------------------------------------
-# Read — single transaction (powers the receipt screen)
+# Single-transaction detail — now with store/business names
 # ---------------------------------------------------------------------------
 
 @router.get("/transaction/{reference}")
@@ -1250,33 +1178,6 @@ async def get_wallet_transaction_detail(
     reference: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Return a single wallet transaction scoped to the caller, plus the
-    counterparty (the other side of the same payment) if it exists.
-
-    Handles every reference convention in this codebase:
-
-      • Same reference, opposite type:
-          svcpay_<uuid>                (debit + credit)
-
-      • Base + ':credit' suffix:
-          pickup_<hex>  ↔  pickup_<hex>:credit
-
-      • Order / escrow flows (different refs, same order_id):
-          ord_xyz                          (shopper debit)
-          ord_xyz:<sk>:single:storekeeper  (storekeeper credit)
-          ord_xyz:<sk>:<osid>:courier      (courier credit)
-          ord_xyz:<ref>:refund             (shopper refund)
-          decline:ord_xyz:<sk>             (shopper refund on decline)
-          ord_xyz:<sk>:...:reversed        (courier credit on reverse)
-
-      • Service booking lifecycle (different refs, same booking_id):
-          book:<bid>       (shopper debit at book time)
-          confirm:<bid>    (provider credit)
-          complete:<bid>   (provider credit, customer released)
-          cancel:<bid>     (shopper refund)
-          decline:<bid>    (shopper refund on provider decline)
-    """
     row = await database.fetch_one(
         """
         SELECT id, user_id, amount, type, description, reference, status, created_at
@@ -1292,37 +1193,27 @@ async def get_wallet_transaction_detail(
     txn = dict(row)
     opposite_type = "credit" if txn["type"] == "debit" else "debit"
 
-    # ── Build candidate reference set ──────────────────────────────
-    candidates: set[str] = set()
+    candidates: set[str] = {reference}
 
-    # 1) Same-reference pairs (svcpay_*, etc.)
-    candidates.add(reference)
-
-    # 2) pickup_<hex>  ↔  pickup_<hex>:credit
     if reference.startswith("pickup_"):
         if reference.endswith(":credit"):
             candidates.add(reference[: -len(":credit")])
         else:
             candidates.add(reference + ":credit")
 
-    # 3) Booking lifecycle — book:/confirm:/complete:/cancel:/decline:<bid>
     candidates.update(_booking_link_candidates(reference))
 
-    # 4) Store decline: decline:<ord_...>:<sk_short>  →  link to the reserve
-    base_like: str | None = None
+    base_like: Optional[str] = None
     m = re.match(r"^decline:(ord_[a-z0-9]+):([a-f0-9]+)$", reference)
     if m:
         base_like = m.group(1)
         candidates.add(base_like)
 
-    # 5) Reserve / escrow flows: everything starting with ord_ shares the
-    #    same base order_id, but the suffixes differ per side.
     if reference.startswith("ord_"):
         base = reference.split(":", 1)[0]
         base_like = base
         candidates.add(base)
 
-    # ── Query for the paired row ───────────────────────────────────
     ref_list = list(candidates)
     placeholders = ", ".join(f":r{i}" for i in range(len(ref_list)))
     params: dict = {f"r{i}": r for i, r in enumerate(ref_list)}
@@ -1336,16 +1227,8 @@ async def get_wallet_transaction_detail(
 
     paired = await database.fetch_one(
         f"""
-        SELECT w.user_id,
-               COALESCE(
-                   NULLIF(u.real_name, ''),
-                   NULLIF(u.nickname, ''),
-                   NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''),
-                   'Admerce user'
-               ) AS display_name,
-               u.role
+        SELECT w.user_id
           FROM wallet_transactions w
-          LEFT JOIN users u ON u.id = w.user_id
          WHERE (w.reference IN ({placeholders}){extra})
            AND w.type = :opp
            AND w.user_id != :uid
@@ -1355,17 +1238,76 @@ async def get_wallet_transaction_detail(
         params,
     )
 
-    counterparty = (
-        {
-            "user_id": paired["user_id"],
-            "display_name": paired["display_name"],
-            "role": paired["role"],
-        }
-        if paired
-        else None
-    )
+    counterparty = None
+    if paired:
+        counterparty = await _lookup_counterparty_user(paired["user_id"])
 
     return {**txn, "counterparty": counterparty}
+
+
+# ---------------------------------------------------------------------------
+# Instant transactions feed — powers the Saved screen tabs
+# ---------------------------------------------------------------------------
+
+@router.get("/instant-transactions")
+async def get_instant_transactions(current_user: dict = Depends(get_current_user)):
+    """
+    Returns two lists for the shopper:
+      - pickups: wallet debits from instant pickups (reference LIKE pickup_%)
+      - services: wallet debits from instant service pay (reference LIKE svcpay_%)
+    """
+    user_id = current_user["id"]
+
+    pickups_rows = await database.fetch_all(
+        """
+        SELECT w.id, w.reference, w.amount, w.description, w.status, w.created_at,
+               wc.user_id AS counterparty_user_id
+          FROM wallet_transactions w
+          LEFT JOIN wallet_transactions wc
+                 ON wc.reference = w.reference || ':credit'
+                AND wc.type = 'credit'
+         WHERE w.user_id = :uid
+           AND w.reference LIKE 'pickup_%'
+           AND w.reference NOT LIKE '%:credit'
+           AND w.type = 'debit'
+         ORDER BY w.created_at DESC
+         LIMIT 50
+        """,
+        {"uid": user_id},
+    )
+
+    service_rows = await database.fetch_all(
+        """
+        SELECT w.id, w.reference, w.amount, w.description, w.status, w.created_at,
+               wc.user_id AS counterparty_user_id
+          FROM wallet_transactions w
+          LEFT JOIN wallet_transactions wc
+                 ON wc.reference = w.reference
+                AND wc.type = 'credit'
+                AND wc.user_id != w.user_id
+         WHERE w.user_id = :uid
+           AND w.reference LIKE 'svcpay_%'
+           AND w.type = 'debit'
+         ORDER BY w.created_at DESC
+         LIMIT 50
+        """,
+        {"uid": user_id},
+    )
+
+    async def enrich(rows) -> list:
+        out = []
+        for r in rows:
+            d = dict(r)
+            cp_user_id = d.pop("counterparty_user_id", None)
+            cp = await _lookup_counterparty_user(cp_user_id) if cp_user_id else None
+            d["counterparty"] = cp
+            out.append(d)
+        return out
+
+    pickups = await enrich(pickups_rows)
+    services = await enrich(service_rows)
+
+    return {"pickups": pickups, "services": services}
 
 
 # ---------------------------------------------------------------------------
@@ -1430,19 +1372,15 @@ async def get_order_detail(
         """
         SELECT e.*,
                COALESCE(
-                   NULLIF(u.nickname, ''),
-                   NULLIF(u.real_name, ''),
+                   NULLIF(u.nickname, ''), NULLIF(u.real_name, ''),
                    NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''),
-                   NULLIF(u.phone, ''),
-                   'Customer'
+                   NULLIF(u.phone, ''), 'Customer'
                ) AS customer_name,
                u.avatar_url AS customer_avatar,
                COALESCE(
-                   NULLIF(sk.nickname, ''),
-                   NULLIF(sk.real_name, ''),
+                   NULLIF(sk.nickname, ''), NULLIF(sk.real_name, ''),
                    NULLIF(TRIM(CONCAT_WS(' ', sk.first_name, sk.last_name)), ''),
-                   NULLIF(sk.phone, ''),
-                   'Storekeeper'
+                   NULLIF(sk.phone, ''), 'Storekeeper'
                ) AS storekeeper_name,
                s.name             AS store_name,
                s.store_image_url  AS store_image_url,
@@ -1489,27 +1427,3 @@ async def get_wallet_transactions(
         {"uid": user_id, "limit": limit, "offset": offset},
     )
     return [dict(row) for row in rows]
-
-
-# ---------------------------------------------------------------------------
-# Reminder (unused)
-# ---------------------------------------------------------------------------
-
-async def schedule_reminder(
-    user_id: str,
-    order_id: str,
-    delay_seconds: float,
-    fraction: float,
-):
-    await asyncio.sleep(delay_seconds)
-    escrow = await database.fetch_one(
-        "SELECT status FROM escrow WHERE order_id = :oid",
-        {"oid": order_id},
-    )
-    if escrow and escrow["status"] in ("locked", "accepted"):
-        await send_push_to_user(
-            user_id,
-            "⏰ Pickup Reminder",
-            f"Your order #{order_id[:8]} is expiring soon! Only {int(fraction*100)}% of time left.",
-            {"order_id": order_id},
-        )
