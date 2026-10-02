@@ -1255,6 +1255,11 @@ async def get_instant_transactions(current_user: dict = Depends(get_current_user
     Returns two lists for the shopper:
       - pickups: wallet debits from instant pickups (reference LIKE pickup_%)
       - services: wallet debits from instant service pay (reference LIKE svcpay_%)
+
+    NOTE: all string literals containing a colon (e.g. ':credit') MUST be
+    passed as bound parameters. The `databases` library scans the whole SQL
+    string with a `:name` regex and would otherwise try to bind `:credit`
+    as a parameter, which fails with IndeterminateDatatypeError.
     """
     user_id = current_user["id"]
 
@@ -1264,16 +1269,21 @@ async def get_instant_transactions(current_user: dict = Depends(get_current_user
                wc.user_id AS counterparty_user_id
           FROM wallet_transactions w
           LEFT JOIN wallet_transactions wc
-                 ON wc.reference = w.reference || ':credit'
+                 ON wc.reference = (w.reference || :credit_suffix)
                 AND wc.type = 'credit'
          WHERE w.user_id = :uid
-           AND w.reference LIKE 'pickup_%'
-           AND w.reference NOT LIKE '%:credit'
+           AND w.reference LIKE :prefix
+           AND w.reference NOT LIKE :not_suffix
            AND w.type = 'debit'
          ORDER BY w.created_at DESC
          LIMIT 50
         """,
-        {"uid": user_id},
+        {
+            "uid": user_id,
+            "credit_suffix": ":credit",
+            "prefix": "pickup\\_%",     # escaped _ so LIKE treats it literally
+            "not_suffix": "%:credit",
+        },
     )
 
     service_rows = await database.fetch_all(
@@ -1286,12 +1296,15 @@ async def get_instant_transactions(current_user: dict = Depends(get_current_user
                 AND wc.type = 'credit'
                 AND wc.user_id != w.user_id
          WHERE w.user_id = :uid
-           AND w.reference LIKE 'svcpay_%'
+           AND w.reference LIKE :prefix
            AND w.type = 'debit'
          ORDER BY w.created_at DESC
          LIMIT 50
         """,
-        {"uid": user_id},
+        {
+            "uid": user_id,
+            "prefix": "svcpay\\_%",
+        },
     )
 
     async def enrich(rows) -> list:
