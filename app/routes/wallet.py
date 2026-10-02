@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -122,9 +123,8 @@ async def _flip_escrow_status(
     """
     Atomically transition escrow status. Returns True iff a row actually flipped.
 
-    Uses `RETURNING 1` so the truth of the outcome is not dependent on the
-    driver's rowcount reporting (which `databases.execute` returns as `None`
-    for UPDATEs without RETURNING on some backends).
+    Uses RETURNING 1 so the outcome does not depend on driver-specific
+    rowcount reporting.
     """
     where = ["order_id = :oid", "status = :from_s"]
     params: dict = {"oid": order_id, "from_s": from_status, "to_s": to_status}
@@ -147,9 +147,8 @@ async def _pick_escrow_row(
     """
     Resolve the correct escrow row for a shopper-side action.
 
-    Multi-store orders share `order_id`. If more than one row exists, the
-    caller must supply `order_store_id`. If only one row exists, it's used
-    directly (single-store and reserve-created orders).
+    Multi-store orders share order_id. If more than one row exists, the
+    caller must supply order_store_id.
     """
     rows = await database.fetch_all(
         "SELECT * FROM escrow WHERE order_id = :oid AND shopper_id = :uid",
@@ -199,6 +198,19 @@ async def _log_wallet_transaction(
     )
 
 
+def _booking_link_candidates(ref: str) -> list[str]:
+    """
+    If `ref` is a booking-lifecycle reference, return all variants.
+    Booking refs: book:<bid>, confirm:<bid>, complete:<bid>,
+                  cancel:<bid>, decline:<bid>
+    """
+    m = re.match(r"^(book|confirm|complete|cancel|decline):(.+)$", ref)
+    if not m:
+        return []
+    bid = m.group(2)
+    return [f"{p}:{bid}" for p in ("book", "confirm", "complete", "cancel", "decline")]
+
+
 # ---------------------------------------------------------------------------
 # Create Wallet
 # ---------------------------------------------------------------------------
@@ -224,7 +236,7 @@ async def create_wallet(current_user: dict = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# Topup — REMOVED
+# Topup — REMOVED (free-money printer)
 # ---------------------------------------------------------------------------
 
 @router.post("/topup")
@@ -301,7 +313,7 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
     user_id = current_user["id"]
     _rate_limit(f"withdraw:{user_id}", max_calls=10, window_sec=900)
 
-    # ── Idempotency replay check ────────────────────────────────────
+    # Idempotency replay check
     if req.idempotency_key:
         replay = await database.fetch_one(
             "SELECT response_json FROM withdraw_idempotency "
@@ -331,7 +343,7 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
             detail="Withdrawal PIN not set. Please set a PIN first.",
         )
 
-    # ── PIN lockout ─────────────────────────────────────────────────
+    # PIN lockout check
     now = datetime.now(timezone.utc)
     locked_until = wallet.get("pin_locked_until")
     if locked_until is not None:
@@ -364,7 +376,6 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
         )
         raise HTTPException(status_code=403, detail="Incorrect PIN")
 
-    # Reset counter on success.
     if (wallet.get("pin_failed_count") or 0) > 0:
         await database.execute(
             "UPDATE wallets SET pin_failed_count = 0 WHERE user_id = :uid",
@@ -420,8 +431,6 @@ async def withdraw(req: WithdrawRequest, current_user: dict = Depends(get_curren
                 {"k": req.idempotency_key, "u": user_id, "r": json.dumps(response)},
             )
         except UniqueViolationError:
-            # Another concurrent call won the race; both responses are identical
-            # enough that returning either is fine.
             pass
 
     return response
@@ -586,10 +595,6 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
 
     try:
         async with database.transaction():
-            # Pre-check for a friendly error. The partial unique index on
-            # escrow(order_id) WHERE order_store_id IS NULL is the real guard
-            # under concurrency — this pre-check exists only to give a nicer
-            # message in the common case.
             existing = await database.fetch_one(
                 "SELECT 1 AS x FROM escrow "
                 "WHERE order_id = :oid AND order_store_id IS NULL",
@@ -672,7 +677,6 @@ async def reserve(req: ReserveRequest, current_user: dict = Depends(get_current_
     except HTTPException:
         raise
     except UniqueViolationError:
-        # Partial unique index caught a duplicate reserve.
         raise HTTPException(
             status_code=400,
             detail=f"Order {req.order_id} already reserved",
@@ -804,7 +808,6 @@ async def decline_reservation(
 
     try:
         async with database.transaction():
-            # The atomic flip. Only the thread that flips proceeds to refund.
             flipped = await _flip_escrow_status(
                 req.order_id, "locked", "declined", storekeeper_id=user_id,
             )
@@ -843,7 +846,6 @@ async def decline_reservation(
     except HTTPException:
         raise
     except UniqueViolationError:
-        # Reference collision (double-decline across concurrent calls)
         return {
             "order_id": req.order_id,
             "status": "declined",
@@ -912,9 +914,9 @@ async def confirm(req: ConfirmRequest, current_user: dict = Depends(get_current_
                 req.order_id, escrow["status"], "picked_up",
             )
             if not flipped:
-                # Try the other allowed source status.
                 flipped = await _flip_escrow_status(
-                    req.order_id, "accepted" if escrow["status"] == "locked" else "locked",
+                    req.order_id,
+                    "accepted" if escrow["status"] == "locked" else "locked",
                     "picked_up",
                 )
             if not flipped:
@@ -999,7 +1001,8 @@ async def dispatch(req: ConfirmRequest, current_user: dict = Depends(get_current
             )
             if not flipped:
                 flipped = await _flip_escrow_status(
-                    req.order_id, "accepted" if escrow["status"] == "locked" else "locked",
+                    req.order_id,
+                    "accepted" if escrow["status"] == "locked" else "locked",
                     "dispatched",
                 )
             if not flipped:
@@ -1078,7 +1081,8 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
             )
             if not flipped:
                 flipped = await _flip_escrow_status(
-                    req.order_id, "accepted" if escrow["status"] == "locked" else "locked",
+                    req.order_id,
+                    "accepted" if escrow["status"] == "locked" else "locked",
                     "returned",
                 )
             if not flipped:
@@ -1088,10 +1092,7 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
                     "message": "Order was already processed.",
                 }
 
-            # ── Restore stock ──────────────────────────────────────
-            # For multi-item basket orders, escrow.listing_id/quantity are
-            # wrong (they were set from the first item + a total). We must
-            # iterate order_items to restore each listing's own quantity.
+            # Restore stock
             restored_items = 0
             if order_store_id is not None:
                 store_row = await database.fetch_one(
@@ -1115,7 +1116,6 @@ async def return_order(req: ConfirmRequest, current_user: dict = Depends(get_cur
                         )
                         restored_items += 1
 
-            # Fallback for reserve-created escrows (no order_store_id).
             if order_store_id is None:
                 listing_id = escrow["listing_id"]
                 qty = escrow["quantity"] or 0
@@ -1242,7 +1242,134 @@ async def reversed_package(
 
 
 # ---------------------------------------------------------------------------
-# Reads
+# Read — single transaction (powers the receipt screen)
+# ---------------------------------------------------------------------------
+
+@router.get("/transaction/{reference}")
+async def get_wallet_transaction_detail(
+    reference: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Return a single wallet transaction scoped to the caller, plus the
+    counterparty (the other side of the same payment) if it exists.
+
+    Handles every reference convention in this codebase:
+
+      • Same reference, opposite type:
+          svcpay_<uuid>                (debit + credit)
+
+      • Base + ':credit' suffix:
+          pickup_<hex>  ↔  pickup_<hex>:credit
+
+      • Order / escrow flows (different refs, same order_id):
+          ord_xyz                          (shopper debit)
+          ord_xyz:<sk>:single:storekeeper  (storekeeper credit)
+          ord_xyz:<sk>:<osid>:courier      (courier credit)
+          ord_xyz:<ref>:refund             (shopper refund)
+          decline:ord_xyz:<sk>             (shopper refund on decline)
+          ord_xyz:<sk>:...:reversed        (courier credit on reverse)
+
+      • Service booking lifecycle (different refs, same booking_id):
+          book:<bid>       (shopper debit at book time)
+          confirm:<bid>    (provider credit)
+          complete:<bid>   (provider credit, customer released)
+          cancel:<bid>     (shopper refund)
+          decline:<bid>    (shopper refund on provider decline)
+    """
+    row = await database.fetch_one(
+        """
+        SELECT id, user_id, amount, type, description, reference, status, created_at
+          FROM wallet_transactions
+         WHERE reference = :ref AND user_id = :uid
+         LIMIT 1
+        """,
+        {"ref": reference, "uid": current_user["id"]},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    txn = dict(row)
+    opposite_type = "credit" if txn["type"] == "debit" else "debit"
+
+    # ── Build candidate reference set ──────────────────────────────
+    candidates: set[str] = set()
+
+    # 1) Same-reference pairs (svcpay_*, etc.)
+    candidates.add(reference)
+
+    # 2) pickup_<hex>  ↔  pickup_<hex>:credit
+    if reference.startswith("pickup_"):
+        if reference.endswith(":credit"):
+            candidates.add(reference[: -len(":credit")])
+        else:
+            candidates.add(reference + ":credit")
+
+    # 3) Booking lifecycle — book:/confirm:/complete:/cancel:/decline:<bid>
+    candidates.update(_booking_link_candidates(reference))
+
+    # 4) Store decline: decline:<ord_...>:<sk_short>  →  link to the reserve
+    base_like: str | None = None
+    m = re.match(r"^decline:(ord_[a-z0-9]+):([a-f0-9]+)$", reference)
+    if m:
+        base_like = m.group(1)
+        candidates.add(base_like)
+
+    # 5) Reserve / escrow flows: everything starting with ord_ shares the
+    #    same base order_id, but the suffixes differ per side.
+    if reference.startswith("ord_"):
+        base = reference.split(":", 1)[0]
+        base_like = base
+        candidates.add(base)
+
+    # ── Query for the paired row ───────────────────────────────────
+    ref_list = list(candidates)
+    placeholders = ", ".join(f":r{i}" for i in range(len(ref_list)))
+    params: dict = {f"r{i}": r for i, r in enumerate(ref_list)}
+    params["opp"] = opposite_type
+    params["uid"] = current_user["id"]
+
+    extra = ""
+    if base_like:
+        extra = " OR w.reference LIKE :base_like"
+        params["base_like"] = f"{base_like}%"
+
+    paired = await database.fetch_one(
+        f"""
+        SELECT w.user_id,
+               COALESCE(
+                   NULLIF(u.real_name, ''),
+                   NULLIF(u.nickname, ''),
+                   NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''),
+                   'Admerce user'
+               ) AS display_name,
+               u.role
+          FROM wallet_transactions w
+          LEFT JOIN users u ON u.id = w.user_id
+         WHERE (w.reference IN ({placeholders}){extra})
+           AND w.type = :opp
+           AND w.user_id != :uid
+         ORDER BY w.created_at ASC NULLS LAST
+         LIMIT 1
+        """,
+        params,
+    )
+
+    counterparty = (
+        {
+            "user_id": paired["user_id"],
+            "display_name": paired["display_name"],
+            "role": paired["role"],
+        }
+        if paired
+        else None
+    )
+
+    return {**txn, "counterparty": counterparty}
+
+
+# ---------------------------------------------------------------------------
+# Reads — lists
 # ---------------------------------------------------------------------------
 
 @router.get("/escrows")
@@ -1386,27 +1513,3 @@ async def schedule_reminder(
             f"Your order #{order_id[:8]} is expiring soon! Only {int(fraction*100)}% of time left.",
             {"order_id": order_id},
         )
-
-
-@router.get("/transaction/{reference}")
-async def get_wallet_transaction_detail(
-    reference: str,
-    current_user: dict = Depends(get_current_user),
-):
-    """
-    Return a single wallet transaction, scoped to the caller.
-    Powers the receipt screen so it never has to trust query params.
-    """
-    row = await database.fetch_one(
-        """
-        SELECT id, user_id, amount, type, description, reference, status, created_at
-          FROM wallet_transactions
-         WHERE reference = :ref
-           AND user_id = :uid
-         LIMIT 1
-        """,
-        {"ref": reference, "uid": current_user["id"]},
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Transaction not found")
-    return dict(row)
