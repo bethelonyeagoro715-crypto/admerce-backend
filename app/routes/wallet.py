@@ -1386,3 +1386,27 @@ async def schedule_reminder(
             f"Your order #{order_id[:8]} is expiring soon! Only {int(fraction*100)}% of time left.",
             {"order_id": order_id},
         )
+
+
+@router.get("/transaction/{reference}")
+async def get_wallet_transaction_detail(
+    reference: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Return a single wallet transaction, scoped to the caller.
+    Powers the receipt screen so it never has to trust query params.
+    """
+    row = await database.fetch_one(
+        """
+        SELECT id, user_id, amount, type, description, reference, status, created_at
+          FROM wallet_transactions
+         WHERE reference = :ref
+           AND user_id = :uid
+         LIMIT 1
+        """,
+        {"ref": reference, "uid": current_user["id"]},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return dict(row)
