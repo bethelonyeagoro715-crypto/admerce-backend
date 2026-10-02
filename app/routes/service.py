@@ -1,11 +1,14 @@
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile
 from pydantic import BaseModel, Field
 from typing import Optional
+import asyncio
+import json as _json
 import logging
 import time
 from app.db.database import database
 from app.utils.security import get_current_user
 from app.services.cloudinary_service import upload_image, upload_video
+from app.routes.notifications import send_push_to_user
 from PIL import Image
 import uuid, io
 from datetime import datetime, timedelta, timezone
@@ -16,6 +19,7 @@ router = APIRouter(prefix="/services", tags=["Services"])
 
 # In-process rate limiter (per worker)
 _rate_buckets: dict[str, list[float]] = {}
+
 
 def _rate_limit(key: str, max_calls: int, window_sec: int) -> None:
     now = time.time()
@@ -107,13 +111,6 @@ async def _flip_booking_status(
     from_statuses: tuple,
     to_status: str,
 ) -> bool:
-    """
-    Atomically flip a booking's status. Returns True iff exactly one row changed.
-
-    `RETURNING 1` is used so the outcome does not depend on driver-specific
-    rowcount reporting (databases returns None for UPDATEs without RETURNING
-    on asyncpg in some versions).
-    """
     placeholders = ", ".join(f":s{i}" for i in range(len(from_statuses)))
     params = {"bid": booking_id, "to_s": to_status}
     for i, s in enumerate(from_statuses):
@@ -140,7 +137,6 @@ async def _record_wallet_txn(
     description: str,
     reference: str,
 ) -> None:
-    """Ledger row. Uses NOW() in SQL — avoids Python datetime → DB tz issues."""
     if amount <= 0 or not user_id:
         return
     await database.execute(
@@ -157,6 +153,89 @@ async def _record_wallet_txn(
             "ref": reference,
         },
     )
+
+
+# ---------- Notifications ----------
+_background_tasks: set = set()
+
+
+def _fire_and_forget(coro) -> None:
+    async def _run():
+        try:
+            await coro
+        except Exception:
+            logger.exception("Background task failed")
+    try:
+        task = asyncio.create_task(_run())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    except Exception:
+        logger.exception("Failed to schedule background task")
+
+
+async def _notify_user(
+    user_id: str,
+    kind: str,
+    title: str,
+    body: str,
+    data: Optional[dict] = None,
+) -> None:
+    """Write a user_notifications row and best-effort push. Non-fatal on failure."""
+    if not user_id:
+        return
+    try:
+        await database.execute(
+            """
+            INSERT INTO user_notifications
+                (user_id, kind, title, body, data, is_read, created_at)
+            VALUES
+                (:uid, :kind, :title, :body, :data, FALSE, NOW())
+            """,
+            {
+                "uid": user_id,
+                "kind": kind,
+                "title": title,
+                "body": body,
+                "data": _json.dumps(data or {}),
+            },
+        )
+    except Exception as e:
+        logger.warning("notification write failed user=%s kind=%s err=%s", user_id, kind, e)
+
+    _fire_and_forget(send_push_to_user(user_id, title, body, data or {}))
+
+
+async def _provider_label(provider_id: str) -> str:
+    row = await database.fetch_one(
+        """
+        SELECT COALESCE(
+            NULLIF(business_name, ''),
+            NULLIF(real_name, ''),
+            NULLIF(nickname, ''),
+            NULLIF(TRIM(CONCAT_WS(' ', first_name, last_name)), ''),
+            'Service provider'
+        ) AS name
+          FROM users WHERE id = :uid
+        """,
+        {"uid": provider_id},
+    )
+    return (row["name"] if row and row["name"] else "Service provider")
+
+
+async def _customer_label(customer_id: str) -> str:
+    row = await database.fetch_one(
+        """
+        SELECT COALESCE(
+            NULLIF(real_name, ''),
+            NULLIF(nickname, ''),
+            NULLIF(TRIM(CONCAT_WS(' ', first_name, last_name)), ''),
+            'A customer'
+        ) AS name
+          FROM users WHERE id = :uid
+        """,
+        {"uid": customer_id},
+    )
+    return (row["name"] if row and row["name"] else "A customer")
 
 
 # ============================================================
@@ -268,9 +347,6 @@ async def update_provider_availability(
     current_user: dict = Depends(get_current_user),
 ):
     provider_id = current_user["id"]
-    # Use NOW() in SQL — avoids binding a Python datetime into a column whose
-    # type may be TEXT (pre-fix) or TIMESTAMPTZ (post-fix). NOW() works with
-    # either.
     await database.execute(
         """
         INSERT INTO provider_availability (user_id, is_available, updated_at)
@@ -315,7 +391,6 @@ async def instant_pay_service(
 
     try:
         async with database.transaction():
-            # Idempotency: is this reference already used by this user?
             existing = await database.fetch_one(
                 "SELECT 1 AS x FROM wallet_transactions "
                 "WHERE user_id = :uid AND reference = :ref",
@@ -327,7 +402,6 @@ async def instant_pay_service(
                     detail="This payment has already been processed",
                 )
 
-            # Atomic wallet debit — WHERE guard blocks overdraft.
             debited = await database.fetch_val(
                 """
                 UPDATE wallets
@@ -361,6 +435,16 @@ async def instant_pay_service(
     except Exception:
         logger.exception("instant_pay failed user=%s ref=%s", customer_id, req.reference)
         raise HTTPException(status_code=500, detail="Payment failed. Please try again.")
+
+    # Notify provider
+    cust_label = await _customer_label(customer_id)
+    await _notify_user(
+        service["provider_id"],
+        "order",
+        "Payment received",
+        f"{cust_label} paid ₦{price:,.0f} for {service.get('title') or 'your service'}.",
+        {"reference": req.reference, "kind": "service_paid"},
+    )
 
     return {
         "message": "Payment successful",
@@ -454,7 +538,7 @@ async def delete_service_video(
 
 
 # ============================================================
-# TOGGLE / DELETE — existing
+# TOGGLE / DELETE
 # ============================================================
 @router.post("/{service_id}/toggle")
 async def toggle_service_active(
@@ -610,6 +694,16 @@ async def accept_booking(
             "message": "Booking was already accepted.",
         }
 
+    customer_id = booking.get("customer_id")
+    provider_label = await _provider_label(current_user["id"])
+    await _notify_user(
+        customer_id,
+        "order",
+        "Booking confirmed",
+        f"{provider_label} accepted your booking #{booking_id[:8]}.",
+        {"booking_id": booking_id, "kind": "booking_accepted"},
+    )
+
     return {
         "booking_id": booking_id,
         "status": "accepted",
@@ -644,6 +738,7 @@ async def decline_booking(
 
     amount = _as_float(booking.get("amount"))
     customer_id = booking.get("customer_id")
+    service_title = booking.get("service_title") or "Service"
     refunded = 0.0
 
     try:
@@ -672,6 +767,16 @@ async def decline_booking(
     except Exception:
         logger.exception("decline_booking failed %s", booking_id)
         raise HTTPException(status_code=500, detail="Could not decline booking.")
+
+    provider_label = await _provider_label(current_user["id"])
+    await _notify_user(
+        customer_id,
+        "order",
+        "Booking declined",
+        f"{provider_label} declined your booking #{booking_id[:8]} ({service_title}). "
+        f"₦{refunded:,.0f} has been refunded to your wallet.",
+        {"booking_id": booking_id, "kind": "booking_declined"},
+    )
 
     return {
         "booking_id": booking_id,
@@ -709,6 +814,8 @@ async def confirm_booking(
 
     amount = _as_float(booking.get("amount"))
     provider_id = booking["provider_id"]
+    customer_id = booking.get("customer_id")
+    service_title = booking.get("service_title") or "Service"
 
     try:
         async with database.transaction():
@@ -736,6 +843,15 @@ async def confirm_booking(
     except Exception:
         logger.exception("confirm_booking failed %s", booking_id)
         raise HTTPException(status_code=500, detail="Could not confirm booking.")
+
+    # Notify the customer — ask for a rating
+    await _notify_user(
+        customer_id,
+        "order",
+        "Service completed",
+        f"Your service ({service_title}) was marked complete. Rate your experience.",
+        {"booking_id": booking_id, "kind": "booking_completed", "prompt_rating": True},
+    )
 
     return {
         "booking_id": booking_id,
@@ -765,6 +881,7 @@ async def complete_booking(
 
     amount = _as_float(booking.get("amount"))
     provider_id = booking["provider_id"]
+    service_title = booking.get("service_title") or "Service"
 
     try:
         async with database.transaction():
@@ -792,6 +909,15 @@ async def complete_booking(
     except Exception:
         logger.exception("complete_booking failed %s", booking_id)
         raise HTTPException(status_code=500, detail="Could not complete booking.")
+
+    cust_label = await _customer_label(current_user["id"])
+    await _notify_user(
+        provider_id,
+        "order",
+        "Payment released",
+        f"{cust_label} released ₦{amount:,.0f} for {service_title} to your wallet.",
+        {"booking_id": booking_id, "kind": "booking_payment_released"},
+    )
 
     return {
         "booking_id": booking_id,
@@ -826,7 +952,10 @@ async def cancel_booking(
 
     amount = _as_float(booking.get("amount"))
     customer_id = booking.get("customer_id")
+    provider_id = booking.get("provider_id")
+    service_title = booking.get("service_title") or "Service"
     cancelled_by = "customer" if user_id == customer_id else "provider"
+    other_party = provider_id if cancelled_by == "customer" else customer_id
     refunded = 0.0
 
     try:
@@ -858,6 +987,20 @@ async def cancel_booking(
     except Exception:
         logger.exception("cancel_booking failed %s", booking_id)
         raise HTTPException(status_code=500, detail="Could not cancel booking.")
+
+    # Notify the other party
+    if cancelled_by == "customer":
+        cancel_label = await _customer_label(customer_id)
+    else:
+        cancel_label = await _provider_label(provider_id)
+
+    await _notify_user(
+        other_party,
+        "order",
+        "Booking cancelled",
+        f"{cancel_label} cancelled booking #{booking_id[:8]} ({service_title}).",
+        {"booking_id": booking_id, "kind": "booking_cancelled", "cancelled_by": cancelled_by},
+    )
 
     return {
         "booking_id": booking_id,
@@ -1039,7 +1182,6 @@ async def book_service(
 
     try:
         async with database.transaction():
-            # Atomic wallet debit.
             debited = await database.fetch_val(
                 """
                 UPDATE wallets
@@ -1088,6 +1230,16 @@ async def book_service(
     except Exception:
         logger.exception("book_service failed service=%s user=%s", service_id, customer_id)
         raise HTTPException(status_code=500, detail="Could not create booking.")
+
+    # Notify provider
+    cust_label = await _customer_label(customer_id)
+    await _notify_user(
+        service["provider_id"],
+        "order",
+        "New booking",
+        f"{cust_label} booked {service.get('title') or 'your service'} — ₦{service_price:,.0f}",
+        {"booking_id": booking_id, "kind": "booking_created"},
+    )
 
     return {
         "booking_id": booking_id,
