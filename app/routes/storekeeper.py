@@ -505,6 +505,159 @@ async def create_listing(
         "message": "Listing created"
     }
 
+# ==================== GET SINGLE LISTING (owner only) ====================
+@router.get("/listing/{listing_id}")
+async def get_listing(
+    listing_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Fetch a single listing for editing.
+
+    Owner-gated: this returns `SELECT *`, which includes the `embedding`
+    column. Only the owner should see that.
+    """
+    listing = await database.fetch_one(
+        "SELECT * FROM listings WHERE listing_id = :lid",
+        {"lid": listing_id},
+    )
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    store = await database.fetch_one(
+        "SELECT owner_id FROM stores WHERE store_id = :sid",
+        {"sid": listing["store_id"]},
+    )
+    if not store or store["owner_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not your listing")
+
+    return dict(listing)
+
+# ==================== UPDATE LISTING (owner only) ====================
+# Only these fields are mutable: title, description, quantity_total,
+# is_available, image. Price, category, and lat/lng are frozen after publish.
+@router.put("/listing/{listing_id}")
+async def update_listing(
+    listing_id: str,
+    current_user: dict = Depends(get_current_user),
+    title: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    quantity_total: Optional[int] = Form(None),
+    is_available: Optional[bool] = Form(None),
+    image: UploadFile = File(None),
+    style: str = Form("warm"),
+):
+    # ── Fetch current row + ownership check
+    listing = await database.fetch_one(
+        "SELECT * FROM listings WHERE listing_id = :lid",
+        {"lid": listing_id},
+    )
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    store = await database.fetch_one(
+        "SELECT owner_id FROM stores WHERE store_id = :sid",
+        {"sid": listing["store_id"]},
+    )
+    if not store or store["owner_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not your listing")
+
+    # ── Accumulate updates. Column names here are all from a fixed
+    #    whitelist — user input never reaches the SQL string.
+    updates: dict = {}
+
+    if title is not None:
+        t = title.strip()
+        if not t:
+            raise HTTPException(status_code=400, detail="Title cannot be empty")
+        if len(t) > 200:
+            raise HTTPException(status_code=400, detail="Title too long (max 200 chars)")
+        updates["title"] = t
+        updates["title_quality"] = compute_title_quality(t)
+
+    if description is not None:
+        updates["description"] = description.strip()[:2000]
+
+    if quantity_total is not None:
+        if quantity_total < 1:
+            raise HTTPException(status_code=400, detail="Quantity must be at least 1")
+        if quantity_total > 100000:
+            raise HTTPException(status_code=400, detail="Quantity too large")
+
+        old_total = int(listing["quantity_total"] or 0)
+        old_avail = int(listing["quantity_available"] or 0)
+        sold = max(0, old_total - old_avail)
+
+        if quantity_total < sold:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot reduce total below {sold} — that many units "
+                    f"have already been ordered."
+                ),
+            )
+
+        delta = quantity_total - old_total
+        new_avail = max(0, old_avail + delta)
+        updates["quantity_total"] = quantity_total
+        updates["quantity_available"] = new_avail
+
+    if is_available is not None:
+        updates["is_available"] = bool(is_available)
+
+    # ── Optional image replacement. On success, recompute embedding so
+    #    SEAI lens / similar-item search reflects the new photo.
+    if image and image.filename:
+        image_bytes = await image.read()
+        if image_bytes:
+            try:
+                processed = process_image(image_bytes, style=style)
+                image_url = upload_image(processed, folder="listings")
+                w, h = _image_dimensions(processed)
+            except Exception as e:
+                print(f"Image processing error on update: {e}")
+                image_url = upload_image(image_bytes, folder="listings")
+                w, h = _image_dimensions(image_bytes)
+
+            updates["image_url"] = image_url
+            updates["image_width"] = w
+            updates["image_height"] = h
+
+            try:
+                emb = await run_in_threadpool(image_bytes_to_embedding, image_bytes)
+                if is_real_embedding(emb):
+                    updates["embedding"] = embedding_to_json(emb)
+                else:
+                    print(
+                        f"⚠️  update embedding for {listing_id} is a color "
+                        f"fallback — leaving old embedding in place"
+                    )
+            except Exception as e:
+                print(f"⚠️  embedding recompute failed for {listing_id}: {e}")
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    # ── Build a parameterized UPDATE. Column names are from `updates`
+    #    (our own dict, never user input). Values are bound.
+    set_parts = []
+    params = {"lid": listing_id}
+    for col, val in updates.items():
+        set_parts.append(f"{col} = :{col}")
+        params[col] = val
+
+    sql = (
+        f"UPDATE listings SET {', '.join(set_parts)} "
+        f"WHERE listing_id = :lid RETURNING *"
+    )
+    updated = await database.fetch_one(sql, params)
+
+    return {
+        "listing_id": listing_id,
+        "updated_fields": list(updates.keys()),
+        "listing": dict(updated) if updated else None,
+        "message": "Listing updated",
+    }
+
 # ==================== AI IMAGE ANALYSIS (mock) ====================
 @router.post("/analyze-image")
 async def analyze_image(
