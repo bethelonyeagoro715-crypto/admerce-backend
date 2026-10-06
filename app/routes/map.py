@@ -43,6 +43,12 @@ async def get_map_locations(
       - `in_stock`   → at least one available listing, or an untracked one
       - `low_stock`  → total tracked stock ≤ 3
       - `out_of_stock` → all listings have 0 tracked stock
+
+    Service aggregation:
+      Services are grouped by `provider_id` so a provider with N services
+      renders as ONE marker. The marker's coordinates are the average of
+      their service locations; `service_count`, `min_price`, and
+      `max_price` are also returned so the sheet can summarize.
     """
     if not include_stores and not include_services:
         return []
@@ -116,54 +122,80 @@ async def get_map_locations(
         store_rows = await database.fetch_all(store_sql, params)
         results.extend([dict(r) for r in store_rows])
 
-    # ── SERVICES ─────────────────────────────────────────────────────
+    # ── SERVICES (aggregated per provider) ───────────────────────────
+    #
+    # Previously: one row per service → providers with N services
+    # rendered as N scattered pins. Now: one row per provider_id, with
+    # the marker placed at the average of the provider's service coords.
+    # The outer SELECT applies the Haversine radius filter against that
+    # aggregated point.
     if include_services:
-        distance_select = ""
-        distance_where = ""
-        params: dict = {}
+        params_svc: dict = {}
 
         if has_origin:
-            distance_select = (
-                f", {_HAVERSINE.format(lat_col='sv.lat', lng_col='sv.lng')}"
-                " AS distance_km"
-            )
-            distance_where = (
-                f" AND {_HAVERSINE.format(lat_col='sv.lat', lng_col='sv.lng')}"
-                " <= :radius_km"
-            )
-            params["user_lat"] = lat
-            params["user_lng"] = lng
-            params["radius_km"] = radius_km
+            params_svc["user_lat"] = lat
+            params_svc["user_lng"] = lng
+            params_svc["radius_km"] = radius_km
 
-        order_clause = "distance_km ASC" if has_origin else "sv.title ASC"
-
-        service_sql = f"""
+        # Inner query: collapse services by provider.
+        # Provider display name mirrors `_provider_label()` in service.py
+        # so map labels match what the rest of the app shows.
+        inner_sql = """
             SELECT
-                sv.service_id       AS id,
-                sv.title            AS name,
-                sv.lat              AS lat,
-                sv.lng              AS lng,
-                'service'           AS type,
-                sv.category         AS category,
-                sv.price            AS price,
-                sv.image_url        AS image_url,
-                'available'         AS status
-                {distance_select}
+                sv.provider_id                          AS id,
+                COALESCE(
+                    NULLIF(u.business_name, ''),
+                    NULLIF(u.real_name, ''),
+                    NULLIF(u.nickname, ''),
+                    NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''),
+                    'Service provider'
+                )                                       AS name,
+                AVG(sv.lat)                             AS lat,
+                AVG(sv.lng)                             AS lng,
+                'service'                               AS type,
+                COUNT(*)                                AS service_count,
+                MIN(sv.price)                           AS min_price,
+                MAX(sv.price)                           AS max_price,
+                MIN(sv.image_url)                       AS image_url,
+                'available'                             AS status
             FROM services sv
+            LEFT JOIN users u ON u.id = sv.provider_id
             WHERE sv.is_active = TRUE
               AND sv.lat IS NOT NULL
               AND sv.lng IS NOT NULL
-              {distance_where}
-            ORDER BY {order_clause}
-            LIMIT 500
+            GROUP BY sv.provider_id,
+                     u.business_name, u.real_name, u.nickname,
+                     u.first_name, u.last_name
         """
 
-        service_rows = await database.fetch_all(service_sql, params)
+        if has_origin:
+            hav_outer = _HAVERSINE.format(lat_col='sub.lat', lng_col='sub.lng')
+            service_sql = f"""
+                SELECT sub.*, {hav_outer} AS distance_km
+                FROM ({inner_sql}) sub
+                WHERE {hav_outer} <= :radius_km
+                ORDER BY distance_km ASC
+                LIMIT 500
+            """
+        else:
+            service_sql = f"""
+                SELECT sub.*
+                FROM ({inner_sql}) sub
+                ORDER BY sub.name ASC
+                LIMIT 500
+            """
+
+        service_rows = await database.fetch_all(service_sql, params_svc)
         results.extend([dict(r) for r in service_rows])
 
     # When both kinds returned, sort the merged list once more so
     # stores + services interleave correctly by distance.
     if has_origin:
-        results.sort(key=lambda r: (r.get("distance_km") is None, r.get("distance_km") or 0))
+        results.sort(
+            key=lambda r: (
+                r.get("distance_km") is None,
+                r.get("distance_km") or 0,
+            )
+        )
 
     return results
