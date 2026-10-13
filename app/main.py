@@ -1,7 +1,7 @@
 import os
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
@@ -90,10 +90,19 @@ def _as_float(value, default: float = 0.0) -> float:
         return default
 
 
+def _aware(dt):
+    """Coerce a datetime to aware UTC. Returns None if not a datetime."""
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 async def _refund_expired_escrows() -> None:
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             expired = await database.fetch_all(
                 "SELECT * FROM escrow WHERE status = 'locked' AND expires_at < :now",
                 {"now": now},
@@ -120,7 +129,7 @@ async def _expire_stale_bookings() -> None:
 
     while True:
         try:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             candidates = await database.fetch_all(
                 """
                 SELECT booking_id, customer_id, provider_id, amount,
@@ -135,21 +144,26 @@ async def _expire_stale_bookings() -> None:
                 due = r.get("scheduled_for") or r.get("created_at")
                 if due is None:
                     continue
+
+                # Coerce to aware UTC — string, naive, or aware all land here.
+                if isinstance(due, str):
+                    try:
+                        due = datetime.fromisoformat(due.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                due = _aware(due)
+                if due is None:
+                    continue
+
                 grace = (
                     LOCKED_GRACE_HOURS
                     if status == "locked"
                     else ACCEPTED_GRACE_HOURS
                 )
-                if isinstance(due, str):
-                    try:
-                        due = datetime.fromisoformat(
-                            due.replace("Z", "+00:00")
-                        ).replace(tzinfo=None)
-                    except ValueError:
-                        continue
                 deadline = due + timedelta(hours=grace)
                 if now < deadline:
                     continue
+
                 booking_id = r["booking_id"]
                 customer_id = r["customer_id"]
                 amount = _as_float(r.get("amount"))
@@ -362,7 +376,6 @@ async def lifespan(app: FastAPI):
             ("business_image_url", "TEXT"),
             ("business_name", "TEXT"),
             ("last_seen_at", "TIMESTAMPTZ"),
-            # ── NEW — settings-tree columns ────────────────────
             ("bio", "TEXT"),
             ("phone_verified", "BOOLEAN DEFAULT FALSE"),
             ("email_verified", "BOOLEAN DEFAULT FALSE"),
@@ -378,7 +391,6 @@ async def lifespan(app: FastAPI):
                 f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
-        # ── NEW — image dims for listings + stores ─────────────
         conn.exec_driver_sql(
             "ALTER TABLE listings ADD COLUMN IF NOT EXISTS image_width INTEGER"
         )
@@ -444,7 +456,6 @@ async def lifespan(app: FastAPI):
             ("is_active", "BOOLEAN DEFAULT TRUE"),
             ("created_at", "TIMESTAMP DEFAULT NOW()"),
             ("updated_at", "TIMESTAMP DEFAULT NOW()"),
-            # ── NEW — image dims for services ──────────────────
             ("image_width", "INTEGER"),
             ("image_height", "INTEGER"),
         ]:
@@ -626,7 +637,6 @@ async def lifespan(app: FastAPI):
             "ON order_items(listing_id)"
         )
 
-        # Store verification schema
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS store_verifications (
                 id               UUID PRIMARY KEY,
@@ -701,7 +711,6 @@ async def lifespan(app: FastAPI):
             "ON users(last_seen_at DESC)"
         )
 
-        # Community schema
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS community_messages (
                 id              SERIAL PRIMARY KEY,
@@ -727,7 +736,6 @@ async def lifespan(app: FastAPI):
             "ON community_messages(sender_id)"
         )
 
-        # ── NEW — settings-tree tables ────────────────────────
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS addresses (
                 id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1031,12 +1039,12 @@ app.include_router(courier_router)
 app.include_router(wallet_router)
 app.include_router(order_router)
 app.include_router(profile_router)
-app.include_router(profile_extras_router)   # ✅ NEW — /profile/me, addresses, blocked, activity
+app.include_router(profile_extras_router)
 app.include_router(events_router)
 app.include_router(flipper_router)
 app.include_router(services_router)
 app.include_router(auth_router)
-app.include_router(auth_extras_router)      # ✅ NEW — /auth/2fa, sessions, phone/email change
+app.include_router(auth_extras_router)
 app.include_router(seai_search_router)
 app.include_router(presence_router)
 app.include_router(community_router)
@@ -1059,7 +1067,7 @@ app.include_router(basket_router)
 app.include_router(maintenance_router)
 app.include_router(settings.router)
 app.include_router(notifications_router)
-app.include_router(feedback_router)         # ✅ NEW — /feedback/*
+app.include_router(feedback_router)
 
 
 @app.exception_handler(RequestValidationError)
