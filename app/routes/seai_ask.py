@@ -96,6 +96,22 @@ This is the most common mistake. Get it right:
 
 If the user hasn't explicitly said "book", "schedule", or "reserve", use search_items.
 
+## CRITICAL — multiple items in one query
+If the user asks for MORE THAN ONE thing ("I need a laptop, a suit, and meatballs"),
+call search_items ONCE FOR EACH ITEM. Do NOT collapse into one search. Do NOT ask
+permission to search for the others. Fire all searches in the same turn.
+Then in your reply, summarize the best match for each item in one short response.
+
+Examples of multi-item queries:
+  "I need a laptop, a suit, and meatballs"
+     → search_items("laptop") + search_items("suit") + search_items("meatballs")
+  "Find me a phone and a charger"
+     → search_items("phone") + search_items("charger")
+  "Looking for shoes, a shirt and a watch"
+     → search_items("shoes") + search_items("shirt") + search_items("watch")
+
+If the user asks for ONE thing, fire ONE search. Do not over-search.
+
 ## LANGUAGE RULES
 - Always say "item" or "items". NEVER say "product" or "products".
 - Match Admerce vocabulary: item, listing, store, service.
@@ -135,10 +151,11 @@ the capability.
 
 ### When you have search results:
 The tools already return ONLY the closest, most relevant matches for the query.
-- Mention the CLOSEST ONE or TWO results — never list them all.
+- Mention the CLOSEST ONE or TWO results per item — never list them all.
 - Lead with distance ("Just 2 min away…", "Right around the corner at…").
 - Say the store/provider name and price naturally.
-- Do NOT enumerate more than 2 results unless the user asked to see everything.
+- For MULTI-ITEM queries, give one line per item.
+- Do NOT enumerate more than 2 results per item unless the user asked to see everything.
 - If the top result is a SERVICE, mention the provider name and service name.
 - If the top result is a STORE, mention the store name and what they sell.
 
@@ -149,14 +166,15 @@ If your previous search found nothing and the user asks why, explain clearly:
 
 ### Never:
 - Say "product" — always "item"
-- Dump every result the tool returned — pick the best 1–2
+- Dump every result the tool returned — pick the best 1–2 per item
 - Repeat the previous response verbatim
 - Say "I found N results"
 - Call search_items as a reflex for conversational messages
 - Route "find a service" to book_service
+- Ask permission to search for the other items in a multi-item query — just search them
 - Deny having image search capability
 
-Keep responses under 60 words unless asked for detail."""
+Keep responses under 80 words unless asked for detail."""
 
 
 def _tools():
@@ -196,7 +214,9 @@ def _tools():
                     "Use for any find/show/browse/look-for query — whether "
                     "the user wants a physical item, a service (plumber, "
                     "haircut, cleaning), or a store. Returns the best matches "
-                    "across all three categories, sorted by distance."
+                    "across all three categories, sorted by distance. "
+                    "If the user asks for multiple items in one message, call "
+                    "this tool once for each item."
                 ),
                 "parameters": {
                     "type": "object",
@@ -287,7 +307,7 @@ def _is_empty_result(result: dict) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PROVIDER FALLBACK CHAIN
+# ENTRYPOINT — provider fallback chain
 # ═══════════════════════════════════════════════════════════════════
 
 @router.post("/ask")
@@ -331,9 +351,9 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
     cards_payload: Optional[dict] = None
 
     # ── First call: only send tools when we actually want tool-calling ──
-    # BUG FIX: never send tools alongside tool_choice="none". Groq's
-    # gpt-oss-120b hallucinates a tool call anyway and 400s. When
-    # conversational, strip tools from the payload entirely.
+    # Never send tools alongside tool_choice="none". Groq's gpt-oss-120b
+    # hallucinates a tool call anyway and 400s. When conversational, strip
+    # tools from the payload entirely.
     first_kwargs = {
         "model": model,
         "messages": messages,
@@ -348,7 +368,7 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
         resp = await client.chat.completions.create(**first_kwargs)
     except Exception as e:
         err = str(e).lower()
-        # Belt-and-suspenders: if the model still refused (rare), retry text-only
+        # Belt-and-suspenders: if the model still refused, retry text-only
         if "tool" in err and not conversational:
             print(f"⚠️  Tool call rejected, retrying text-only: {e}", flush=True)
             retry_kwargs = {
@@ -370,24 +390,59 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
             media_type="text/event-stream",
         )
 
-    call = tool_calls[0]
-    fn = call.function.name
-    try:
-        args = json.loads(call.function.arguments or "{}")
-    except json.JSONDecodeError:
-        args = {}
+    # ── Execute EVERY tool call the model returned ──────────────────
+    # OpenAI-compatible models fire multiple calls in one response when
+    # the user asks for multiple things (e.g. laptop + suit + meatballs).
+    # Executing only the first discards the rest, which is why SEAI used to
+    # find one item and then ask permission to search for the others.
+    merged_results: list = []
+    last_result: Optional[dict] = None
+    primary_query: Optional[str] = None
 
-    print(f"🔧 SEAI tool call: {fn}({args})", flush=True)
+    for call in tool_calls:
+        fn = call.function.name
+        try:
+            args = json.loads(call.function.arguments or "{}")
+        except json.JSONDecodeError:
+            args = {}
 
-    result = await _execute_agent_function(fn, args, user_id, req.lat, req.lng)
+        print(f"🔧 SEAI tool call: {fn}({args})", flush=True)
 
-    if result.get("type") == "action" and result.get("intent") == "search_results":
-        cards_payload = result["data"]
+        r = await _execute_agent_function(fn, args, user_id, req.lat, req.lng)
+        last_result = r
+
+        if r.get("type") == "action" and r.get("intent") == "search_results":
+            data = r.get("data", {})
+            if primary_query is None:
+                primary_query = data.get("query")
+            merged_results.extend(data.get("results", []))
+
+    if merged_results:
+        seen = set()
+        deduped = []
+        for r in merged_results:
+            key = (
+                r.get("type"),
+                r.get("listing_id") or r.get("service_id") or r.get("store_id"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
+        cards_payload = {
+            "query": primary_query or req.query,
+            "results": deduped[:5],
+        }
+
+    result = last_result if last_result is not None else {
+        "type": "text",
+        "text": "I couldn't complete that action.",
+    }
 
     # ── Empty result: ask the model for a clean, natural reply ──
-    # BUG FIX: use a fresh message list. Do NOT append the assistant
-    # message containing tool_calls then call without tools — Groq
-    # rejects that as "tool_choice is none, but model called a tool".
+    # Use a fresh message list. Do NOT append the assistant message
+    # containing tool_calls then call without tools — Groq rejects that
+    # as "tool_choice is none, but model called a tool".
     if cards_payload is None and _is_empty_result(result):
         refinement_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -421,8 +476,10 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
     if cards_payload is None:
         return _respond_from_result(result)
 
-    # ── Have cards: ask the model for a 1-2 sentence intro ──
-    compact = _compact_for_llm(result)
+    # ── Have cards: ask the model for a short intro ──
+    compact = _compact_for_llm(
+        {"type": "action", "intent": "search_results", "data": cards_payload}
+    )
     intro_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": req.query},
@@ -430,8 +487,8 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
             "role": "system",
             "content": (
                 f"Search results: {json.dumps(compact)}. "
-                "Write a 1-2 sentence intro highlighting the closest / best option. "
-                "Do NOT list them all. Do NOT say 'I found N results'."
+                "Write a 1-2 sentence intro highlighting the closest / best option "
+                "for each item. Do NOT list them all. Do NOT say 'I found N results'."
             ),
         },
     ]
@@ -439,7 +496,7 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
         final = await client.chat.completions.create(
             model=model,
             messages=intro_messages,
-            max_tokens=140,
+            max_tokens=160,
             temperature=0.7,
         )
         intro = (final.choices[0].message.content or "").strip().strip('"')
@@ -622,7 +679,7 @@ async def _handle_reserve_item(
         }
 
     order_id = f"ord_{uuid.uuid4().hex[:8]}"
-    # FIX: use timezone-aware UTC to match DB TIMESTAMPTZ
+    # Aware UTC — matches TIMESTAMPTZ columns in the DB
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(hours=2)
 
@@ -693,11 +750,11 @@ async def _handle_reserve_item(
 
 
 def _compact_for_llm(result: dict) -> dict:
-    """Cap at 3 — enough for the LLM to pick the top 1–2, not enough to dump."""
+    """Cap at 4 — enough for the LLM to pick the top 1–2 per item, not enough to dump."""
     if result.get("type") != "action":
         return result
     data = result.get("data", {})
-    items = data.get("results", [])[:3]
+    items = data.get("results", [])[:4]
     slim = [
         {
             "type": r.get("type"),
@@ -725,7 +782,23 @@ def _fallback_intro(results: list) -> str:
         if r.get("travel_minutes"):
             bits.append(f"~{r['travel_minutes']} min away")
         return " ".join(bits) + "."
-    return f"{len(results)} options nearby — the closest is {results[0].get('title', 'the first one')}."
+
+    # Multi-item: one line per item
+    lines = []
+    for r in results[:3]:
+        title = r.get("title") or "An option"
+        sn = r.get("store_name") or r.get("provider_name")
+        price = r.get("price")
+        tm = r.get("travel_minutes")
+        line = title
+        if sn:
+            line += f" at {sn}"
+        if price:
+            line += f" — ₦{int(float(price)):,}"
+        if tm:
+            line += f" (~{tm} min)"
+        lines.append("• " + line)
+    return "Nearby options:\n" + "\n".join(lines)
 
 
 async def _regex_fallback(req: AskRequest, user_id: Optional[str]):
