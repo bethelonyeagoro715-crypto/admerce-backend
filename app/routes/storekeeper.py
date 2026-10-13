@@ -11,7 +11,7 @@ from app.services.image_embedder import (
     is_real_embedding,
 )
 from app.services.auto_fill import suggest_from_barcode
-from app.utils.category_utils import validate_product_category
+from app.utils.category_utils import validate_item_category
 from app.services.cloudinary_service import upload_image
 from fastapi.responses import FileResponse
 from PIL import Image
