@@ -244,6 +244,14 @@ _MINOR_WORDS = {
     "purple", "orange", "brown", "grey", "gray", "silver", "gold",
 }
 
+# Urgency words are modifiers, not items. Strip them from fragments
+# before search so "footwear urgently" searches "footwear", not
+# "footwear urgently". Prevents phantom "• urgently — nothing nearby".
+_URGENCY_WORDS = {
+    "urgently", "asap", "immediately", "quickly", "quick", "fast",
+    "now", "today", "right away", "right now",
+}
+
 _LEADING_FILLER_RE = re.compile(
     r"^(?:okay|ok|hi|hey|hello|please|so|"
     r"i|you|we|they|he|she|"
@@ -301,6 +309,14 @@ def _split_items_heuristically(query: str) -> Optional[List[str]]:
     fragments: List[str] = []
     for p in parts:
         stripped = _strip_filler(p)
+
+        # Strip urgency words — they're modifiers, not items.
+        for w in list(_URGENCY_WORDS):
+            stripped = re.sub(
+                rf"\b{re.escape(w)}\b", "", stripped, flags=re.IGNORECASE
+            ).strip()
+        stripped = re.sub(r"\s+", " ", stripped).strip()
+
         if len(stripped) < 3:
             continue
         if not _has_content_word(stripped):
