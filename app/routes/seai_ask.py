@@ -2,6 +2,7 @@ import json
 import os
 import re
 import uuid
+import asyncio
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -24,7 +25,6 @@ router = APIRouter(prefix="/seai", tags=["SEAI Agent"])
 
 _groq = AsyncGroq(api_key=os.getenv("GROQ_API_KEY")) if os.getenv("GROQ_API_KEY") else None
 
-# ── NVIDIA NIM (fallback, OpenAI-compatible) ─────────────────
 try:
     from app.services.llm_agent import (
         _nvidia_client as _nvidia,
@@ -62,116 +62,61 @@ You have FOUR tools:
 2. search_items(query)
    Search ITEMS, SERVICES, and STORES near the user.
    Use whenever the user wants to FIND, SEE, BROWSE, EXPLORE, or SEARCH — whether the thing is a physical item OR a service OR a store.
-   The tool returns the best matches across all three categories, sorted by distance.
    Examples:
      "find iphone"                    → search_items(query="iPhone 14")
      "show me pizza"                  → search_items(query="pizza")
      "I'm looking for shoes"          → search_items(query="shoes")
      "where can I get a haircut"      → search_items(query="haircut")
-     "show me cleaning services"      → search_items(query="cleaning")
      "I need a plumber"               → search_items(query="plumber")
-     "any phone repairs around?"      → search_items(query="phone repair")
      "services near me"               → search_items(query="services")
-     "what stores are open"           → search_items(query="stores")
 
 3. book_service(service)
    BOOK/COMMIT to a service the user already wants. Only when the user says BOOK, SCHEDULE, or confirms a specific service.
-   NOT for browsing or finding services.
    Examples:
      "book a haircut for tomorrow"    → book_service(service="haircut")
      "schedule a plumber"             → book_service(service="plumber")
-     "I want to book cleaning"        → book_service(service="cleaning")
 
 4. get_store_info(store)
-   Get details about a specific store BY NAME. Only when the user names a store.
+   Get details about a specific store BY NAME.
 
 ## CRITICAL — search vs book
-This is the most common mistake. Get it right:
 - "Find a plumber"        → search_items (user wants to SEE options)
 - "Show me plumbers"      → search_items
-- "Any plumbers around?"  → search_items
 - "Book a plumber"        → book_service (user wants to COMMIT)
 - "Schedule a plumber"    → book_service
-- "I'll take the second one" → book_service
 
 If the user hasn't explicitly said "book", "schedule", or "reserve", use search_items.
-
-## CRITICAL — multiple items in one query
-If the user asks for MORE THAN ONE thing ("I need a laptop, a suit, and meatballs"),
-call search_items ONCE FOR EACH ITEM. Do NOT collapse into one search. Do NOT ask
-permission to search for the others. Fire all searches in the same turn.
-Then in your reply, summarize the best match for each item in one short response.
-
-Examples of multi-item queries:
-  "I need a laptop, a suit, and meatballs"
-     → search_items("laptop") + search_items("suit") + search_items("meatballs")
-  "Find me a phone and a charger"
-     → search_items("phone") + search_items("charger")
-  "Looking for shoes, a shirt and a watch"
-     → search_items("shoes") + search_items("shirt") + search_items("watch")
-
-If the user asks for ONE thing, fire ONE search. Do not over-search.
 
 ## LANGUAGE RULES
 - Always say "item" or "items". NEVER say "product" or "products".
 - Match Admerce vocabulary: item, listing, store, service.
 
-## CRITICAL RULES
-
-### When to use a tool:
-- User names or implies an ITEM, SERVICE, or STORE to find/browse → search_items
-- User wants to RESERVE a physical item → reserve_item
-- User wants to BOOK a specific service (committed) → book_service
-- User asks about a specific store by name → get_store_info
-
-### When NOT to use a tool:
+## When NOT to use a tool:
 - Follow-up questions: "but why", "why not", "how come", "hmm", "ok", "tell me more"
 - Greetings: "hi", "hello", "hey"
 - Meta questions: "what can you do", "how does this work", "are you sure"
 - Thanks: "thanks", "thank you", "nice"
 
 For these, respond CONVERSATIONALLY using the previous turn as context.
-NEVER re-call the previous tool for a follow-up question.
 
-### Image search
+## Image search
 The Admerce SEAI interface has an attach button (➕) next to the text input.
-Users can tap it to upload a photo. That photo is analyzed by a separate
-vision service which identifies the object and shows matching listings
-nearby as cards.
+Tell users to tap it to upload a photo — the app analyzes it and shows
+matching items nearby. NEVER claim SEAI has no image support.
 
-If the user asks about images, photos, or visual search:
-- Tell them to tap the ➕ button next to the input to upload a photo
-- The image will be analyzed and matching items shown as cards
-- NEVER claim SEAI has no image support — it does, through the attach flow
-- NEVER say "I don't have image-analysis built into this chat"
-
-You personally cannot see images typed into the chat. But the app can
-analyze uploaded photos. Guide users to the ➕ button instead of denying
-the capability.
-
-### When you have search results:
-The tools already return ONLY the closest, most relevant matches for the query.
-- Mention the CLOSEST ONE or TWO results per item — never list them all.
-- Lead with distance ("Just 2 min away…", "Right around the corner at…").
+## When you have search results:
+- Mention the CLOSEST ONE or TWO results per item.
+- Lead with distance ("Just 2 min away…").
 - Say the store/provider name and price naturally.
-- For MULTI-ITEM queries, give one line per item.
-- Do NOT enumerate more than 2 results per item unless the user asked to see everything.
 - If the top result is a SERVICE, mention the provider name and service name.
 - If the top result is a STORE, mention the store name and what they sell.
 
-### Explaining empty results:
-If your previous search found nothing and the user asks why, explain clearly:
-- "I searched items and services in your area and none matched '<query>'."
-- Suggest a next step: "Try a broader term" or "Want a wanted alert so you're notified when one is posted?"
-
-### Never:
+## Never:
 - Say "product" — always "item"
-- Dump every result the tool returned — pick the best 1–2 per item
+- Dump every result the tool returned
 - Repeat the previous response verbatim
 - Say "I found N results"
-- Call search_items as a reflex for conversational messages
 - Route "find a service" to book_service
-- Ask permission to search for the other items in a multi-item query — just search them
 - Deny having image search capability
 
 Keep responses under 80 words unless asked for detail."""
@@ -191,15 +136,8 @@ def _tools():
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Short item name, e.g. 'iPhone 14'",
-                        },
-                        "quantity": {
-                            "type": "integer",
-                            "description": "How many. Default 1.",
-                            "default": 1,
-                        },
+                        "query": {"type": "string", "description": "Short item name, e.g. 'iPhone 14'"},
+                        "quantity": {"type": "integer", "description": "How many. Default 1.", "default": 1},
                     },
                     "required": ["query"],
                 },
@@ -211,24 +149,14 @@ def _tools():
                 "name": "search_items",
                 "description": (
                     "Search ITEMS, SERVICES, and STORES near the user. "
-                    "Use for any find/show/browse/look-for query — whether "
-                    "the user wants a physical item, a service (plumber, "
-                    "haircut, cleaning), or a store. Returns the best matches "
-                    "across all three categories, sorted by distance. "
-                    "If the user asks for multiple items in one message, call "
-                    "this tool once for each item."
+                    "Use for any find/show/browse/look-for query. "
+                    "If the user asks for multiple items in one message, "
+                    "call this tool once per item."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": (
-                                "Search terms — item name, service type, or "
-                                "store name. E.g. 'iPhone 14', 'plumber', "
-                                "'haircut', 'Graham Hub'."
-                            ),
-                        },
+                        "query": {"type": "string", "description": "Search terms."},
                     },
                     "required": ["query"],
                 },
@@ -241,8 +169,7 @@ def _tools():
                 "description": (
                     "COMMIT to booking a service the user has already chosen. "
                     "Only for explicit BOOK / SCHEDULE / RESERVE requests on a "
-                    "service — never for browsing. If the user is just looking "
-                    "for services, use search_items instead."
+                    "service — never for browsing."
                 ),
                 "parameters": {
                     "type": "object",
@@ -307,7 +234,170 @@ def _is_empty_result(result: dict) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ENTRYPOINT — provider fallback chain
+# MULTI-ITEM DETECTION (deterministic — no LLM dependency)
+# ═══════════════════════════════════════════════════════════════════
+
+_MINOR_WORDS = {
+    "size", "color", "colour", "small", "medium", "large",
+    "tiny", "huge", "big", "some", "another", "new", "old",
+    "red", "blue", "green", "black", "white", "yellow", "pink",
+    "purple", "orange", "brown", "grey", "gray", "silver", "gold",
+}
+
+_LEADING_FILLER_RE = re.compile(
+    r"^(?:okay|ok|hi|hey|hello|please|so|"
+    r"i|you|we|they|he|she|"
+    r"have|has|had|having|"
+    r"a|an|the|some|another|new|"
+    r"friend|friends|that|who|which|"
+    r"need|needs|needed|want|wants|wanted|"
+    r"to|be|am|is|are|was|were|"
+    r"looking|looks|looked|for|"
+    r"find|finds|found|show|shows|showed|"
+    r"me|my|our|get|gets|got|"
+    r"search|searching|"
+    r"eat|eats|eating|"
+    r"buy|buys|buying|"
+    r"and|also|plus)\s+",
+    re.IGNORECASE,
+)
+
+
+def _strip_filler(text: str) -> str:
+    prev = None
+    cur = text.strip().strip(".,!?;:")
+    while prev != cur:
+        prev = cur
+        cur = _LEADING_FILLER_RE.sub("", cur).strip().strip(".,!?;:")
+    return cur
+
+
+def _has_content_word(text: str) -> bool:
+    for w in re.findall(r"[a-z]+", text.lower()):
+        if len(w) >= 3 and w not in _MINOR_WORDS:
+            return True
+    return False
+
+
+def _split_items_heuristically(query: str) -> Optional[List[str]]:
+    """If the query clearly asks for multiple items, return the fragments.
+    Otherwise return None. Deterministic — no LLM dependency."""
+    q = query.strip()
+    if not q or len(q) > 400:
+        return None
+
+    # Require a conjunction or comma — single-item queries never split.
+    lower = q.lower()
+    if " and " not in lower and "," not in q:
+        return None
+
+    parts = re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+", q, flags=re.IGNORECASE)
+
+    fragments: List[str] = []
+    for p in parts:
+        stripped = _strip_filler(p)
+        if len(stripped) < 3:
+            continue
+        if not _has_content_word(stripped):
+            continue
+        fragments.append(stripped)
+
+    if len(fragments) < 2:
+        return None
+    return fragments
+
+
+async def _search_multi_items(req: AskRequest, user_id: Optional[str], items: List[str]):
+    """Fire one search per item in parallel, merge, return cards + intro."""
+
+    async def _one(item: str):
+        try:
+            return await handle_search_items({"query": item}, req.lat, req.lng, user_id)
+        except Exception as e:
+            print(f"⚠️  multi-item search failed for '{item}': {e}", flush=True)
+            return None
+
+    results = await asyncio.gather(*[_one(i) for i in items])
+
+    merged: list = []
+    seen = set()
+    for r in results:
+        if not r or r.get("type") != "action":
+            continue
+        for item in r.get("data", {}).get("results", []):
+            key = (
+                item.get("type"),
+                item.get("listing_id") or item.get("service_id") or item.get("store_id"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+
+    if not merged:
+        return StreamingResponse(
+            _stream_text(
+                f"I searched for {', '.join(items)} nearby but found nothing. "
+                "Try broader terms or a different area."
+            ),
+            media_type="text/event-stream",
+        )
+
+    # Keep up to 2 results per original item, cap 6 total
+    per_item: Dict[str, int] = {}
+    trimmed: list = []
+    for r in merged:
+        title = (r.get("title") or "").lower()
+        matched_item = None
+        for it in items:
+            if any(tok in title for tok in it.lower().split() if len(tok) >= 3):
+                matched_item = it
+                break
+        k = matched_item or "__other__"
+        per_item[k] = per_item.get(k, 0) + 1
+        if per_item[k] <= 2:
+            trimmed.append(r)
+        if len(trimmed) >= 6:
+            break
+
+    payload = {"query": req.query, "results": trimmed}
+
+    # Build intro line-by-line: one line per requested item
+    lines: list = []
+    for it in items:
+        toks = [t for t in it.lower().split() if len(t) >= 3]
+        match = next(
+            (r for r in trimmed if any(t in (r.get("title") or "").lower() for t in toks)),
+            None,
+        )
+        if match:
+            price = match.get("price")
+            tm = match.get("travel_minutes")
+            store = match.get("store_name") or match.get("provider_name")
+            line = f"• {match.get('title')}"
+            if store:
+                line += f" at {store}"
+            if price:
+                try:
+                    line += f" — ₦{int(float(price)):,}"
+                except Exception:
+                    pass
+            if tm:
+                line += f" (~{tm} min)"
+            lines.append(line)
+        else:
+            lines.append(f"• {it} — nothing nearby")
+
+    intro = "Here's what I found:\n" + "\n".join(lines)
+
+    return StreamingResponse(
+        _stream_text_and_action(intro, payload),
+        media_type="text/event-stream",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ENTRYPOINT — multi-item shortcut, then provider fallback chain
 # ═══════════════════════════════════════════════════════════════════
 
 @router.post("/ask")
@@ -317,26 +407,36 @@ async def seai_ask(
 ):
     user_id = current_user["id"] if current_user else None
 
-    # 1) Groq (primary — fastest, cheapest)
+    # Multi-item shortcut — deterministic, no LLM dependency.
+    # If the query clearly asks for multiple things, fire one search per
+    # item directly. Do not rely on the model to fire parallel tool calls,
+    # because gpt-oss-120b frequently doesn't.
+    if not _is_conversational(req.query):
+        items = _split_items_heuristically(req.query)
+        if items and len(items) >= 2:
+            print(f"🧩 Multi-item query detected: {items}", flush=True)
+            return await _search_multi_items(req, user_id, items)
+
+    # 1) Groq (primary)
     if GROQ_ENABLED and _groq is not None:
         try:
             return await _agent_loop(req, user_id, _groq, GROQ_MODEL)
         except Exception as e:
             print(f"❌ Groq agent failed, trying NVIDIA: {e}", flush=True)
 
-    # 2) NVIDIA NIM (OpenAI-compatible, same tool-calling interface)
+    # 2) NVIDIA NIM fallback
     if NVIDIA_ENABLED and _nvidia is not None:
         try:
             return await _agent_loop(req, user_id, _nvidia, NVIDIA_MODEL)
         except Exception as e:
             print(f"❌ NVIDIA agent failed, falling back to regex: {e}", flush=True)
 
-    # 3) Regex fallback (no LLM — always works)
+    # 3) Regex fallback
     return await _regex_fallback(req, user_id)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# AGENT LOOP (provider-agnostic — pass any OpenAI-compatible client)
+# AGENT LOOP
 # ═══════════════════════════════════════════════════════════════════
 
 async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: str):
@@ -350,10 +450,6 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
     conversational = _is_conversational(req.query)
     cards_payload: Optional[dict] = None
 
-    # ── First call: only send tools when we actually want tool-calling ──
-    # Never send tools alongside tool_choice="none". Groq's gpt-oss-120b
-    # hallucinates a tool call anyway and 400s. When conversational, strip
-    # tools from the payload entirely.
     first_kwargs = {
         "model": model,
         "messages": messages,
@@ -368,7 +464,6 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
         resp = await client.chat.completions.create(**first_kwargs)
     except Exception as e:
         err = str(e).lower()
-        # Belt-and-suspenders: if the model still refused, retry text-only
         if "tool" in err and not conversational:
             print(f"⚠️  Tool call rejected, retrying text-only: {e}", flush=True)
             retry_kwargs = {
@@ -390,11 +485,6 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
             media_type="text/event-stream",
         )
 
-    # ── Execute EVERY tool call the model returned ──────────────────
-    # OpenAI-compatible models fire multiple calls in one response when
-    # the user asks for multiple things (e.g. laptop + suit + meatballs).
-    # Executing only the first discards the rest, which is why SEAI used to
-    # find one item and then ask permission to search for the others.
     merged_results: list = []
     last_result: Optional[dict] = None
     primary_query: Optional[str] = None
@@ -429,20 +519,13 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
                 continue
             seen.add(key)
             deduped.append(r)
-        cards_payload = {
-            "query": primary_query or req.query,
-            "results": deduped[:5],
-        }
+        cards_payload = {"query": primary_query or req.query, "results": deduped[:5]}
 
     result = last_result if last_result is not None else {
         "type": "text",
         "text": "I couldn't complete that action.",
     }
 
-    # ── Empty result: ask the model for a clean, natural reply ──
-    # Use a fresh message list. Do NOT append the assistant message
-    # containing tool_calls then call without tools — Groq rejects that
-    # as "tool_choice is none, but model called a tool".
     if cards_payload is None and _is_empty_result(result):
         refinement_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -476,7 +559,6 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
     if cards_payload is None:
         return _respond_from_result(result)
 
-    # ── Have cards: ask the model for a short intro ──
     compact = _compact_for_llm(
         {"type": "action", "intent": "search_results", "data": cards_payload}
     )
@@ -679,7 +761,6 @@ async def _handle_reserve_item(
         }
 
     order_id = f"ord_{uuid.uuid4().hex[:8]}"
-    # Aware UTC — matches TIMESTAMPTZ columns in the DB
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(hours=2)
 
@@ -750,7 +831,6 @@ async def _handle_reserve_item(
 
 
 def _compact_for_llm(result: dict) -> dict:
-    """Cap at 4 — enough for the LLM to pick the top 1–2 per item, not enough to dump."""
     if result.get("type") != "action":
         return result
     data = result.get("data", {})
@@ -783,7 +863,6 @@ def _fallback_intro(results: list) -> str:
             bits.append(f"~{r['travel_minutes']} min away")
         return " ".join(bits) + "."
 
-    # Multi-item: one line per item
     lines = []
     for r in results[:3]:
         title = r.get("title") or "An option"
@@ -794,7 +873,10 @@ def _fallback_intro(results: list) -> str:
         if sn:
             line += f" at {sn}"
         if price:
-            line += f" — ₦{int(float(price)):,}"
+            try:
+                line += f" — ₦{int(float(price)):,}"
+            except Exception:
+                pass
         if tm:
             line += f" (~{tm} min)"
         lines.append("• " + line)
