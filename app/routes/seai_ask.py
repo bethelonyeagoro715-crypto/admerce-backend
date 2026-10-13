@@ -2,7 +2,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -23,6 +23,18 @@ from app.services.llm_agent import GROQ_ENABLED, GROQ_MODEL
 router = APIRouter(prefix="/seai", tags=["SEAI Agent"])
 
 _groq = AsyncGroq(api_key=os.getenv("GROQ_API_KEY")) if os.getenv("GROQ_API_KEY") else None
+
+# ── NVIDIA NIM (fallback, OpenAI-compatible) ─────────────────
+try:
+    from app.services.llm_agent import (
+        _nvidia_client as _nvidia,
+        NVIDIA_ENABLED,
+        NVIDIA_MODEL,
+    )
+except Exception:
+    _nvidia = None
+    NVIDIA_ENABLED = False
+    NVIDIA_MODEL = ""
 
 
 class AskRequest(BaseModel):
@@ -116,10 +128,6 @@ If the user asks about images, photos, or visual search:
 - The image will be analyzed and matching items shown as cards
 - NEVER claim SEAI has no image support — it does, through the attach flow
 - NEVER say "I don't have image-analysis built into this chat"
-
-Example responses:
-- "Tap the ➕ button next to the input and upload your photo — I'll search for visually similar items nearby."
-- "Yes — tap ➕ to upload a picture of what you're looking for."
 
 You personally cannot see images typed into the chat. But the app can
 analyze uploaded photos. Guide users to the ➕ button instead of denying
@@ -278,18 +286,40 @@ def _is_empty_result(result: dict) -> bool:
     )
 
 
+# ═══════════════════════════════════════════════════════════════════
+# PROVIDER FALLBACK CHAIN
+# ═══════════════════════════════════════════════════════════════════
+
 @router.post("/ask")
 async def seai_ask(
     req: AskRequest,
     current_user: Optional[dict] = Depends(get_optional_user),
 ):
     user_id = current_user["id"] if current_user else None
-    if not GROQ_ENABLED or _groq is None:
-        return await _regex_fallback(req, user_id)
-    return await _groq_agent_loop(req, user_id)
+
+    # 1) Groq (primary — fastest, cheapest)
+    if GROQ_ENABLED and _groq is not None:
+        try:
+            return await _agent_loop(req, user_id, _groq, GROQ_MODEL)
+        except Exception as e:
+            print(f"❌ Groq agent failed, trying NVIDIA: {e}", flush=True)
+
+    # 2) NVIDIA NIM (OpenAI-compatible, same tool-calling interface)
+    if NVIDIA_ENABLED and _nvidia is not None:
+        try:
+            return await _agent_loop(req, user_id, _nvidia, NVIDIA_MODEL)
+        except Exception as e:
+            print(f"❌ NVIDIA agent failed, falling back to regex: {e}", flush=True)
+
+    # 3) Regex fallback (no LLM — always works)
+    return await _regex_fallback(req, user_id)
 
 
-async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
+# ═══════════════════════════════════════════════════════════════════
+# AGENT LOOP (provider-agnostic — pass any OpenAI-compatible client)
+# ═══════════════════════════════════════════════════════════════════
+
+async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: str):
     messages: list = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in req.conversation_history[-8:]:
         role = m.get("role", "user")
@@ -298,94 +328,132 @@ async def _groq_agent_loop(req: AskRequest, user_id: Optional[str]):
     messages.append({"role": "user", "content": req.query})
 
     conversational = _is_conversational(req.query)
-
     cards_payload: Optional[dict] = None
 
+    # ── First call: only send tools when we actually want tool-calling ──
+    # BUG FIX: never send tools alongside tool_choice="none". Groq's
+    # gpt-oss-120b hallucinates a tool call anyway and 400s. When
+    # conversational, strip tools from the payload entirely.
+    first_kwargs = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 400,
+        "temperature": 0.4,
+    }
+    if not conversational:
+        first_kwargs["tools"] = _tools()
+        first_kwargs["tool_choice"] = "auto"
+
     try:
-        resp = await _groq.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            tools=_tools(),
-            tool_choice="none" if conversational else "auto",
-            max_tokens=400,
-            temperature=0.4,
+        resp = await client.chat.completions.create(**first_kwargs)
+    except Exception as e:
+        err = str(e).lower()
+        # Belt-and-suspenders: if the model still refused (rare), retry text-only
+        if "tool" in err and not conversational:
+            print(f"⚠️  Tool call rejected, retrying text-only: {e}", flush=True)
+            retry_kwargs = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": 400,
+                "temperature": 0.4,
+            }
+            resp = await client.chat.completions.create(**retry_kwargs)
+        else:
+            raise
+
+    msg = resp.choices[0].message
+    tool_calls = getattr(msg, "tool_calls", None)
+
+    if not tool_calls:
+        return StreamingResponse(
+            _stream_text(msg.content or "How can I help?"),
+            media_type="text/event-stream",
         )
-        msg = resp.choices[0].message
-        tool_calls = getattr(msg, "tool_calls", None)
 
-        if not tool_calls:
-            return StreamingResponse(
-                _stream_text(msg.content or "How can I help?"),
-                media_type="text/event-stream",
-            )
+    call = tool_calls[0]
+    fn = call.function.name
+    try:
+        args = json.loads(call.function.arguments or "{}")
+    except json.JSONDecodeError:
+        args = {}
 
-        call = tool_calls[0]
-        fn = call.function.name
+    print(f"🔧 SEAI tool call: {fn}({args})", flush=True)
+
+    result = await _execute_agent_function(fn, args, user_id, req.lat, req.lng)
+
+    if result.get("type") == "action" and result.get("intent") == "search_results":
+        cards_payload = result["data"]
+
+    # ── Empty result: ask the model for a clean, natural reply ──
+    # BUG FIX: use a fresh message list. Do NOT append the assistant
+    # message containing tool_calls then call without tools — Groq
+    # rejects that as "tool_choice is none, but model called a tool".
+    if cards_payload is None and _is_empty_result(result):
+        refinement_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": req.query},
+            {
+                "role": "system",
+                "content": (
+                    f"The search returned: {json.dumps(result)}. "
+                    "Write a short, natural 1-2 sentence reply explaining that "
+                    "nothing matched and suggesting a next step."
+                ),
+            },
+        ]
         try:
-            args = json.loads(call.function.arguments or "{}")
-        except json.JSONDecodeError:
-            args = {}
-
-        print(f"🔧 SEAI tool call: {fn}({args})", flush=True)
-
-        result = await _execute_agent_function(fn, args, user_id, req.lat, req.lng)
-
-        if result.get("type") == "action" and result.get("intent") == "search_results":
-            cards_payload = result["data"]
-
-        if cards_payload is None and _is_empty_result(result):
-            messages.append(msg)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": json.dumps(result),
-            })
-            try:
-                final = await _groq.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=messages,
-                    max_tokens=160,
-                    temperature=0.6,
+            final = await client.chat.completions.create(
+                model=model,
+                messages=refinement_messages,
+                max_tokens=160,
+                temperature=0.6,
+            )
+            refined = (final.choices[0].message.content or "").strip().strip('"')
+            if refined:
+                return StreamingResponse(
+                    _stream_text(refined),
+                    media_type="text/event-stream",
                 )
-                refined = (final.choices[0].message.content or "").strip().strip('"')
-                if refined:
-                    return StreamingResponse(
-                        _stream_text(refined),
-                        media_type="text/event-stream",
-                    )
-            except Exception as e:
-                print(f"⚠️  Empty-result refinement failed: {e}")
-            return _respond_from_result(result)
+        except Exception as e:
+            print(f"⚠️  Empty-result refinement failed: {e}", flush=True)
+        return _respond_from_result(result)
 
-        if cards_payload is None:
-            return _respond_from_result(result)
+    if cards_payload is None:
+        return _respond_from_result(result)
 
-        compact = _compact_for_llm(result)
-        messages.append(msg)
-        messages.append({
-            "role": "tool",
-            "tool_call_id": call.id,
-            "content": json.dumps(compact),
-        })
-
-        final = await _groq.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
+    # ── Have cards: ask the model for a 1-2 sentence intro ──
+    compact = _compact_for_llm(result)
+    intro_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": req.query},
+        {
+            "role": "system",
+            "content": (
+                f"Search results: {json.dumps(compact)}. "
+                "Write a 1-2 sentence intro highlighting the closest / best option. "
+                "Do NOT list them all. Do NOT say 'I found N results'."
+            ),
+        },
+    ]
+    try:
+        final = await client.chat.completions.create(
+            model=model,
+            messages=intro_messages,
             max_tokens=140,
             temperature=0.7,
         )
         intro = (final.choices[0].message.content or "").strip().strip('"')
-        if not intro:
-            intro = _fallback_intro(cards_payload.get("results", []))
-
-        return StreamingResponse(
-            _stream_text_and_action(intro, cards_payload),
-            media_type="text/event-stream",
-        )
-
     except Exception as e:
-        print(f"❌ SEAI agent error: {e}")
-        return await _regex_fallback(req, user_id)
+        print(f"⚠️  Intro refinement failed: {e}", flush=True)
+        intro = ""
+
+    if not intro:
+        intro = _fallback_intro(cards_payload.get("results", []))
+
+    return StreamingResponse(
+        _stream_text_and_action(intro, cards_payload),
+        media_type="text/event-stream",
+    )
 
 
 async def _execute_agent_function(
@@ -554,7 +622,8 @@ async def _handle_reserve_item(
         }
 
     order_id = f"ord_{uuid.uuid4().hex[:8]}"
-    now = datetime.utcnow()
+    # FIX: use timezone-aware UTC to match DB TIMESTAMPTZ
+    now = datetime.now(timezone.utc)
     expires_at = now + timedelta(hours=2)
 
     await database.execute(
