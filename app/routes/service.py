@@ -1156,12 +1156,15 @@ async def book_service(
     customer_id = current_user["id"]
     _rate_limit(f"book:{customer_id}", max_calls=20, window_sec=60)
 
-    service = await database.fetch_one(
+    # ✅ FIX: fetch as Record, then convert to dict so .get() works everywhere below
+    service_row = await database.fetch_one(
         "SELECT * FROM services WHERE service_id = :sid AND is_active = TRUE",
         {"sid": service_id},
     )
-    if not service:
+    if not service_row:
         raise HTTPException(status_code=404, detail="Service not found or inactive")
+
+    service = dict(service_row)
 
     if customer_id == service["provider_id"]:
         raise HTTPException(status_code=400, detail="You cannot book your own service")
@@ -1231,7 +1234,7 @@ async def book_service(
         logger.exception("book_service failed service=%s user=%s", service_id, customer_id)
         raise HTTPException(status_code=500, detail="Could not create booking.")
 
-    # Notify provider
+    # Notify provider — ✅ service is now a dict, .get() works
     cust_label = await _customer_label(customer_id)
     await _notify_user(
         service["provider_id"],
