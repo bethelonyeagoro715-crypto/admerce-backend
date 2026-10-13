@@ -288,10 +288,15 @@ def _split_items_heuristically(query: str) -> Optional[List[str]]:
 
     # Require a conjunction or comma — single-item queries never split.
     lower = q.lower()
-    if " and " not in lower and "," not in q:
+    if not any(sep in lower for sep in (" and ", ",", " with ", " plus ", " & ", " + ")):
         return None
 
-    parts = re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+", q, flags=re.IGNORECASE)
+    # Split on commas, " and ", " with ", " plus ", " & ", " + ".
+    parts = re.split(
+        r"\s*,\s*(?:and\s+)?|\s+(?:and|with|plus|&|\+)\s+",
+        q,
+        flags=re.IGNORECASE,
+    )
 
     fragments: List[str] = []
     for p in parts:
