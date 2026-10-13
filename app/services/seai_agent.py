@@ -79,6 +79,38 @@ def _tokenize(text: str) -> list[str]:
     return [w for w in words if w not in STOP_WORDS and len(w) > 1]
 
 
+# ════════════════════════════════════════════════════════════════
+# CATEGORY EXPANSION
+# Expands broad category words ("footwear", "electronics") into their
+# concrete terms using product_category_map. Non-category tokens pass
+# through unchanged. Fails safe: on any DB error, returns tokens as-is.
+# ════════════════════════════════════════════════════════════════
+async def _expand_category_terms(tokens: list[str]) -> list[str]:
+    if not tokens:
+        return tokens
+
+    terms = [t.lower() for t in tokens]
+    try:
+        rows = await database.fetch_all(
+            "SELECT expands_to FROM product_category_map "
+            "WHERE search_term = ANY(:terms)",
+            {"terms": terms},
+        )
+    except Exception as e:
+        print(f"⚠️  category map lookup failed: {e}", flush=True)
+        return tokens
+
+    expanded = list(tokens)
+    seen = set(t.lower() for t in expanded)
+    for row in rows:
+        for term in (row["expands_to"] or []):
+            low = term.lower()
+            if low not in seen:
+                seen.add(low)
+                expanded.append(term)
+    return expanded
+
+
 def _travel_minutes(distance_km: float) -> int:
     if distance_km <= 0:
         return 0
@@ -103,6 +135,11 @@ async def _query_relevant_items(
     limit: int = 5,
 ) -> list[dict]:
     tokens = _tokenize(query)
+    if not tokens:
+        return []
+
+    # Expand category words into concrete search terms
+    tokens = await _expand_category_terms(tokens)
     if not tokens:
         return []
 
@@ -182,10 +219,6 @@ async def _query_relevant_items(
     return scored[:limit]
 
 
-# ════════════════════════════════════════════════════════════
-# FIXED — removed s.address (column doesn't exist on services),
-#         added relevance scoring, expanded to search category + provider name
-# ════════════════════════════════════════════════════════════
 async def _service_recall(
     query: str,
     lat: float,
@@ -194,6 +227,11 @@ async def _service_recall(
     limit: int = 3,
 ):
     tokens = _tokenize(query)
+    if not tokens:
+        return []
+
+    # Expand category words into concrete search terms
+    tokens = await _expand_category_terms(tokens)
     if not tokens:
         return []
 
@@ -221,7 +259,6 @@ async def _service_recall(
         )
     score_expr = " + ".join(score_terms)
 
-    # ✅ No s.address — that column doesn't exist on the services table.
     sql = f"""
         SELECT s.service_id, s.title, s.price, s.lat, s.lng, s.image_url,
                s.provider_id, s.category,
@@ -267,10 +304,7 @@ async def _service_recall(
             "address": None,
         })
 
-    # Filter out zero-relevance in case the SQL matched something irrelevant
     results = [r for r in results if r["relevance"] > 0]
-
-    # Sort by (relevance desc, distance asc)
     results.sort(key=lambda x: (-x["relevance"], x["distance_km"]))
     return results[:limit]
 
@@ -320,11 +354,6 @@ async def _store_recall(query: str, lat: float, lng: float, radius_km: float, li
     return results[:limit]
 
 
-# ════════════════════════════════════════════════════════════
-# FIXED — items and services run in PARALLEL, merged, then
-#         interleaved by a combined relevance score. Stores remain
-#         a final fallback.
-# ════════════════════════════════════════════════════════════
 async def handle_search_items(
     params: dict,
     lat: float = 6.5,
@@ -335,8 +364,6 @@ async def handle_search_items(
     if not query:
         return {"type": "text", "text": "What are you looking for?"}
 
-    # ── Tier 1 & 2: items AND services run together ─────────
-    # Wrapped so one failing doesn't kill the other.
     import asyncio
 
     async def safe_items():
@@ -355,7 +382,6 @@ async def handle_search_items(
 
     items, services = await asyncio.gather(safe_items(), safe_services())
 
-    # ── Tier 3: stores only when nothing else matched ───────
     stores = []
     if not items and not services:
         try:
@@ -425,7 +451,6 @@ async def handle_search_items(
             ),
         })
 
-    # Cap at 5 — mix of items and services, sorted by distance
     top = all_results[:5]
 
     if not top:
