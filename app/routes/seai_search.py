@@ -2,7 +2,7 @@ import re
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from typing import Optional, List, Literal
-from datetime import datetime
+from datetime import datetime, timezone
 from app.db.database import database
 from app.utils import haversine
 
@@ -35,20 +35,34 @@ class SuggestionResult(BaseModel):
     type: Literal["product", "service", "store"]
     listing_id: str
 
-def parse_datetime(value):
+
+def _now_utc() -> datetime:
+    """Always return an aware UTC datetime."""
+    return datetime.now(timezone.utc)
+
+
+def parse_datetime(value) -> datetime:
+    """Parse anything into an aware UTC datetime. Never returns naive."""
     if value is None:
-        return datetime.utcnow()
+        return _now_utc()
     if isinstance(value, datetime):
-        return value
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value)
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
         except ValueError:
-            return datetime.utcnow()
+            return _now_utc()
     try:
-        return datetime.fromtimestamp(float(value))
+        dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        return dt
     except (TypeError, ValueError, OSError):
-        return datetime.utcnow()
+        return _now_utc()
+
 
 def _get_coords(row) -> Optional[tuple]:
     keys = set(row.keys())
@@ -174,7 +188,7 @@ async def _search_products(lat, lng, radius_km, pattern=None):
             WHERE l.quantity_available > 0
             """
         )
-    now = datetime.utcnow()
+    now = _now_utc()
     results = []
     for row in rows:
         coords = _get_coords(row)
@@ -213,7 +227,7 @@ async def _search_services(lat, lng, radius_km, pattern=None):
         )
     else:
         rows = await database.fetch_all("SELECT * FROM services")
-    now = datetime.utcnow()
+    now = _now_utc()
     results = []
     for row in rows:
         coords = _get_coords(row)
@@ -252,7 +266,7 @@ async def _search_stores(lat, lng, radius_km, pattern=None):
         )
     else:
         rows = await database.fetch_all("SELECT * FROM stores")
-    now = datetime.utcnow()
+    now = _now_utc()
     results = []
     for row in rows:
         coords = _get_coords(row)
@@ -291,15 +305,6 @@ async def seai_search(req: SearchRequest):
         + await _search_services(req.lat, req.lng, req.radius_km, pattern)
         + await _search_stores(req.lat, req.lng, req.radius_km, pattern)
     )
-
-    # If no query, show everything within radius.
-    # If query exists and no matches -> empty list (no fallback).
-    if not pattern:
-        results = (
-            await _search_products(req.lat, req.lng, req.radius_km)
-            + await _search_services(req.lat, req.lng, req.radius_km)
-            + await _search_stores(req.lat, req.lng, req.radius_km)
-        )
 
     results = _dedupe(results)
     results.sort(key=lambda x: x["score"], reverse=True)
