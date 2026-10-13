@@ -258,7 +258,7 @@ _LEADING_FILLER_RE = re.compile(
     r"search|searching|"
     r"eat|eats|eating|"
     r"buy|buys|buying|"
-    r"and|also|plus)\s+",
+    r"and|also|plus)\s*",
     re.IGNORECASE,
 )
 
