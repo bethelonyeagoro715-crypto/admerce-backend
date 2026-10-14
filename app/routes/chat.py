@@ -1,31 +1,33 @@
 import os
-import uuid
 import json
 import hmac
 import hashlib
 import tempfile
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File, Form, Body
 from pydantic import BaseModel
 from app.db.database import database
 from app.utils.security import get_current_user
 from app.services.transcription_service import transcribe_audio
-# ✅ NEW — Cloudinary for durable voice note storage
 from app.services.cloudinary_service import upload_video
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
-# ✅ WhatsApp parity limits
 EDIT_WINDOW_MINUTES = 15
 DELETE_FOR_EVERYONE_WINDOW_MINUTES = 60
 
-# ✅ Jitsi room derivation — HMAC of conversation_id with server secret.
 _JITSI_SECRET = os.getenv("JITSI_SECRET", os.getenv("JWT_SECRET", "change-me")).encode()
 JITSI_BASE_URL = os.getenv("JITSI_BASE_URL", "https://meet.jit.si")
 
+# ── In-memory typing state ─────────────────────────────────────
+# Fine for a single Render worker. If you ever set WEB_CONCURRENCY>1,
+# move this to Redis or a small Postgres table.
+_typing_state: dict[str, dict[str, float]] = {}
+TYPING_TTL_SECONDS = 5
 
-# ---------- Models ----------
+
 class SendMessageRequest(BaseModel):
     receiver_id: str
     text: str = ""
@@ -40,8 +42,10 @@ class CallSignalRequest(BaseModel):
     receiver_id: str
     data: str
 
+class TypingRequest(BaseModel):
+    conversation_id: str
 
-# ---------- Helpers ----------
+
 async def _resolve_receiver_id(receiver_id: str, current_user_id: str) -> str:
     if "_" not in receiver_id:
         store = await database.fetch_one(
@@ -70,21 +74,15 @@ def _validate_conversation_id(conversation_id: str, user_id: str) -> Optional[st
 
 
 async def _hydrate_messages(rows, user_id: str) -> list[dict]:
-    """
-    Convert raw message rows to API dicts, adding reply context and
-    masking content for deleted-for-everyone messages.
-    """
     out = []
     for row in rows:
         d = dict(row)
 
-        # Mask deleted-for-everyone content
         if d.get("deleted_for_everyone"):
             d["text"] = None
             d["image_url"] = None
             d["audio_url"] = None
 
-        # Attach parent reply context if present
         if d.get("reply_to_id"):
             parent = await database.fetch_one(
                 """
@@ -122,9 +120,8 @@ async def send_message(
         raise HTTPException(status_code=400, detail="Cannot message yourself")
 
     conversation_id = await _get_conversation_id(sender_id, receiver_id)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
-    # Validate reply_to_id if present — must be in the same conversation
     reply_to_id = req.reply_to_id
     if reply_to_id is not None:
         parent = await database.fetch_one(
@@ -140,7 +137,8 @@ async def send_message(
     )
     sender_name = sender["name"] if sender else sender_id
 
-    result = await database.execute(
+    # ✅ FIX — use fetch_val so RETURNING id actually returns the id.
+    new_id = await database.fetch_val(
         """
         INSERT INTO messages
             (conversation_id, sender_id, receiver_id, sender_name, text,
@@ -161,8 +159,13 @@ async def send_message(
         },
     )
 
+    # Clear my typing state — I just sent.
+    conv_state = _typing_state.get(conversation_id)
+    if conv_state:
+        conv_state.pop(sender_id, None)
+
     return {
-        "id": result,
+        "id": new_id,
         "conversation_id": conversation_id,
         "sender_id": sender_id,
         "receiver_id": receiver_id,
@@ -172,6 +175,42 @@ async def send_message(
         "created_at": now,
         "message": "Message sent",
     }
+
+
+# ---------- Typing indicator ----------
+@router.post("/typing")
+async def set_typing(
+    req: TypingRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Client calls this on every keystroke, throttled to ~2s."""
+    user_id = current_user["id"]
+    valid = _validate_conversation_id(req.conversation_id, user_id)
+    if not valid:
+        raise HTTPException(status_code=403, detail="Invalid conversation ID")
+    _typing_state.setdefault(req.conversation_id, {})[user_id] = time.time()
+    return {"ok": True}
+
+
+@router.get("/typing/{conversation_id}")
+async def get_typing(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Client polls this every ~2s while the chat screen is open."""
+    user_id = current_user["id"]
+    valid = _validate_conversation_id(conversation_id, user_id)
+    if not valid:
+        raise HTTPException(status_code=403, detail="Invalid conversation ID")
+
+    now = time.time()
+    users = _typing_state.get(conversation_id, {})
+    for uid in list(users.keys()):
+        if now - users[uid] > TYPING_TTL_SECONDS:
+            del users[uid]
+
+    other_typing = any(uid != user_id for uid in users.keys())
+    return {"typing": other_typing}
 
 
 # ---------- Edit message ----------
@@ -199,13 +238,15 @@ async def edit_message(
         raise HTTPException(status_code=400, detail="Cannot edit a deleted message")
 
     created_at = row["created_at"]
-    if created_at and datetime.utcnow() - created_at > timedelta(minutes=EDIT_WINDOW_MINUTES):
+    if created_at and created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    if created_at and datetime.now(timezone.utc) - created_at > timedelta(minutes=EDIT_WINDOW_MINUTES):
         raise HTTPException(
             status_code=403,
             detail=f"Edit window closed ({EDIT_WINDOW_MINUTES} min)",
         )
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     await database.execute(
         "UPDATE messages SET text = :t, edited_at = :now WHERE id = :id",
         {"t": new_text, "now": now, "id": message_id},
@@ -239,7 +280,7 @@ async def delete_message(
     if user_id not in (row["sender_id"], row["receiver_id"]):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     if scope == "me":
         await database.execute(
@@ -252,7 +293,6 @@ async def delete_message(
         )
         return {"id": message_id, "scope": "me", "message": "Deleted for you"}
 
-    # scope == "all"
     if row["sender_id"] != user_id:
         raise HTTPException(
             status_code=403,
@@ -262,7 +302,9 @@ async def delete_message(
         return {"id": message_id, "scope": "all", "message": "Already deleted"}
 
     created_at = row["created_at"]
-    if created_at and datetime.utcnow() - created_at > timedelta(
+    if created_at and created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    if created_at and datetime.now(timezone.utc) - created_at > timedelta(
         minutes=DELETE_FOR_EVERYONE_WINDOW_MINUTES
     ):
         raise HTTPException(
@@ -301,26 +343,16 @@ async def send_voice(
     if sender_id == receiver_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
 
-    # ── Read the file once into memory ────────────────────────
     audio_bytes = await audio.read()
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Empty audio file")
 
     ext = os.path.splitext(audio.filename or "")[1].lower() or ".webm"
-    # Cloudinary's `upload_video` handles audio under resource_type=video.
-    # Extension is inferred from content-type; keep the original suffix
-    # for the transcription pass below.
 
-    # ── Transcription (best-effort; never blocks the send) ────
-    # `transcribe_audio` expects a filesystem path, so we write to a
-    # temporary file and delete it immediately. If transcription fails
-    # for any reason, we still ship the voice note.
     transcription = ""
     tmp_path: Optional[str] = None
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=ext, delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
         transcription = transcribe_audio(tmp_path) or ""
@@ -334,10 +366,6 @@ async def send_voice(
             except Exception:
                 pass
 
-    # ── Upload to Cloudinary (durable, survives deploys) ──────
-    # ✅ FIX: was writing to `uploads/voice/{uuid}.webm` on the Render
-    #    container's ephemeral disk. Every deploy wiped it. Old voice
-    #    notes served 404. Cloudinary URLs are permanent.
     try:
         audio_url = upload_video(audio_bytes, folder="voice_notes")
     except Exception as e:
@@ -345,9 +373,8 @@ async def send_voice(
         raise HTTPException(status_code=500, detail="Voice note upload failed")
 
     conversation_id = await _get_conversation_id(sender_id, receiver_id)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
-    # Validate reply target if present
     if reply_to_id is not None:
         parent = await database.fetch_one(
             "SELECT id FROM messages WHERE id = :pid AND conversation_id = :cid",
@@ -356,14 +383,14 @@ async def send_voice(
         if not parent:
             reply_to_id = None
 
-    # Populate sender_name for consistency with text messages
     sender = await database.fetch_one(
         "SELECT COALESCE(nickname, phone, id) AS name FROM users WHERE id = :uid",
         {"uid": sender_id},
     )
     sender_name = sender["name"] if sender else sender_id
 
-    result = await database.execute(
+    # ✅ FIX — fetch_val so RETURNING id returns the new id.
+    new_id = await database.fetch_val(
         """
         INSERT INTO messages
             (conversation_id, sender_id, receiver_id, sender_name,
@@ -385,8 +412,12 @@ async def send_voice(
         },
     )
 
+    conv_state = _typing_state.get(conversation_id)
+    if conv_state:
+        conv_state.pop(sender_id, None)
+
     return {
-        "id": result,
+        "id": new_id,
         "conversation_id": conversation_id,
         "sender_id": sender_id,
         "receiver_id": receiver_id,
@@ -429,20 +460,62 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
         if len(parts) != 2:
             continue
         other_id = parts[0] if parts[1] == user_id else parts[1]
+
+        # ✅ FIX — pull the same columns as presence.py so the fallback
+        # chain matches everywhere. Previously this only looked at
+        # nickname + phone, so providers/storekeepers showed as "Unknown".
         other_user = await database.fetch_one(
-            "SELECT nickname, phone, avatar_url FROM users WHERE id = :uid",
-            {"uid": other_id}
+            """
+            SELECT u.nickname, u.real_name, u.first_name, u.last_name,
+                   u.phone, u.business_name, u.avatar_url,
+                   u.business_image_url, u.role,
+                   s.name            AS own_store_name,
+                   s.store_image_url AS own_store_image
+            FROM users u
+            LEFT JOIN stores s ON s.owner_id = u.id
+            WHERE u.id = :uid
+            """,
+            {"uid": other_id},
         )
-        other_name = other_user["nickname"] or other_user["phone"] if other_user else "Unknown"
+
+        if other_user:
+            ou = dict(other_user)
+            role = (ou.get("role") or "").lower()
+
+            name = (
+                ou.get("business_name")
+                or ou.get("own_store_name")
+                or ou.get("nickname")
+                or ou.get("real_name")
+            )
+            if not name and (ou.get("first_name") or ou.get("last_name")):
+                name = " ".join(
+                    p for p in [ou.get("first_name"), ou.get("last_name")] if p
+                ).strip() or None
+            if not name and ou.get("phone"):
+                name = ou["phone"]
+            if not name:
+                name = other_id[:8]
+
+            if role == "service_provider" and ou.get("business_image_url"):
+                avatar = ou["business_image_url"]
+            elif role == "storekeeper" and ou.get("own_store_image"):
+                avatar = ou["own_store_image"]
+            else:
+                avatar = ou.get("avatar_url")
+        else:
+            name = "Unknown"
+            avatar = None
+
         conversations.append({
             "conversation_id": row["conversation_id"],
             "other_user_id": other_id,
-            "other_user_name": other_name,
-            "other_user_avatar": other_user["avatar_url"] if other_user else None,
+            "other_user_name": name,
+            "other_user_avatar": avatar,
             "last_message": row["last_message"],
             "last_sender_id": row["last_sender"],
             "last_time": row["last_time"],
-            "unread_count": row["unread_count"]
+            "unread_count": row["unread_count"],
         })
 
     return conversations
@@ -557,7 +630,6 @@ async def get_call_room(
     current_user: dict = Depends(get_current_user),
 ):
     user_id = current_user["id"]
-
     valid = _validate_conversation_id(conversation_id, user_id)
     if not valid:
         raise HTTPException(status_code=403, detail="Invalid conversation ID")
@@ -574,7 +646,7 @@ async def get_call_room(
     }
 
 
-# ---------- Legacy WebRTC signaling (kept for compatibility) ----------
+# ---------- Legacy WebRTC signaling ----------
 @router.post("/call/offer")
 async def send_offer(req: CallSignalRequest, current_user: dict = Depends(get_current_user)):
     await _store_signal(req.conversation_id, current_user["id"], req.receiver_id, "offer", req.data)
@@ -608,7 +680,7 @@ async def poll_signals(conversation_id: str, current_user: dict = Depends(get_cu
 
 
 async def _store_signal(conv_id: str, sender: str, receiver: str, signal_type: str, data: str):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     await database.execute(
         "INSERT INTO call_signals (conversation_id, sender_id, receiver_id, type, data, created_at) "
         "VALUES (:cid, :sid, :rid, :type, :data, :now)",
@@ -629,7 +701,7 @@ async def save_seai_exchange(
         raise HTTPException(status_code=400, detail="Missing text")
 
     conversation_id = f"{user_id}_seai"
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     await database.execute(
         """
