@@ -343,3 +343,197 @@ async def login_activity(
         {"uid": current_user["id"], "lim": limit},
     )
     return [dict(r) for r in rows]
+
+# ─────────────────────────────────────────────────────────────
+# USER FOLLOWS
+# ─────────────────────────────────────────────────────────────
+
+class CreateHighlightRequest(BaseModel):
+    emoji: str
+    label: str
+    route: str
+
+
+@router.get("/{user_id}/follow-status")
+async def get_follow_status(
+    user_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Whether the current user follows `user_id`, plus both counts.
+    Self-view returns is_self=True and zeros.
+    """
+    if user_id == current_user["id"]:
+        return {
+            "is_following": False,
+            "followers_count": 0,
+            "following_count": 0,
+            "is_self": True,
+        }
+
+    row = await database.fetch_one(
+        """
+        SELECT 1 AS x FROM user_follows
+         WHERE follower_id = :fid AND following_id = :tid
+        """,
+        {"fid": current_user["id"], "tid": user_id},
+    )
+    counts = await database.fetch_one(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM user_follows WHERE following_id = :uid) AS followers,
+            (SELECT COUNT(*) FROM user_follows WHERE follower_id  = :uid) AS following
+        """,
+        {"uid": user_id},
+    )
+    return {
+        "is_following": row is not None,
+        "followers_count": int(counts["followers"]) if counts else 0,
+        "following_count": int(counts["following"]) if counts else 0,
+        "is_self": False,
+    }
+
+
+@router.post("/{user_id}/follow", status_code=201)
+async def follow_user(
+    user_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="Cannot follow yourself")
+
+    target = await database.fetch_one(
+        "SELECT 1 AS x FROM users WHERE id = :uid", {"uid": user_id}
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    await database.execute(
+        """
+        INSERT INTO user_follows (follower_id, following_id)
+        VALUES (:fid, :tid)
+        ON CONFLICT DO NOTHING
+        """,
+        {"fid": current_user["id"], "tid": user_id},
+    )
+    count = await database.fetch_val(
+        "SELECT COUNT(*) FROM user_follows WHERE following_id = :uid",
+        {"uid": user_id},
+    )
+    return {"following": True, "followers_count": int(count or 0)}
+
+
+@router.delete("/{user_id}/follow")
+async def unfollow_user(
+    user_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    await database.execute(
+        """
+        DELETE FROM user_follows
+         WHERE follower_id = :fid AND following_id = :tid
+        """,
+        {"fid": current_user["id"], "tid": user_id},
+    )
+    count = await database.fetch_val(
+        "SELECT COUNT(*) FROM user_follows WHERE following_id = :uid",
+        {"uid": user_id},
+    )
+    return {"following": False, "followers_count": int(count or 0)}
+
+
+# ─────────────────────────────────────────────────────────────
+# PROFILE HIGHLIGHTS (user-curated shortcut strip)
+# ─────────────────────────────────────────────────────────────
+
+def _safe_route(route: str) -> bool:
+    if not route or not route.startswith("/"):
+        return False
+    if route.startswith("//") or route.startswith("/\\"):
+        return False
+    if "http" in route.lower() or "://" in route:
+        return False
+    if len(route) > 300:
+        return False
+    return True
+
+
+@router.get("/highlights")
+async def list_my_highlights(current_user: dict = Depends(get_current_user)):
+    rows = await database.fetch_all(
+        """
+        SELECT id, emoji, label, route, sort_order, created_at
+          FROM profile_highlights
+         WHERE user_id = :uid
+         ORDER BY sort_order ASC, created_at ASC
+        """,
+        {"uid": current_user["id"]},
+    )
+    return [dict(r) for r in rows]
+
+
+@router.post("/highlights", status_code=201)
+async def create_highlight(
+    req: CreateHighlightRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    emoji = (req.emoji or "").strip()[:8]
+    label = (req.label or "").strip()
+    route = (req.route or "").strip()
+
+    if not emoji or not label or not route:
+        raise HTTPException(status_code=400, detail="emoji, label and route are required")
+    if len(label) > 20:
+        raise HTTPException(status_code=400, detail="label max 20 chars")
+    if not _safe_route(route):
+        raise HTTPException(status_code=400, detail="Invalid route")
+
+    # Enforce a small cap to prevent abuse
+    count = await database.fetch_val(
+        "SELECT COUNT(*) FROM profile_highlights WHERE user_id = :uid",
+        {"uid": current_user["id"]},
+    )
+    if int(count or 0) >= 12:
+        raise HTTPException(status_code=400, detail="Maximum 12 highlights")
+
+    hid = str(uuid.uuid4())
+    await database.execute(
+        """
+        INSERT INTO profile_highlights (id, user_id, emoji, label, route)
+        VALUES (:id, :uid, :e, :l, :r)
+        """,
+        {"id": hid, "uid": current_user["id"], "e": emoji, "l": label, "r": route},
+    )
+    return {"id": hid, "emoji": emoji, "label": label, "route": route}
+
+
+@router.delete("/highlights/{highlight_id}")
+async def delete_highlight(
+    highlight_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    result = await database.execute(
+        "DELETE FROM profile_highlights WHERE id = :id AND user_id = :uid",
+        {"id": highlight_id, "uid": current_user["id"]},
+    )
+    if isinstance(result, str) and result.strip().endswith("0"):
+        raise HTTPException(status_code=404, detail="Highlight not found")
+    return {"message": "Highlight deleted"}
+
+
+@router.get("/{user_id}/highlights")
+async def get_user_highlights(
+    user_id: str,
+    _: dict = Depends(get_current_user),
+):
+    """Public highlight list for another user."""
+    rows = await database.fetch_all(
+        """
+        SELECT id, emoji, label, route
+          FROM profile_highlights
+         WHERE user_id = :uid
+         ORDER BY sort_order ASC, created_at ASC
+        """,
+        {"uid": user_id},
+    )
+    return {"highlights": [dict(r) for r in rows]}
