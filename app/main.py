@@ -70,9 +70,8 @@ from app.routes.seai_search import router as seai_search_router
 from app.routes.presence import router as presence_router
 from app.routes.community import router as community_router
 from app.routes.maintenance import router as maintenance_router
-from app.routes.funding import router as funding_router
 
-# ── NEW — settings-tree routers ────────────────────────────────
+# ── settings-tree routers ──────────────────────────────────────
 from app.routes.auth_extras import router as auth_extras_router
 from app.routes.profile_extras import router as profile_extras_router
 from app.routes.feedback import router as feedback_router
@@ -123,9 +122,6 @@ def _aware(dt):
     return dt.astimezone(timezone.utc)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Refund helper — Anchor first, legacy wallet fallback
-# ═══════════════════════════════════════════════════════════════════
 async def _refund_via_anchor_or_legacy(
     *,
     shopper_id: str,
@@ -135,18 +131,13 @@ async def _refund_via_anchor_or_legacy(
     bucket: str = "shopping",
 ) -> bool:
     """
-    Try to refund via an Anchor book transfer (escrow holding → shopper).
-    Returns True if Anchor path succeeded, False if we fell back to the
-    legacy wallet balance update.
-
-    Fails soft: any Anchor error falls through to the legacy path so
-    refunds keep working while you're mid-migration.
+    Try an Anchor book transfer (escrow holding → shopper). Falls back to
+    the legacy wallet update if Anchor isn't configured or errors out.
     """
     if amount <= 0:
         return False
 
     if not anchor.is_configured():
-        # Legacy path
         await database.execute(
             "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
             {"amt": amount, "uid": shopper_id},
@@ -158,7 +149,6 @@ async def _refund_via_anchor_or_legacy(
         shopper_sub = await _get_user_sub_account(shopper_id)
     except HTTPException as exc:
         print(f"⚠️  Refund prep failed ({reference}): {exc.detail}")
-        # Fall back to legacy
         await database.execute(
             "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
             {"amt": amount, "uid": shopper_id},
@@ -182,10 +172,8 @@ async def _refund_via_anchor_or_legacy(
         )
         transfer_id = (result or {}).get("transfer_id")
 
-        # Credit the display ledger
         await _credit_ledger(shopper_id, bucket, amount)
 
-        # Audit row
         await database.execute(
             """
             INSERT INTO wallet_transactions
@@ -212,9 +200,6 @@ async def _refund_via_anchor_or_legacy(
         return False
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Background loop 1 — expired escrows
-# ═══════════════════════════════════════════════════════════════════
 async def _refund_expired_escrows() -> None:
     while True:
         try:
@@ -252,9 +237,6 @@ async def _refund_expired_escrows() -> None:
         await asyncio.sleep(60)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Background loop 2 — expired service bookings
-# ═══════════════════════════════════════════════════════════════════
 async def _expire_stale_bookings() -> None:
     LOCKED_GRACE_HOURS = 24
     ACCEPTED_GRACE_HOURS = 72
@@ -330,15 +312,7 @@ async def _expire_stale_bookings() -> None:
         await asyncio.sleep(15 * 60)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Background loop 3 — reconcile pending Anchor transfers
-# ═══════════════════════════════════════════════════════════════════
 async def _reconcile_anchor_transfers() -> None:
-    """
-    Every 60s, ask Anchor for the real status of pending transfers that
-    haven't been confirmed by a webhook. Heals the system if webhooks
-    are missed or delayed.
-    """
     while True:
         try:
             if anchor.is_configured():
@@ -595,7 +569,6 @@ async def lifespan(app: FastAPI):
             ("created_at", "TIMESTAMP DEFAULT NOW()"),
             ("expires_at", "TIMESTAMP"),
             ("order_store_id", "INTEGER"),
-            # ── Anchor transfer tracking ───────────────────────
             ("anchor_transfer_id", "TEXT"),
             ("anchor_released_at", "TIMESTAMPTZ"),
         ]:
@@ -1066,7 +1039,6 @@ async def lifespan(app: FastAPI):
             "CREATE INDEX IF NOT EXISTS idx_user_ledger_user ON user_ledger(user_id)"
         )
 
-        # Backfill every user × every bucket at 0
         conn.exec_driver_sql("""
             INSERT INTO user_ledger (user_id, bucket, amount)
             SELECT u.id, b.bucket, 0
@@ -1144,13 +1116,48 @@ async def lifespan(app: FastAPI):
             ON CONFLICT (key) DO NOTHING
         """)
 
+        # ═══════════════════════════════════════════════════════════
+        # Social: user_follows (asymmetric follow graph)
+        # ═══════════════════════════════════════════════════════════
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS user_follows (
+                follower_id  TEXT NOT NULL,
+                following_id TEXT NOT NULL,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (follower_id, following_id)
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_user_follows_following "
+            "ON user_follows (following_id, created_at DESC)"
+        )
+
+        # ═══════════════════════════════════════════════════════════
+        # Social: profile_highlights (user-curated shortcut strip)
+        # ═══════════════════════════════════════════════════════════
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS profile_highlights (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id     TEXT NOT NULL,
+                emoji       TEXT NOT NULL,
+                label       TEXT NOT NULL,
+                route       TEXT NOT NULL,
+                sort_order  INTEGER DEFAULT 0,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_profile_highlights_user "
+            "ON profile_highlights (user_id, sort_order, created_at)"
+        )
+
     print("✅ Schema migrations complete.")
 
     await database.connect()
     print("✅ Async database pool connected.")
 
     # ═══════════════════════════════════════════════════════════
-    # Wallet + booking tables (async — must run after connect)
+    # Wallet + booking tables (async — after connect)
     # ═══════════════════════════════════════════════════════════
     await database.execute("""
         CREATE TABLE IF NOT EXISTS provider_availability (
@@ -1312,9 +1319,9 @@ async def lifespan(app: FastAPI):
     # ═══════════════════════════════════════════════════════════
     # Background tasks
     # ═══════════════════════════════════════════════════════════
-    task_escrow    = asyncio.create_task(_refund_expired_escrows())
-    task_bookings  = asyncio.create_task(_expire_stale_bookings())
-    task_recon     = asyncio.create_task(_reconcile_anchor_transfers())
+    task_escrow   = asyncio.create_task(_refund_expired_escrows())
+    task_bookings = asyncio.create_task(_expire_stale_bookings())
+    task_recon    = asyncio.create_task(_reconcile_anchor_transfers())
     print("✅ Server is ready.")
     yield
 
@@ -1364,7 +1371,7 @@ app.include_router(shopper_router)
 app.include_router(storekeeper_router)
 app.include_router(courier_router)
 app.include_router(wallet_router)
-app.include_router(webhook_router)          # ✅ Anchor webhooks
+app.include_router(webhook_router)
 app.include_router(order_router)
 app.include_router(profile_router)
 app.include_router(profile_extras_router)
@@ -1396,7 +1403,6 @@ app.include_router(maintenance_router)
 app.include_router(settings.router)
 app.include_router(notifications_router)
 app.include_router(feedback_router)
-app.include_router(funding_router)
 
 
 @app.exception_handler(RequestValidationError)
