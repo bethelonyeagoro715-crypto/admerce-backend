@@ -70,6 +70,7 @@ from app.routes.seai_search import router as seai_search_router
 from app.routes.presence import router as presence_router
 from app.routes.community import router as community_router
 from app.routes.maintenance import router as maintenance_router
+from app.routes.funding import router as funding_router
 
 # ── NEW — settings-tree routers ────────────────────────────────
 from app.routes.auth_extras import router as auth_extras_router
@@ -1395,6 +1396,7 @@ app.include_router(maintenance_router)
 app.include_router(settings.router)
 app.include_router(notifications_router)
 app.include_router(feedback_router)
+app.include_router(funding_router)
 
 
 @app.exception_handler(RequestValidationError)
