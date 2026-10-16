@@ -722,25 +722,33 @@ async def get_upload(file_path: str):
 # ==================== GET STORE DETAILS ====================
 @router.get("/store/{store_id}")
 async def get_store(store_id: str):
-    row = await database.fetch_one("SELECT * FROM stores WHERE store_id = :sid", {"sid": store_id})
+    row = await database.fetch_one(
+        "SELECT * FROM stores WHERE store_id = :sid", {"sid": store_id}
+    )
     if not row:
         raise HTTPException(status_code=404, detail="Store not found")
-    return dict(row)
 
-# ==================== STORE LOCATIONS ====================
-@router.get("/stores/locations")
-async def get_store_locations():
-    stores = await database.fetch_all(
-        "SELECT s.store_id, s.name AS store_name, s.latitude, s.longitude, "
-        "s.store_image_url AS image_url, "
-        "s.image_width, s.image_height, "
-        "CASE WHEN COUNT(l.listing_id) > 0 THEN true ELSE false END AS has_stock "
-        "FROM stores s "
-        "LEFT JOIN listings l ON s.store_id = l.store_id AND l.quantity_available > 0 "
-        "GROUP BY s.store_id, s.name, s.latitude, s.longitude, "
-        "s.store_image_url, s.image_width, s.image_height"
-    )
-    return [dict(store) for store in stores]
+    store = dict(row)
+
+    # Public social proof: unique buyers who actually received goods.
+    owner_id = store.get("owner_id")
+    patronizer_count = 0
+    if owner_id:
+        try:
+            patronizer_count = await database.fetch_val(
+                """
+                SELECT COUNT(DISTINCT shopper_id)
+                  FROM escrow
+                 WHERE storekeeper_id = :oid
+                   AND status IN ('picked_up', 'dispatched', 'completed')
+                """,
+                {"oid": owner_id},
+            ) or 0
+        except Exception as e:
+            print(f"⚠️  patronizer count failed for {store_id}: {e}")
+
+    store["patronizer_count"] = int(patronizer_count)
+    return store
 
 # ==================== GET ITEMS FOR A STORE ====================
 @router.get("/items/{store_id}")
