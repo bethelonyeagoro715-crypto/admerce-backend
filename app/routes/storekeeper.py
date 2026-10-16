@@ -396,7 +396,7 @@ async def create_listing(
     style: str = Form("warm"),
     quantity: int = Form(1),
 ):
-    if not validate_product_category(category):
+    if not validate_item_category(category):
         raise HTTPException(
             status_code=400,
             detail=f"Invalid category: '{category}'. Valid categories are: tech_electronics, food_beverage, health_wellness, fashion_apparel, building_industrial, home_garden, kids_toys, sports_outdoors, automotive, media_office"
