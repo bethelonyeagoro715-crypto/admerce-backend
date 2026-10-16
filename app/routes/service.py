@@ -1272,3 +1272,20 @@ async def get_provider_services_by_user(provider_id: str):
         {"pid": provider_id},
     )
     return [dict(row) for row in rows]
+
+
+# ==================== PUBLIC PATRONIZER COUNT ====================
+# Same idea as the store's patronizer count: unique buyers who actually
+# received the service. Anonymous so a shopper can see it before login.
+@router.get("/provider/{provider_id}/patronizers")
+async def get_provider_patronizer_count(provider_id: str):
+    count = await database.fetch_val(
+        """
+        SELECT COUNT(DISTINCT customer_id)
+          FROM service_bookings
+         WHERE provider_id = :pid
+           AND status = 'completed'
+        """,
+        {"pid": provider_id},
+    )
+    return {"patronizer_count": int(count or 0)}
