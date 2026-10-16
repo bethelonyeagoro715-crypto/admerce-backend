@@ -824,39 +824,104 @@ async def search_store_items(store_id: str, q: str):
     )
     return [dict(row) for row in rows]
 
-# ==================== FOLLOW / UNFOLLOW ====================
 @router.post("/{store_id}/follow")
 async def follow_store(store_id: str, current_user: dict = Depends(get_current_user)):
-    exists = await database.fetch_one(
-        "SELECT * FROM stores WHERE store_id = :sid", {"sid": store_id}
+    store = await database.fetch_one(
+        "SELECT store_id, owner_id FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
     )
-    if not exists:
+    if not store:
         raise HTTPException(status_code=404, detail="Store not found")
+
+    owner_id = store["owner_id"]
+    if owner_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="Cannot follow your own store")
+
+    now = datetime.utcnow()
+
+    # "I follow this store" — powers /shopper/saved favorites list
     await database.execute(
-        "INSERT INTO favorites (user_id, store_id, created_at) VALUES (:uid, :sid, :now) "
-        "ON CONFLICT DO NOTHING",
-        {"uid": current_user["id"], "sid": store_id, "now": datetime.utcnow()}
+        "INSERT INTO favorites (user_id, store_id, created_at) "
+        "VALUES (:uid, :sid, :now) ON CONFLICT DO NOTHING",
+        {"uid": current_user["id"], "sid": store_id, "now": now},
     )
-    return {"message": "Store followed"}
+
+    # Mirror into user_follows so the storekeeper's profile shows the count
+    if owner_id:
+        await database.execute(
+            "INSERT INTO user_follows (follower_id, following_id) "
+            "VALUES (:fid, :tid) ON CONFLICT DO NOTHING",
+            {"fid": current_user["id"], "tid": owner_id},
+        )
+
+    count = await database.fetch_val(
+        "SELECT COUNT(*) FROM user_follows WHERE following_id = :uid",
+        {"uid": owner_id},
+    )
+    return {
+        "message": "Store followed",
+        "is_following": True,
+        "followers_count": int(count or 0),
+    }
+
 
 @router.get("/{store_id}/follow-status")
 async def get_follow_status(
     store_id: str,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    record = await database.fetch_one(
-        "SELECT * FROM favorites WHERE user_id = :uid AND store_id = :sid",
-        {"uid": current_user["id"], "sid": store_id}
+    store = await database.fetch_one(
+        "SELECT owner_id FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
     )
-    return {"is_following": record is not None}
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    record = await database.fetch_one(
+        "SELECT 1 AS x FROM favorites WHERE user_id = :uid AND store_id = :sid",
+        {"uid": current_user["id"], "sid": store_id},
+    )
+    count = await database.fetch_val(
+        "SELECT COUNT(*) FROM user_follows WHERE following_id = :uid",
+        {"uid": store["owner_id"]},
+    )
+    return {
+        "is_following": record is not None,
+        "followers_count": int(count or 0),
+    }
+
 
 @router.delete("/{store_id}/unfollow")
-async def unfollow_store(store_id: str, current_user: dict = Depends(get_current_user)):
+async def unfollow_store(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    store = await database.fetch_one(
+        "SELECT owner_id FROM stores WHERE store_id = :sid",
+        {"sid": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+
     await database.execute(
         "DELETE FROM favorites WHERE user_id = :uid AND store_id = :sid",
-        {"uid": current_user["id"], "sid": store_id}
+        {"uid": current_user["id"], "sid": store_id},
     )
-    return {"message": "Store unfollowed"}
+    if store["owner_id"]:
+        await database.execute(
+            "DELETE FROM user_follows WHERE follower_id = :fid AND following_id = :tid",
+            {"fid": current_user["id"], "tid": store["owner_id"]},
+        )
+
+    count = await database.fetch_val(
+        "SELECT COUNT(*) FROM user_follows WHERE following_id = :uid",
+        {"uid": store["owner_id"]},
+    )
+    return {
+        "message": "Store unfollowed",
+        "is_following": False,
+        "followers_count": int(count or 0),
+    }
 
 # ==================== UPDATE STORE IMAGE ====================
 @router.post("/update-store-image")
