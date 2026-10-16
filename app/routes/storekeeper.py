@@ -719,6 +719,36 @@ async def get_upload(file_path: str):
         return FileResponse(filepath)
     raise HTTPException(status_code=404, detail="Image not found")
 
+# ==================== LIST STORES (public discovery) ====================
+# Public endpoint — the SHOPNSTORE tab fetches this before the buyer is
+# necessarily logged in. Returns one row per store with the fields the
+# frontend's <Store> type expects.
+@router.get("/stores/locations")
+async def get_store_locations():
+    rows = await database.fetch_all(
+        """
+        SELECT store_id, name, store_image_url, latitude, longitude,
+               verification_status, image_width, image_height
+          FROM stores
+         ORDER BY created_at DESC NULLS LAST
+        """
+    )
+    out = []
+    for r in rows:
+        lat = r["latitude"]
+        lng = r["longitude"]
+        out.append({
+            "store_id": r["store_id"],
+            "store_name": r["name"],
+            "image_url": r["store_image_url"],
+            "lat": float(lat) if lat is not None else 0.0,
+            "lng": float(lng) if lng is not None else 0.0,
+            "verification_status": r["verification_status"] or "unverified",
+            "image_width": r["image_width"],
+            "image_height": r["image_height"],
+        })
+    return out
+
 # ==================== GET STORE DETAILS ====================
 @router.get("/store/{store_id}")
 async def get_store(store_id: str):
