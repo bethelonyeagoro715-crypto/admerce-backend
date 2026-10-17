@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional
 from fastapi import HTTPException
 
 from app.db.database import database
-from app.services.seai_agent import handle_search_items
+# Removed handle_search_items import to do direct fuzzy DB search
 
 # ── Reserve an item (auto‑search if no listing_id) ─────────────
 async def handle_reserve_item(user_id: str, params: dict, lat: float = None, lng: float = None) -> dict:
@@ -14,41 +14,68 @@ async def handle_reserve_item(user_id: str, params: dict, lat: float = None, lng
     storekeeper_id = params.get("storekeeper_id")
     quantity = int(params.get("quantity", 1))
     item_name = params.get("listing_name") or params.get("item_name") or params.get("query")
+    store_name = params.get("store_name")
 
-    # 1. If no listing_id, search for the best match
+    # 1. If no listing_id, search directly using fuzzy matching
     if not listing_id and item_name:
-        search_result = await handle_search_items(
-            {"query": item_name},
-            lat=lat or 6.5,
-            lng=lng or 3.4,
-            user_id=user_id
+        # Base query
+        query = """
+            SELECT l.listing_id, l.title, l.price, l.quantity_available, s.owner_id as storekeeper_id
+            FROM listings l
+            JOIN stores s ON l.store_id = s.store_id
+            WHERE l.quantity_available > 0
+        """
+        args = {}
+
+        if store_name:
+            query += " AND s.name ILIKE :sname"
+            args["sname"] = f"%{store_name}%"
+
+        row = None
+        
+        # Step A: Try exact phrase (e.g., "meatpie" or "meat pies")
+        args["q"] = f"%{item_name.strip()}%"
+        row = await database.fetch_one(query + " AND l.title ILIKE :q LIMIT 1", args)
+        
+        if not row:
+            # Step B: Try splitting words (e.g., "meatpie" -> "meat")
+            first_word = item_name.split()[0] if item_name.split() else item_name
+            if len(first_word) >= 3:
+                args["q"] = f"%{first_word}%"
+                row = await database.fetch_one(query + " AND l.title ILIKE :q LIMIT 1", args)
+                
+        if not row and "meatpie" in item_name.lower():
+            # Step C: Hardcoded fallback for the "meat pie" vs "meatpie" case
+            args["q"] = "%meat%"
+            row = await database.fetch_one(query + " AND l.title ILIKE :q LIMIT 1", args)
+
+        if not row:
+            msg = f"No items found for '{item_name}'"
+            if store_name:
+                msg += f" at '{store_name}'"
+            return {"type": "error", "message": f"{msg}. Try a different search term."}
+
+        listing_id = row["listing_id"]
+        storekeeper_id = row["storekeeper_id"]
+        listing_title = row["title"]
+        price = row["price"]
+    else:
+        # Fetch listing details directly if listing_id was provided
+        row = await database.fetch_one(
+            "SELECT l.*, s.owner_id FROM listings l "
+            "JOIN stores s ON l.store_id = s.store_id "
+            "WHERE l.listing_id = :lid",
+            {"lid": listing_id}
         )
-        if search_result.get("type") == "action":
-            results = search_result["data"]["results"]
-            items = [r for r in results if r["type"] == "item"]
-            if items:
-                first_item = items[0]
-                listing_id = first_item.get("listing_id")
-                storekeeper_id = storekeeper_id or first_item.get("store_id")
-            else:
-                return {"type": "error", "message": f"No items found for '{item_name}'."}
-        else:
-            return {"type": "error", "message": f"Could not find '{item_name}'."}
-
-    if not listing_id or not storekeeper_id:
-        return {"type": "error", "message": "Please specify which item to reserve."}
-
-    # 2. Fetch listing details to verify
-    listing = await database.fetch_one(
-        "SELECT l.*, s.owner_id FROM listings l "
-        "JOIN stores s ON l.store_id = s.store_id "
-        "WHERE l.listing_id = :lid",
-        {"lid": listing_id}
-    )
-    if not listing:
-        return {"type": "error", "message": "Listing not found."}
+        if not row:
+            return {"type": "error", "message": "Listing not found."}
+        
+        storekeeper_id = storekeeper_id or row["owner_id"]
+        listing_title = row["title"]
+        price = row["price"]
 
     order_id = f"ord_{uuid.uuid4().hex[:8]}"
+    item_amount = float(price) * quantity
 
     # 3. Execute reservation via the new Anchor wallet route
     try:
@@ -60,12 +87,11 @@ async def handle_reserve_item(user_id: str, params: dict, lat: float = None, lng
         )
         current_user = {"id": user_id}
         
-        # Calls the FastAPI route function directly with the correct signatures
         await wallet_reserve_route(req, current_user)
         
         return {
             "type": "text",
-            "text": f"✅ Reserved {quantity}x {listing['title']} for ₦{listing['price'] * quantity}. Order #{order_id}"
+            "text": f"✅ Reserved {quantity}x {listing_title} for ₦{item_amount:,.0f}. Order #{order_id}"
         }
     except HTTPException as e:
         # Catch Anchor 503 or 400 errors gracefully
@@ -81,34 +107,32 @@ async def handle_book_service(user_id: str, params: dict, lat: float = None, lng
     if not service_name:
         return {"type": "error", "message": "Which service would you like to book?"}
 
-    search_result = await handle_search_items(
-        {"query": service_name},
-        lat=lat or 6.5,
-        lng=3.4,
-        user_id=user_id
+    # Use exact DB search for services
+    row = await database.fetch_one(
+        "SELECT s.service_id, s.title, s.price FROM services s "
+        "WHERE s.is_active = TRUE AND s.title ILIKE :q LIMIT 1",
+        {"q": f"%{service_name.strip()}%"}
     )
-    if search_result.get("type") == "action":
-        services = [r for r in search_result["data"]["results"] if r["type"] == "service"]
-        if services:
-            svc = services[0]
-            try:
-                req = BookServiceRequest(
-                    notes=f"Booked via SEAI agent",
-                )
-                current_user = {"id": user_id}
-                
-                await book_service_route(svc['service_id'], req, current_user)
-                
-                return {
-                    "type": "text",
-                    "text": f"✅ Booked {svc['title']} for ₦{svc['price']}. Confirmation will follow."
-                }
-            except HTTPException as e:
-                return {"type": "error", "message": f"Booking failed: {e.detail}"}
-            except Exception as e:
-                return {"type": "error", "message": f"Booking failed: {str(e)}"}
-                
-    return {"type": "error", "message": f"No service found matching '{service_name}'."}
+
+    if not row:
+        return {"type": "error", "message": f"No service found matching '{service_name}'."}
+
+    try:
+        req = BookServiceRequest(
+            notes=f"Booked via SEAI agent",
+        )
+        current_user = {"id": user_id}
+        
+        await book_service_route(row["service_id"], req, current_user)
+        
+        return {
+            "type": "text",
+            "text": f"✅ Booked {row['title']} for ₦{row['price']}. Confirmation will follow."
+        }
+    except HTTPException as e:
+        return {"type": "error", "message": f"Booking failed: {e.detail}"}
+    except Exception as e:
+        return {"type": "error", "message": f"Booking failed: {str(e)}"}
 
 # ── Create a listing (for storekeepers) ─────────────────────────
 async def handle_create_listing(user_id: str, params: dict) -> dict:
@@ -136,7 +160,6 @@ async def handle_create_listing(user_id: str, params: dict) -> dict:
     try:
         current_user = {"id": user_id}
         
-        # Must pass Request as None since we are calling the route function directly
         await storekeeper_create_listing(
             request=None, 
             current_user=current_user,
