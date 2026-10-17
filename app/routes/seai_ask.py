@@ -4,7 +4,7 @@ import re
 import uuid
 import asyncio
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
@@ -244,9 +244,6 @@ _MINOR_WORDS = {
     "purple", "orange", "brown", "grey", "gray", "silver", "gold",
 }
 
-# Urgency words are modifiers, not items. Strip them from fragments
-# before search so "footwear urgently" searches "footwear", not
-# "footwear urgently". Prevents phantom "• urgently — nothing nearby".
 _URGENCY_WORDS = {
     "urgently", "asap", "immediately", "quickly", "quick", "fast",
     "now", "today", "right away", "right now",
@@ -288,18 +285,14 @@ def _has_content_word(text: str) -> bool:
 
 
 def _split_items_heuristically(query: str) -> Optional[List[str]]:
-    """If the query clearly asks for multiple items, return the fragments.
-    Otherwise return None. Deterministic — no LLM dependency."""
     q = query.strip()
     if not q or len(q) > 400:
         return None
 
-    # Require a conjunction or comma — single-item queries never split.
     lower = q.lower()
     if not any(sep in lower for sep in (" and ", ",", " with ", " plus ", " & ", " + ")):
         return None
 
-    # Split on commas, " and ", " with ", " plus ", " & ", " + ".
     parts = re.split(
         r"\s*,\s*(?:and\s+)?|\s+(?:and|with|plus|&|\+)\s+",
         q,
@@ -310,7 +303,6 @@ def _split_items_heuristically(query: str) -> Optional[List[str]]:
     for p in parts:
         stripped = _strip_filler(p)
 
-        # Strip urgency words — they're modifiers, not items.
         for w in list(_URGENCY_WORDS):
             stripped = re.sub(
                 rf"\b{re.escape(w)}\b", "", stripped, flags=re.IGNORECASE
@@ -329,8 +321,6 @@ def _split_items_heuristically(query: str) -> Optional[List[str]]:
 
 
 async def _search_multi_items(req: AskRequest, user_id: Optional[str], items: List[str]):
-    """Fire one search per item in parallel, merge, return cards + intro."""
-
     async def _one(item: str):
         try:
             return await handle_search_items({"query": item}, req.lat, req.lng, user_id)
@@ -364,7 +354,6 @@ async def _search_multi_items(req: AskRequest, user_id: Optional[str], items: Li
             media_type="text/event-stream",
         )
 
-    # Keep up to 2 results per original item, cap 6 total
     per_item: Dict[str, int] = {}
     trimmed: list = []
     for r in merged:
@@ -383,7 +372,6 @@ async def _search_multi_items(req: AskRequest, user_id: Optional[str], items: Li
 
     payload = {"query": req.query, "results": trimmed}
 
-    # Build intro line-by-line: one line per requested item
     lines: list = []
     for it in items:
         toks = [t for t in it.lower().split() if len(t) >= 3]
@@ -417,10 +405,6 @@ async def _search_multi_items(req: AskRequest, user_id: Optional[str], items: Li
     )
 
 
-# ═══════════════════════════════════════════════════════════════════
-# ENTRYPOINT — multi-item shortcut, then provider fallback chain
-# ═══════════════════════════════════════════════════════════════════
-
 @router.post("/ask")
 async def seai_ask(
     req: AskRequest,
@@ -428,37 +412,26 @@ async def seai_ask(
 ):
     user_id = current_user["id"] if current_user else None
 
-    # Multi-item shortcut — deterministic, no LLM dependency.
-    # If the query clearly asks for multiple things, fire one search per
-    # item directly. Do not rely on the model to fire parallel tool calls,
-    # because gpt-oss-120b frequently doesn't.
     if not _is_conversational(req.query):
         items = _split_items_heuristically(req.query)
         if items and len(items) >= 2:
             print(f"🧩 Multi-item query detected: {items}", flush=True)
             return await _search_multi_items(req, user_id, items)
 
-    # 1) Groq (primary)
     if GROQ_ENABLED and _groq is not None:
         try:
             return await _agent_loop(req, user_id, _groq, GROQ_MODEL)
         except Exception as e:
             print(f"❌ Groq agent failed, trying NVIDIA: {e}", flush=True)
 
-    # 2) NVIDIA NIM fallback
     if NVIDIA_ENABLED and _nvidia is not None:
         try:
             return await _agent_loop(req, user_id, _nvidia, NVIDIA_MODEL)
         except Exception as e:
             print(f"❌ NVIDIA agent failed, falling back to regex: {e}", flush=True)
 
-    # 3) Regex fallback
     return await _regex_fallback(req, user_id)
 
-
-# ═══════════════════════════════════════════════════════════════════
-# AGENT LOOP
-# ═══════════════════════════════════════════════════════════════════
 
 async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: str):
     messages: list = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -678,43 +651,52 @@ async def _find_best_listing(query: str) -> Optional[dict]:
     if not tokens:
         return None
 
-    or_parts = []
-    params: dict = {}
-    for i, tok in enumerate(tokens):
-        or_parts.append(
-            f"LOWER(l.title) LIKE :w{i} OR LOWER(COALESCE(s.name, '')) LIKE :w{i}"
-        )
-        params[f"w{i}"] = f"%{tok}%"
+    async def _query_db(search_tokens: list[str]) -> list:
+        or_parts = []
+        params: dict = {}
+        for i, tok in enumerate(search_tokens):
+            or_parts.append(
+                f"LOWER(l.title) LIKE :w{i} OR LOWER(COALESCE(s.name, '')) LIKE :w{i}"
+            )
+            params[f"w{i}"] = f"%{tok}%"
 
-    where = " OR ".join(f"({p})" for p in or_parts)
+        where = " OR ".join(f"({p})" for p in or_parts)
 
-    score_terms = []
-    for i, tok in enumerate(tokens):
-        score_terms.append(f"CASE WHEN LOWER(l.title) LIKE :w{i} THEN 3 ELSE 0 END")
-        score_terms.append(
-            f"CASE WHEN LOWER(COALESCE(s.name, '')) LIKE :w{i} THEN 1 ELSE 0 END"
-        )
-    score_expr = " + ".join(score_terms)
+        score_terms = []
+        for i, tok in enumerate(search_tokens):
+            score_terms.append(f"CASE WHEN LOWER(l.title) LIKE :w{i} THEN 3 ELSE 0 END")
+            score_terms.append(
+                f"CASE WHEN LOWER(COALESCE(s.name, '')) LIKE :w{i} THEN 1 ELSE 0 END"
+            )
+        score_expr = " + ".join(score_terms)
 
-    sql = f"""
-        SELECT
-            l.listing_id,
-            l.title,
-            l.price,
-            l.quantity_available,
-            l.store_id,
-            s.owner_id,
-            s.name AS store_name,
-            ({score_expr}) AS score
-        FROM listings l
-        LEFT JOIN stores s ON l.store_id = s.store_id
-        WHERE ({where})
-          AND (l.quantity_available IS NULL OR l.quantity_available > 0)
-        ORDER BY score DESC, LENGTH(l.title) ASC, l.created_at DESC
-        LIMIT 5
-    """
+        sql = f"""
+            SELECT
+                l.listing_id,
+                l.title,
+                l.price,
+                l.quantity_available,
+                l.store_id,
+                s.owner_id,
+                s.name AS store_name,
+                ({score_expr}) AS score
+            FROM listings l
+            LEFT JOIN stores s ON l.store_id = s.store_id
+            WHERE ({where})
+              AND (l.quantity_available IS NULL OR l.quantity_available > 0)
+            ORDER BY score DESC, LENGTH(l.title) ASC, l.created_at DESC
+            LIMIT 5
+        """
+        return await database.fetch_all(sql, params)
 
-    rows = await database.fetch_all(sql, params)
+    rows = await _query_db(tokens)
+
+    # Fuzzy fallback: if "meatpie" fails, try the first 4 letters "meat"
+    if not rows and tokens:
+        longest = max(tokens, key=len)
+        if len(longest) >= 4:
+            rows = await _query_db([longest[:4]])
+
     if not rows:
         return None
 
@@ -727,6 +709,8 @@ async def _find_best_listing(query: str) -> Optional[dict]:
 async def _handle_reserve_item(
     user_id: str, query: str, quantity: int = 1
 ) -> dict:
+    from app.routes.wallet import reserve as wallet_reserve_route, ReserveRequest
+
     if not query:
         return {"type": "text", "text": "Which item would you like to reserve?"}
 
@@ -764,91 +748,33 @@ async def _handle_reserve_item(
         return {"type": "text",
                 "text": f"Only {available} left in stock for '{title}'."}
 
-    wallet = await database.fetch_one(
-        "SELECT balance FROM wallets WHERE user_id = :uid", {"uid": user_id}
-    )
-    if not wallet:
-        return {"type": "text",
-                "text": "Please create a wallet first before reserving."}
+    order_id = f"ord_{uuid.uuid4().hex[:8]}"
 
-    balance = float(wallet["balance"] or 0)
-    if balance < total:
+    try:
+        req = ReserveRequest(
+            order_id=order_id,
+            storekeeper_id=storekeeper_id,
+            listing_id=listing_id,
+            quantity=quantity,
+        )
+        current_user = {"id": user_id}
+        
+        # This calls the FastAPI route function directly, ensuring
+        # the Anchor wallet check (_require_anchor_ready) is enforced.
+        await wallet_reserve_route(req, current_user)
+        
         return {
             "type": "text",
             "text": (
-                f"You need ₦{total:,.0f} to reserve {quantity}× {title}, "
-                f"but your balance is ₦{balance:,.0f}. Top up first."
+                f"✅ Reserved {quantity}× {title} at {store_name} "
+                f"for ₦{total:,.0f}. Order #{order_id[:8]} — pick up within 2 hours."
             ),
         }
-
-    order_id = f"ord_{uuid.uuid4().hex[:8]}"
-    now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(hours=2)
-
-    await database.execute(
-        "UPDATE wallets SET balance = balance - :amt WHERE user_id = :uid",
-        {"amt": total, "uid": user_id},
-    )
-
-    await database.execute(
-        """
-        INSERT INTO escrow (
-            order_id, shopper_id, storekeeper_id, courier_id,
-            listing_id, quantity, item_amount, delivery_fee, total_amount,
-            status, expires_at, created_at
-        )
-        VALUES (
-            :order_id, :shopper_id, :storekeeper_id, NULL,
-            :listing_id, :quantity, :item_amount, 0, :total_amount,
-            'locked', :expires_at, :created_at
-        )
-        """,
-        {
-            "order_id": order_id,
-            "shopper_id": user_id,
-            "storekeeper_id": storekeeper_id,
-            "listing_id": listing_id,
-            "quantity": quantity,
-            "item_amount": price,
-            "total_amount": total,
-            "expires_at": expires_at,
-            "created_at": now,
-        },
-    )
-
-    try:
-        await database.execute(
-            """
-            INSERT INTO wallet_transactions
-                (user_id, amount, type, description, reference, status, created_at)
-            VALUES
-                (:uid, :amt, 'debit', :desc, :ref, 'completed', :now)
-            """,
-            {
-                "uid": user_id,
-                "amt": total,
-                "desc": f"Reserved {quantity}× {title}",
-                "ref": order_id,
-                "now": now,
-            },
-        )
+    except HTTPException as e:
+        # Handles "Wallet is being migrated" (503) or "Insufficient balance" (400)
+        return {"type": "text", "text": f"Reservation failed: {e.detail}"}
     except Exception as e:
-        print(f"⚠️  wallet_transactions insert failed: {e}")
-
-    if available is not None:
-        await database.execute(
-            "UPDATE listings SET quantity_available = quantity_available - :q "
-            "WHERE listing_id = :lid AND quantity_available >= :q",
-            {"q": quantity, "lid": listing_id},
-        )
-
-    return {
-        "type": "text",
-        "text": (
-            f"✅ Reserved {quantity}× {title} at {store_name} "
-            f"for ₦{total:,.0f}. Order #{order_id[:8]} — pick up within 2 hours."
-        ),
-    }
+        return {"type": "text", "text": f"Reservation failed: {str(e)}"}
 
 
 def _compact_for_llm(result: dict) -> dict:
