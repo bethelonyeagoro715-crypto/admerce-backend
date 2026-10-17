@@ -1851,11 +1851,13 @@ async def get_instant_transactions(current_user: dict = Depends(get_current_user
     pickups_rows = await database.fetch_all(
         """
         SELECT w.id, w.reference, w.amount, w.description, w.status, w.created_at,
-               wc.user_id AS counterparty_user_id
+               wc.user_id AS counterparty_user_id,
+               u.business_image_url AS store_image_url
           FROM wallet_transactions w
           LEFT JOIN wallet_transactions wc
                  ON wc.reference = (w.reference || :credit_suffix)
                 AND wc.type = 'credit'
+          LEFT JOIN users u ON wc.user_id = u.id
          WHERE w.user_id = :uid
            AND w.reference LIKE :prefix
            AND w.reference NOT LIKE :not_suffix
@@ -1874,12 +1876,14 @@ async def get_instant_transactions(current_user: dict = Depends(get_current_user
     service_rows = await database.fetch_all(
         """
         SELECT w.id, w.reference, w.amount, w.description, w.status, w.created_at,
-               wc.user_id AS counterparty_user_id
+               wc.user_id AS counterparty_user_id,
+               u.business_image_url AS provider_image_url
           FROM wallet_transactions w
           LEFT JOIN wallet_transactions wc
                  ON wc.reference = w.reference
                 AND wc.type = 'credit'
                 AND wc.user_id != w.user_id
+          LEFT JOIN users u ON wc.user_id = u.id
          WHERE w.user_id = :uid
            AND w.reference LIKE :prefix
            AND w.type = 'debit'
@@ -1903,7 +1907,6 @@ async def get_instant_transactions(current_user: dict = Depends(get_current_user
         "pickups": await enrich(pickups_rows),
         "services": await enrich(service_rows),
     }
-
 
 @router.get("/escrows")
 async def get_escrows(current_user: dict = Depends(get_current_user)):
