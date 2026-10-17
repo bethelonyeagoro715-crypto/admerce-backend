@@ -212,11 +212,40 @@ _CONVERSATIONAL_PATTERNS = [
     r"^more[\?\.!]*$",
     r"^what\s+can\s+you\s+do[\?\.!]*$",
     r"^are\s+there\s+any[\?\.!]*$",
+    # Catch meta-questions directed at the AI
+    r"^(why|how|what)\s+(did|didn't|do|don't|are|aren't|can|could)\s+you\b.*",
 ]
+
+_SYNONYMS = {
+    "hamburgers": "burger",
+    "hamburger": "burger",
+    "meatpies": "meat pie",
+    "meatpie": "meat pie",
+    "cellphones": "phone",
+    "cellphone": "phone",
+    "mobile": "phone",
+    "sneakers": "shoes",
+    "sneaker": "shoes",
+}
+
+def _apply_synonyms(text: str) -> str:
+    t = text.lower()
+    for k, v in _SYNONYMS.items():
+        t = re.sub(rf"\b{k}\b", v, t)
+    return t
 
 
 def _is_conversational(text: str) -> bool:
     t = text.strip().lower()
+    
+    # Catch meta-questions about the AI itself
+    meta_phrases = [
+        "you understand", "you mean", "your search", "your response", 
+        "why didn't you", "why did you", "what do you mean", "how did you"
+    ]
+    if any(p in t for p in meta_phrases):
+        return True
+
     if len(t) > 60:
         return False
     return any(re.match(p, t) for p in _CONVERSATIONAL_PATTERNS)
@@ -308,6 +337,8 @@ def _split_items_heuristically(query: str) -> Optional[List[str]]:
                 rf"\b{re.escape(w)}\b", "", stripped, flags=re.IGNORECASE
             ).strip()
         stripped = re.sub(r"\s+", " ", stripped).strip()
+        
+        stripped = _apply_synonyms(stripped)
 
         if len(stripped) < 3:
             continue
@@ -594,6 +625,9 @@ async def _execute_agent_function(
 ) -> dict:
     try:
         if fn_name == "search_items":
+            # Apply synonyms before searching
+            if args.get("query"):
+                args["query"] = _apply_synonyms(args.get("query", ""))
             return await handle_search_items(args, lat, lng, user_id)
 
         if fn_name == "reserve_item":
@@ -691,7 +725,6 @@ async def _find_best_listing(query: str) -> Optional[dict]:
 
     rows = await _query_db(tokens)
 
-    # Fuzzy fallback: if "meatpie" fails, try the first 4 letters "meat"
     if not rows and tokens:
         longest = max(tokens, key=len)
         if len(longest) >= 4:
@@ -717,6 +750,7 @@ async def _handle_reserve_item(
     if quantity < 1:
         quantity = 1
 
+    query = _apply_synonyms(query)
     listing = await _find_best_listing(query)
 
     if not listing:
@@ -759,8 +793,6 @@ async def _handle_reserve_item(
         )
         current_user = {"id": user_id}
         
-        # This calls the FastAPI route function directly, ensuring
-        # the Anchor wallet check (_require_anchor_ready) is enforced.
         await wallet_reserve_route(req, current_user)
         
         return {
@@ -771,7 +803,6 @@ async def _handle_reserve_item(
             ),
         }
     except HTTPException as e:
-        # Handles "Wallet is being migrated" (503) or "Insufficient balance" (400)
         return {"type": "text", "text": f"Reservation failed: {e.detail}"}
     except Exception as e:
         return {"type": "text", "text": f"Reservation failed: {str(e)}"}
@@ -840,6 +871,8 @@ async def _regex_fallback(req: AskRequest, user_id: Optional[str]):
         )
     intent, params = classify_intent(req.query)
     if intent == "search":
+        if params.get("query"):
+            params["query"] = _apply_synonyms(params["query"])
         r = await handle_search_items(params, req.lat, req.lng, user_id)
         return _respond_from_result(r)
     if intent == "reserve_item":
