@@ -1,12 +1,15 @@
 # app/services/seai_cortex.py
 import uuid
 from typing import Dict, Any, Optional
+from fastapi import HTTPException
+
 from app.db.database import database
-from app.routes.wallet import reserve as wallet_reserve
 from app.services.seai_agent import handle_search_items
 
 # ── Reserve an item (auto‑search if no listing_id) ─────────────
 async def handle_reserve_item(user_id: str, params: dict, lat: float = None, lng: float = None) -> dict:
+    from app.routes.wallet import reserve as wallet_reserve_route, ReserveRequest
+
     listing_id = params.get("listing_id")
     storekeeper_id = params.get("storekeeper_id")
     quantity = int(params.get("quantity", 1))
@@ -32,10 +35,10 @@ async def handle_reserve_item(user_id: str, params: dict, lat: float = None, lng
         else:
             return {"type": "error", "message": f"Could not find '{item_name}'."}
 
-    if not listing_id:
+    if not listing_id or not storekeeper_id:
         return {"type": "error", "message": "Please specify which item to reserve."}
 
-    # 2. Fetch listing details
+    # 2. Fetch listing details to verify
     listing = await database.fetch_one(
         "SELECT l.*, s.owner_id FROM listings l "
         "JOIN stores s ON l.store_id = s.store_id "
@@ -45,28 +48,35 @@ async def handle_reserve_item(user_id: str, params: dict, lat: float = None, lng
     if not listing:
         return {"type": "error", "message": "Listing not found."}
 
-    storekeeper_id = storekeeper_id or listing["owner_id"]
-    item_amount = listing["price"] * quantity
     order_id = f"ord_{uuid.uuid4().hex[:8]}"
 
-    # 3. Execute reservation
+    # 3. Execute reservation via the new Anchor wallet route
     try:
-        await wallet_reserve(
+        req = ReserveRequest(
             order_id=order_id,
             storekeeper_id=storekeeper_id,
-            item_amount=item_amount,
             listing_id=listing_id,
             quantity=quantity,
         )
+        current_user = {"id": user_id}
+        
+        # Calls the FastAPI route function directly with the correct signatures
+        await wallet_reserve_route(req, current_user)
+        
         return {
             "type": "text",
-            "text": f"✅ Reserved {quantity}x {listing['title']} for ₦{item_amount}. Order #{order_id}"
+            "text": f"✅ Reserved {quantity}x {listing['title']} for ₦{listing['price'] * quantity}. Order #{order_id}"
         }
+    except HTTPException as e:
+        # Catch Anchor 503 or 400 errors gracefully
+        return {"type": "error", "message": f"Reservation failed: {e.detail}"}
     except Exception as e:
         return {"type": "error", "message": f"Reservation failed: {str(e)}"}
 
 # ── Book a service (auto‑search if needed) ──────────────────────
 async def handle_book_service(user_id: str, params: dict, lat: float = None, lng: float = None) -> dict:
+    from app.routes.service import book_service as book_service_route, BookServiceRequest
+
     service_name = params.get("service_name") or params.get("service")
     if not service_name:
         return {"type": "error", "message": "Which service would you like to book?"}
@@ -74,21 +84,36 @@ async def handle_book_service(user_id: str, params: dict, lat: float = None, lng
     search_result = await handle_search_items(
         {"query": service_name},
         lat=lat or 6.5,
-        lng=lng or 3.4,
+        lng=3.4,
         user_id=user_id
     )
     if search_result.get("type") == "action":
         services = [r for r in search_result["data"]["results"] if r["type"] == "service"]
         if services:
             svc = services[0]
-            return {
-                "type": "text",
-                "text": f"✅ Booked {svc['title']} for ₦{svc['price']}. Confirmation will follow."
-            }
+            try:
+                req = BookServiceRequest(
+                    notes=f"Booked via SEAI agent",
+                )
+                current_user = {"id": user_id}
+                
+                await book_service_route(svc['service_id'], req, current_user)
+                
+                return {
+                    "type": "text",
+                    "text": f"✅ Booked {svc['title']} for ₦{svc['price']}. Confirmation will follow."
+                }
+            except HTTPException as e:
+                return {"type": "error", "message": f"Booking failed: {e.detail}"}
+            except Exception as e:
+                return {"type": "error", "message": f"Booking failed: {str(e)}"}
+                
     return {"type": "error", "message": f"No service found matching '{service_name}'."}
 
 # ── Create a listing (for storekeepers) ─────────────────────────
 async def handle_create_listing(user_id: str, params: dict) -> dict:
+    from app.routes.storekeeper import create_listing as storekeeper_create_listing
+
     title = params.get("title")
     price = params.get("price")
     category = params.get("category")
@@ -109,21 +134,30 @@ async def handle_create_listing(user_id: str, params: dict) -> dict:
         store_id = store["store_id"]
 
     try:
-        # Direct import to avoid circular dependency at module level
-        from app.routes.storekeeper import create_listing as storekeeper_create_listing
+        current_user = {"id": user_id}
+        
+        # Must pass Request as None since we are calling the route function directly
         await storekeeper_create_listing(
+            request=None, 
+            current_user=current_user,
             store_id=store_id,
             title=title,
             price=float(price),
-            category=category or "uncategorized",
-            quantity=1,
+            lat=6.5,
+            lng=3.4,
+            category=category or "tech_electronics",
+            quantity=1
         )
         return {"type": "text", "text": f"✅ Listing '{title}' created for ₦{price}."}
+    except HTTPException as e:
+        return {"type": "error", "message": f"Failed: {e.detail}"}
     except Exception as e:
         return {"type": "error", "message": f"Failed: {str(e)}"}
 
 # ── Create a service (for service providers) ────────────────────
 async def handle_create_service(user_id: str, params: dict) -> dict:
+    from app.routes.service import create_service as services_create_route, CreateServiceRequest
+
     title = params.get("title")
     price = params.get("price")
     category = params.get("category")
@@ -135,15 +169,22 @@ async def handle_create_service(user_id: str, params: dict) -> dict:
         return {"type": "error", "message": "Please provide a price."}
 
     try:
-        from app.routes.services import create_service as services_create
-        await services_create(
-            provider_id=user_id,
+        req = CreateServiceRequest(
             title=title,
             category=category or "general",
+            description="",
             price=float(price),
             duration_minutes=int(duration),
+            location_lat=6.5,
+            location_lng=3.4
         )
+        current_user = {"id": user_id}
+        
+        await services_create_route(req, current_user)
+        
         return {"type": "text", "text": f"✅ Service '{title}' created for ₦{price}."}
+    except HTTPException as e:
+        return {"type": "error", "message": f"Failed: {e.detail}"}
     except Exception as e:
         return {"type": "error", "message": f"Failed: {str(e)}"}
 
