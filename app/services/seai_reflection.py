@@ -192,7 +192,6 @@ async def evaluate_response(
             temperature=0.0,
         )
         raw = (resp.choices[0].message.content or "").strip()
-        # Strip potential code fences
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         parsed = json.loads(raw)
     except Exception as e:
@@ -221,7 +220,7 @@ async def store_reflection(
             """
             INSERT INTO seai_reflections
                 (user_id, query, response_text, evaluation, reflection_text)
-            VALUES (:uid, :q, :resp, :eval, :refl)
+            VALUES (:uid, :q, :resp, CAST(:eval AS JSONB), :refl)
             """,
             {
                 "uid": user_id,
