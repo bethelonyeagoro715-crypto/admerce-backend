@@ -79,12 +79,6 @@ def _tokenize(text: str) -> list[str]:
     return [w for w in words if w not in STOP_WORDS and len(w) > 1]
 
 
-# ════════════════════════════════════════════════════════════════
-# CATEGORY EXPANSION
-# Expands broad category words ("footwear", "electronics") into their
-# concrete terms using product_category_map. Non-category tokens pass
-# through unchanged. Fails safe: on any DB error, returns tokens as-is.
-# ════════════════════════════════════════════════════════════════
 async def _expand_category_terms(tokens: list[str]) -> list[str]:
     if not tokens:
         return tokens
@@ -133,12 +127,12 @@ async def _query_relevant_items(
     lng: float,
     radius_km: float = 50.0,
     limit: int = 5,
+    max_price: Optional[float] = None,
 ) -> list[dict]:
     tokens = _tokenize(query)
     if not tokens:
         return []
 
-    # Expand category words into concrete search terms
     tokens = await _expand_category_terms(tokens)
     if not tokens:
         return []
@@ -166,6 +160,11 @@ async def _query_relevant_items(
         )
     score_expr = " + ".join(score_terms)
 
+    price_clause = ""
+    if max_price is not None:
+        price_clause = " AND l.price <= :max_price"
+        params["max_price"] = float(max_price)
+
     sql = f"""
         SELECT
             l.listing_id,
@@ -184,6 +183,7 @@ async def _query_relevant_items(
         FROM listings l
         LEFT JOIN stores s ON l.store_id = s.store_id
         WHERE ({where})
+          {price_clause}
           AND (l.quantity_available IS NULL OR l.quantity_available > 0)
         LIMIT 100
     """
@@ -225,12 +225,12 @@ async def _service_recall(
     lng: float,
     radius_km: float,
     limit: int = 3,
+    max_price: Optional[float] = None,
 ):
     tokens = _tokenize(query)
     if not tokens:
         return []
 
-    # Expand category words into concrete search terms
     tokens = await _expand_category_terms(tokens)
     if not tokens:
         return []
@@ -259,6 +259,11 @@ async def _service_recall(
         )
     score_expr = " + ".join(score_terms)
 
+    price_clause = ""
+    if max_price is not None:
+        price_clause = " AND s.price <= :max_price"
+        params["max_price"] = float(max_price)
+
     sql = f"""
         SELECT s.service_id, s.title, s.price, s.lat, s.lng, s.image_url,
                s.provider_id, s.category,
@@ -267,6 +272,7 @@ async def _service_recall(
         FROM services s
         JOIN users u ON s.provider_id = u.id
         WHERE s.is_active = TRUE
+          {price_clause}
           AND s.lat IS NOT NULL
           AND s.lng IS NOT NULL
           AND ({where})
@@ -361,6 +367,8 @@ async def handle_search_items(
     user_id: str = None,
 ) -> dict:
     query = params.get("query", "").strip()
+    max_price = params.get("max_price")
+    
     if not query:
         return {"type": "text", "text": "What are you looking for?"}
 
@@ -368,14 +376,14 @@ async def handle_search_items(
 
     async def safe_items():
         try:
-            return await _query_relevant_items(query, lat, lng, radius_km=50, limit=5)
+            return await _query_relevant_items(query, lat, lng, radius_km=50, limit=5, max_price=max_price)
         except Exception as e:
             print(f"⚠️  items failed: {e}", flush=True)
             return []
 
     async def safe_services():
         try:
-            return await _service_recall(query, lat, lng, radius_km=50, limit=3)
+            return await _service_recall(query, lat, lng, radius_km=50, limit=3, max_price=max_price)
         except Exception as e:
             print(f"⚠️  services failed: {e}", flush=True)
             return []
@@ -383,6 +391,7 @@ async def handle_search_items(
     items, services = await asyncio.gather(safe_items(), safe_services())
 
     stores = []
+    # Only look for stores if we didn't find any specific items/services
     if not items and not services:
         try:
             stores = await _store_recall(query, lat, lng, radius_km=50, limit=3)
@@ -454,10 +463,13 @@ async def handle_search_items(
     top = all_results[:5]
 
     if not top:
+        msg = f"Nothing near you currently matches '{query}'"
+        if max_price:
+            msg += f" under ₦{int(max_price):,}"
         return {
             "type": "text",
             "text": (
-                f"Nothing near you currently matches '{query}'. "
+                f"{msg}. "
                 "Try a broader term, or ask me to post a wanted alert so "
                 "you're notified when one is listed."
             ),
