@@ -1,15 +1,15 @@
-from fastapi import APIRouter, HTTPException, Depends, Request, Header
+# app/routes/notifications.py
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from app.db.database import database
 from app.utils.security import get_current_user
 import os
 import json
-from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
 
-# Firebase initialisation (unchanged)
+# Firebase initialisation
 try:
     import firebase_admin
     from firebase_admin import credentials, messaging
@@ -29,50 +29,52 @@ except ImportError:
 
 class RegisterDeviceRequest(BaseModel):
     fcm_token: str
-    user_id: Optional[str] = None   # Optional, can be provided by frontend if known
+    user_id: Optional[str] = None
 
-
-# New optional user dependency – tries to get user from Bearer token, else returns None
 async def get_current_user_optional(request: Request):
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header.replace("Bearer ", "")
         try:
-            # Assume get_current_user accepts a token string (adjust if needed)
             return await get_current_user(token)
         except Exception:
             return None
     return None
-
 
 @router.post("/register-device")
 async def register_device(
     req: RegisterDeviceRequest,
     current_user: Optional[dict] = Depends(get_current_user_optional)
 ):
-    """Register or update the FCM token. If authenticated, ties token to user_id; otherwise stores anonymously."""
-    # Determine user_id: from request body, else from auth, else None
     user_id = req.user_id or (current_user["id"] if current_user else None)
 
-    # Deactivate previous tokens for this user (if user_id exists)
     if user_id:
         await database.execute(
             "UPDATE user_devices SET is_active = false WHERE user_id = :uid",
             {"uid": user_id}
         )
 
-    # Insert new token
     await database.execute(
         "INSERT INTO user_devices (user_id, fcm_token, is_active) VALUES (:uid, :token, true)",
         {"uid": user_id, "token": req.fcm_token}
     )
     return {"message": "Device registered for push notifications"}
 
+def flatten_data_for_fcm(data: dict) -> dict:
+    """FCM requires all data payload values to be strings."""
+    if not data:
+        return {}
+    flat = {}
+    for k, v in data.items():
+        if isinstance(v, (dict, list)):
+            flat[k] = json.dumps(v)
+        elif v is not None:
+            flat[k] = str(v)
+    return flat
 
-# Helper function – used by wallet.py and other modules
 async def send_push_to_user(user_id: str, title: str, body: str, data: dict = None):
-    """Send a push notification and also store it in the history table."""
-    # 1. Store the notification in history (always, even if push fails)
+    """Send a push notification and store it in the history table."""
+    # 1. Store in history
     try:
         await database.execute(
             "INSERT INTO user_notifications (user_id, title, body, data) "
@@ -87,19 +89,23 @@ async def send_push_to_user(user_id: str, title: str, body: str, data: dict = No
     except Exception as e:
         print(f"⚠️ Failed to store notification history: {e}")
 
-    # 2. Send push via Firebase (if available)
+    # 2. Send push via Firebase
     if firebase_admin is None or messaging is None:
         print(f"⚠️ Push skipped (Firebase not available) – {title}")
         return
+        
     rows = await database.fetch_all(
         "SELECT fcm_token FROM user_devices WHERE user_id = :uid AND is_active = true",
         {"uid": user_id}
     )
+    
+    fcm_data = flatten_data_for_fcm(data)
+    
     for row in rows:
         token = row["fcm_token"]
         message = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
-            data=data,
+            data=fcm_data,
             token=token,
         )
         try:
@@ -113,8 +119,6 @@ async def send_push_to_user(user_id: str, title: str, body: str, data: dict = No
                     {"token": token}
                 )
 
-
-# ── Get notification history ──────────────────────────────────
 @router.get("/")
 async def get_notifications(
     limit: int = 50,
@@ -134,8 +138,6 @@ async def get_notifications(
     )
     return [dict(row) for row in rows]
 
-
-# ── Optional: Mark as read ────────────────────────────────────────
 @router.post("/read/{notification_id}")
 async def mark_as_read(notification_id: int, current_user: dict = Depends(get_current_user)):
     await database.execute(
