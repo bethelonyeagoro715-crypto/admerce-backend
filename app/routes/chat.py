@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import tempfile
 import time
+import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File, Form, Body
@@ -12,6 +13,7 @@ from app.db.database import database
 from app.utils.security import get_current_user
 from app.services.transcription_service import transcribe_audio
 from app.services.cloudinary_service import upload_video
+from app.routes.notifications import send_push_to_user
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
@@ -22,22 +24,29 @@ _JITSI_SECRET = os.getenv("JITSI_SECRET", os.getenv("JWT_SECRET", "change-me")).
 JITSI_BASE_URL = os.getenv("JITSI_BASE_URL", "https://meet.jit.si")
 
 # ── In-memory typing & presence state ─────────────────────────────
-# Fine for a single Render worker. If you ever set WEB_CONCURRENCY>1,
-# move this to Redis or a small Postgres table.
 _typing_state: dict[str, dict[str, float]] = {}
 TYPING_TTL_SECONDS = 5
 
 _presence_state: dict[str, float] = {}
 ONLINE_WINDOW_SECONDS = 300  # 5 minutes
 
+_background_tasks: set = set()
 
 def _mark_online(user_id: str):
     _presence_state[user_id] = time.time()
 
-
 def _is_online(user_id: str) -> bool:
     last_seen = _presence_state.get(user_id, 0)
     return (time.time() - last_seen) < ONLINE_WINDOW_SECONDS
+
+def _fire_and_forget(coro) -> None:
+    """Safely run async tasks in the background without blocking the API response."""
+    try:
+        task = asyncio.create_task(coro)
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    except Exception as e:
+        print(f"⚠️ Failed to schedule background task: {e}", flush=True)
 
 
 class SendMessageRequest(BaseModel):
@@ -177,6 +186,20 @@ async def send_message(
     if conv_state:
         conv_state.pop(sender_id, None)
 
+    # 🚨 TRIGGER PUSH NOTIFICATION
+    _fire_and_forget(
+        send_push_to_user(
+            user_id=receiver_id,
+            title=f"New message from {sender_name}",
+            body=req.text[:100] if req.text else "📷 Sent a photo",
+            data={
+                "type": "message",
+                "conversation_id": conversation_id,
+                "url": f"/chat/{conversation_id}"
+            }
+        )
+    )
+
     return {
         "id": new_id,
         "conversation_id": conversation_id,
@@ -196,7 +219,6 @@ async def set_typing(
     req: TypingRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """Client calls this on every keystroke, throttled to ~2s."""
     user_id = current_user["id"]
     _mark_online(user_id)
     
@@ -212,7 +234,6 @@ async def get_typing(
     conversation_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """Client polls this every ~2s while the chat screen is open."""
     user_id = current_user["id"]
     _mark_online(user_id)
     
@@ -434,6 +455,20 @@ async def send_voice(
     if conv_state:
         conv_state.pop(sender_id, None)
 
+    # 🚨 TRIGGER PUSH NOTIFICATION
+    _fire_and_forget(
+        send_push_to_user(
+            user_id=receiver_id,
+            title=f"New voice note from {sender_name}",
+            body=transcription[:100] if transcription else "🎤 Voice note",
+            data={
+                "type": "message",
+                "conversation_id": conversation_id,
+                "url": f"/chat/{conversation_id}"
+            }
+        )
+    )
+
     return {
         "id": new_id,
         "conversation_id": conversation_id,
@@ -533,7 +568,7 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
             "last_sender_id": row["last_sender"],
             "last_time": row["last_time"],
             "unread_count": row["unread_count"],
-            "is_online": _is_online(other_id), # <--- REAL ONLINE STATUS
+            "is_online": _is_online(other_id),
         })
 
     return conversations
@@ -585,7 +620,7 @@ async def get_messages_by_user(
         "messages": hydrated,
         "conversation_id": conversation_id,
         "other_user_id": other_user_id,
-        "is_online": _is_online(other_user_id), # <--- REAL ONLINE STATUS
+        "is_online": _is_online(other_user_id),
     }
 
 
@@ -648,7 +683,7 @@ async def get_messages(
     return {
         "messages": hydrated, 
         "conversation_id": conversation_id,
-        "is_online": _is_online(other_id), # <--- REAL ONLINE STATUS
+        "is_online": _is_online(other_id),
     }
 
 
