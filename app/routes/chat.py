@@ -21,11 +21,23 @@ DELETE_FOR_EVERYONE_WINDOW_MINUTES = 60
 _JITSI_SECRET = os.getenv("JITSI_SECRET", os.getenv("JWT_SECRET", "change-me")).encode()
 JITSI_BASE_URL = os.getenv("JITSI_BASE_URL", "https://meet.jit.si")
 
-# ── In-memory typing state ─────────────────────────────────────
+# ── In-memory typing & presence state ─────────────────────────────
 # Fine for a single Render worker. If you ever set WEB_CONCURRENCY>1,
 # move this to Redis or a small Postgres table.
 _typing_state: dict[str, dict[str, float]] = {}
 TYPING_TTL_SECONDS = 5
+
+_presence_state: dict[str, float] = {}
+ONLINE_WINDOW_SECONDS = 300  # 5 minutes
+
+
+def _mark_online(user_id: str):
+    _presence_state[user_id] = time.time()
+
+
+def _is_online(user_id: str) -> bool:
+    last_seen = _presence_state.get(user_id, 0)
+    return (time.time() - last_seen) < ONLINE_WINDOW_SECONDS
 
 
 class SendMessageRequest(BaseModel):
@@ -115,6 +127,8 @@ async def send_message(
     current_user: dict = Depends(get_current_user)
 ):
     sender_id = current_user["id"]
+    _mark_online(sender_id)
+    
     receiver_id = await _resolve_receiver_id(req.receiver_id, sender_id)
     if sender_id == receiver_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
@@ -137,7 +151,6 @@ async def send_message(
     )
     sender_name = sender["name"] if sender else sender_id
 
-    # ✅ FIX — use fetch_val so RETURNING id actually returns the id.
     new_id = await database.fetch_val(
         """
         INSERT INTO messages
@@ -185,6 +198,8 @@ async def set_typing(
 ):
     """Client calls this on every keystroke, throttled to ~2s."""
     user_id = current_user["id"]
+    _mark_online(user_id)
+    
     valid = _validate_conversation_id(req.conversation_id, user_id)
     if not valid:
         raise HTTPException(status_code=403, detail="Invalid conversation ID")
@@ -199,6 +214,8 @@ async def get_typing(
 ):
     """Client polls this every ~2s while the chat screen is open."""
     user_id = current_user["id"]
+    _mark_online(user_id)
+    
     valid = _validate_conversation_id(conversation_id, user_id)
     if not valid:
         raise HTTPException(status_code=403, detail="Invalid conversation ID")
@@ -339,6 +356,8 @@ async def send_voice(
     current_user: dict = Depends(get_current_user),
 ):
     sender_id = current_user["id"]
+    _mark_online(sender_id)
+    
     receiver_id = await _resolve_receiver_id(receiver_id, sender_id)
     if sender_id == receiver_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
@@ -389,7 +408,6 @@ async def send_voice(
     )
     sender_name = sender["name"] if sender else sender_id
 
-    # ✅ FIX — fetch_val so RETURNING id returns the new id.
     new_id = await database.fetch_val(
         """
         INSERT INTO messages
@@ -433,6 +451,8 @@ async def send_voice(
 @router.get("/conversations")
 async def get_conversations(current_user: dict = Depends(get_current_user)):
     user_id = current_user["id"]
+    _mark_online(user_id)
+    
     rows = await database.fetch_all(
         """
         SELECT m.conversation_id,
@@ -461,9 +481,6 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
             continue
         other_id = parts[0] if parts[1] == user_id else parts[1]
 
-        # ✅ FIX — pull the same columns as presence.py so the fallback
-        # chain matches everywhere. Previously this only looked at
-        # nickname + phone, so providers/storekeepers showed as "Unknown".
         other_user = await database.fetch_one(
             """
             SELECT u.nickname, u.real_name, u.first_name, u.last_name,
@@ -516,6 +533,7 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
             "last_sender_id": row["last_sender"],
             "last_time": row["last_time"],
             "unread_count": row["unread_count"],
+            "is_online": _is_online(other_id), # <--- REAL ONLINE STATUS
         })
 
     return conversations
@@ -530,6 +548,7 @@ async def get_messages_by_user(
     current_user: dict = Depends(get_current_user)
 ):
     user_id = current_user["id"]
+    _mark_online(user_id)
 
     resolved_id = await _resolve_receiver_id(other_user_id, user_id)
     if resolved_id != other_user_id:
@@ -566,6 +585,7 @@ async def get_messages_by_user(
         "messages": hydrated,
         "conversation_id": conversation_id,
         "other_user_id": other_user_id,
+        "is_online": _is_online(other_user_id), # <--- REAL ONLINE STATUS
     }
 
 
@@ -578,6 +598,7 @@ async def get_messages(
     current_user: dict = Depends(get_current_user)
 ):
     user_id = current_user["id"]
+    _mark_online(user_id)
 
     valid = _validate_conversation_id(conversation_id, user_id)
     if not valid:
@@ -620,7 +641,15 @@ async def get_messages(
     )
 
     hydrated = await _hydrate_messages(reversed(rows), user_id)
-    return {"messages": hydrated, "conversation_id": conversation_id}
+    
+    parts = conversation_id.split("_")
+    other_id = parts[0] if parts[1] == user_id else parts[1]
+    
+    return {
+        "messages": hydrated, 
+        "conversation_id": conversation_id,
+        "is_online": _is_online(other_id), # <--- REAL ONLINE STATUS
+    }
 
 
 # ---------- Call room (Jitsi) ----------
