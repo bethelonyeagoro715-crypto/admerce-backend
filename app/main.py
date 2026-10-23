@@ -24,12 +24,9 @@ print(
 )
 
 print(
-    "🏦 Anchor env:",
+    "💳 Paystack env:",
     {
-        "ANCHOR_API_KEY":         bool(os.getenv("ANCHOR_API_KEY")),
-        "ANCHOR_BASE_URL":        os.getenv("ANCHOR_BASE_URL", "(default)"),
-        "ANCHOR_FBO_ACCOUNT_ID":  bool(os.getenv("ANCHOR_FBO_ACCOUNT_ID")),
-        "ANCHOR_WEBHOOK_SECRET":  bool(os.getenv("ANCHOR_WEBHOOK_SECRET")),
+        "PAYSTACK_SECRET_KEY": bool(os.getenv("PAYSTACK_SECRET_KEY")),
     },
     flush=True,
 )
@@ -45,8 +42,6 @@ from app.db.listing_models import ListingModel
 from app.db.wallet_models import WalletModel, EscrowModel
 from app.db.courier_models import CourierModel
 from app.db.user_models import UserModel
-
-from app.services import anchor
 
 from app.routes.payment import router as payment_router
 from app.routes.storekeeper import router as storekeeper_router
@@ -76,15 +71,12 @@ from app.routes.auth_extras import router as auth_extras_router
 from app.routes.profile_extras import router as profile_extras_router
 from app.routes.feedback import router as feedback_router
 
-# ── Wallet router + webhook + background-loop helpers ─────────
+# ── Wallet router + webhook (Paystack) ─────────
 from app.routes.wallet import (
     router as wallet_router,
     webhook_router,
-    reconcile_pending_transfers,
-    _book_transfer,
-    _get_user_sub_account,
-    _get_escrow_holding_account,
     _credit_ledger,
+    _debit_ledger,
 )
 
 SKIP_MODELS = os.getenv("SKIP_MODELS") == "1"
@@ -122,82 +114,18 @@ def _aware(dt):
     return dt.astimezone(timezone.utc)
 
 
-async def _refund_via_anchor_or_legacy(
-    *,
-    shopper_id: str,
-    amount: float,
-    reference: str,
-    reason: str,
-    bucket: str = "shopping",
-) -> bool:
-    """
-    Try an Anchor book transfer (escrow holding → shopper). Falls back to
-    the legacy wallet update if Anchor isn't configured or errors out.
-    """
+async def _refund_escrow(shopper_id: str, amount: float, order_id: str) -> None:
     if amount <= 0:
-        return False
-
-    if not anchor.is_configured():
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": amount, "uid": shopper_id},
-        )
-        return False
-
-    try:
-        escrow_sub = await _get_escrow_holding_account()
-        shopper_sub = await _get_user_sub_account(shopper_id)
-    except HTTPException as exc:
-        print(f"⚠️  Refund prep failed ({reference}): {exc.detail}")
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": amount, "uid": shopper_id},
-        )
-        return False
-    except Exception as exc:
-        print(f"⚠️  Refund prep error ({reference}): {exc}")
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": amount, "uid": shopper_id},
-        )
-        return False
-
-    try:
-        result = await _book_transfer(
-            from_sub_account_id=escrow_sub,
-            to_sub_account_id=shopper_sub,
-            amount=amount,
-            reference=reference,
-            reason=reason,
-        )
-        transfer_id = (result or {}).get("transfer_id")
-
-        await _credit_ledger(shopper_id, bucket, amount)
-
-        await database.execute(
-            """
-            INSERT INTO wallet_transactions
-                (user_id, amount, type, description, reference, status,
-                 anchor_transfer_id, created_at)
-            VALUES
-                (:uid, :amt, 'credit', :desc, :ref, 'completed', :atid, NOW())
-            """,
-            {
-                "uid": shopper_id,
-                "amt": float(amount),
-                "desc": reason,
-                "ref": reference,
-                "atid": transfer_id,
-            },
-        )
-        return True
-    except Exception as exc:
-        print(f"⚠️  Anchor refund failed ({reference}): {exc} — falling back to legacy")
-        await database.execute(
-            "UPDATE wallets SET balance = balance + :amt WHERE user_id = :uid",
-            {"amt": amount, "uid": shopper_id},
-        )
-        return False
+        return
+    await _credit_ledger(shopper_id, "shopping", amount)
+    await database.execute(
+        """
+        INSERT INTO wallet_transactions 
+            (user_id, amount, type, description, reference, status, created_at)
+        VALUES (:uid, :amt, 'credit', :desc, :ref, 'completed', NOW())
+        """,
+        {"uid": shopper_id, "amt": amount, "desc": f"Refund: escrow expired — order {order_id[:8]}", "ref": f"expire:{order_id}"}
+    )
 
 
 async def _refund_expired_escrows() -> None:
@@ -213,28 +141,34 @@ async def _refund_expired_escrows() -> None:
                 shopper_id = row["shopper_id"]
                 refund_amount = float(row["total_amount"] or 0)
 
-                used_anchor = await _refund_via_anchor_or_legacy(
-                    shopper_id=shopper_id,
-                    amount=refund_amount,
-                    reference=f"expire:{order_id}",
-                    reason=f"Refund: escrow expired — order {order_id[:8]}",
-                    bucket="shopping",
-                )
+                await _refund_escrow(shopper_id, refund_amount, order_id)
 
                 await database.execute(
                     "UPDATE escrow SET status = 'refunded' WHERE order_id = :oid",
                     {"oid": order_id},
                 )
-
-                path = "Anchor" if used_anchor else "legacy"
                 print(
                     f"⏰ Refunded order {order_id} → {shopper_id} "
-                    f"(₦{refund_amount:,.0f}, {path})",
+                    f"(₦{refund_amount:,.0f})",
                     flush=True,
                 )
         except Exception as exc:
             print(f"⚠️  Escrow refund loop error: {exc}")
         await asyncio.sleep(60)
+
+
+async def _refund_booking(customer_id: str, amount: float, booking_id: str) -> None:
+    if amount <= 0:
+        return
+    await _credit_ledger(customer_id, "shopping", amount)
+    await database.execute(
+        """
+        INSERT INTO wallet_transactions 
+            (user_id, amount, type, description, reference, status, created_at)
+        VALUES (:uid, :amt, 'credit', :desc, :ref, 'completed', NOW())
+        """,
+        {"uid": customer_id, "amt": amount, "desc": f"Refund: booking {booking_id[:8]} expired", "ref": f"booking-expire:{booking_id}"}
+    )
 
 
 async def _expire_stale_bookings() -> None:
@@ -282,16 +216,7 @@ async def _expire_stale_bookings() -> None:
                 amount = _as_float(r.get("amount"))
 
                 if amount > 0:
-                    used_anchor = await _refund_via_anchor_or_legacy(
-                        shopper_id=customer_id,
-                        amount=amount,
-                        reference=f"booking-expire:{booking_id}",
-                        reason=f"Refund: booking {booking_id[:8]} expired",
-                        bucket="shopping",
-                    )
-                    path = "Anchor" if used_anchor else "legacy"
-                else:
-                    path = "no-op"
+                    await _refund_booking(customer_id, amount, booking_id)
 
                 await database.execute(
                     """
@@ -304,24 +229,12 @@ async def _expire_stale_bookings() -> None:
                 )
                 print(
                     f"⌛ Booking {booking_id} expired (was {status}) — "
-                    f"refunded ₦{amount:,.0f} → {customer_id} ({path})",
+                    f"refunded ₦{amount:,.0f} → {customer_id}",
                     flush=True,
                 )
         except Exception as exc:
             print(f"⚠️  Booking expiry loop error: {exc}")
         await asyncio.sleep(15 * 60)
-
-
-async def _reconcile_anchor_transfers() -> None:
-    while True:
-        try:
-            if anchor.is_configured():
-                n = await reconcile_pending_transfers(50)
-                if n > 0:
-                    print(f"🔁 Reconciled {n} Anchor transfers", flush=True)
-        except Exception as exc:
-            print(f"⚠️  Anchor reconciliation error: {exc}")
-        await asyncio.sleep(60)
 
 
 @asynccontextmanager
@@ -483,7 +396,7 @@ async def lifespan(app: FastAPI):
         """)
 
         # ═══════════════════════════════════════════════════════════
-        # users table columns
+        # users table columns (Paystack version)
         # ═══════════════════════════════════════════════════════════
         for col, dtype in [
             ("verified", "BOOLEAN DEFAULT FALSE"),
@@ -518,26 +431,22 @@ async def lifespan(app: FastAPI):
             ("avatar_height", "INTEGER"),
             ("business_image_width", "INTEGER"),
             ("business_image_height", "INTEGER"),
-            # ── Anchor virtual account columns ─────────────────
-            ("anchor_customer_id", "TEXT"),
-            ("anchor_sub_account_id", "TEXT"),
-            ("anchor_virtual_nuban", "TEXT"),
-            ("anchor_kyc_status", "TEXT DEFAULT 'pending'"),
-            ("anchor_sub_account_at", "TIMESTAMPTZ"),
+            # ── Paystack virtual account columns ─────────────────
+            ("paystack_customer_code", "TEXT"),
+            ("virtual_account_number", "TEXT"),
+            ("virtual_bank_name", "TEXT"),
+            ("paystack_recipient_code", "TEXT"),
+            ("paystack_subaccount_code", "TEXT"),
         ]:
             conn.exec_driver_sql(
                 f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {dtype}"
             )
 
         conn.exec_driver_sql(
-            "CREATE INDEX IF NOT EXISTS idx_users_anchor_virtual_nuban "
-            "ON users(anchor_virtual_nuban)"
+            "CREATE INDEX IF NOT EXISTS idx_users_virtual_account "
+            "ON users(virtual_account_number)"
         )
-        conn.exec_driver_sql(
-            "CREATE INDEX IF NOT EXISTS idx_users_anchor_sub_account_id "
-            "ON users(anchor_sub_account_id)"
-        )
-
+        
         conn.exec_driver_sql(
             "ALTER TABLE listings ADD COLUMN IF NOT EXISTS image_width INTEGER"
         )
@@ -569,8 +478,6 @@ async def lifespan(app: FastAPI):
             ("created_at", "TIMESTAMP DEFAULT NOW()"),
             ("expires_at", "TIMESTAMP"),
             ("order_store_id", "INTEGER"),
-            ("anchor_transfer_id", "TEXT"),
-            ("anchor_released_at", "TIMESTAMPTZ"),
         ]:
             conn.exec_driver_sql(
                 f"ALTER TABLE escrow ADD COLUMN IF NOT EXISTS {col} {dtype}"
@@ -1024,7 +931,7 @@ async def lifespan(app: FastAPI):
         )
 
         # ═══════════════════════════════════════════════════════════
-        # Anchor: user_ledger (display buckets)
+        # Ledger (display buckets)
         # ═══════════════════════════════════════════════════════════
         conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS user_ledger (
@@ -1045,75 +952,6 @@ async def lifespan(app: FastAPI):
             FROM users u
             CROSS JOIN (VALUES ('shopping'),('selling'),('services')) AS b(bucket)
             ON CONFLICT DO NOTHING
-        """)
-
-        # ═══════════════════════════════════════════════════════════
-        # Anchor: webhook event log (idempotency)
-        # ═══════════════════════════════════════════════════════════
-        conn.exec_driver_sql("""
-            CREATE TABLE IF NOT EXISTS anchor_webhook_events (
-                id               BIGSERIAL PRIMARY KEY,
-                anchor_event_id  TEXT UNIQUE NOT NULL,
-                event_type       TEXT NOT NULL,
-                payload          JSONB NOT NULL,
-                received_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                processed_at     TIMESTAMPTZ,
-                process_error    TEXT
-            )
-        """)
-        conn.exec_driver_sql(
-            "CREATE INDEX IF NOT EXISTS idx_anchor_webhook_pending "
-            "ON anchor_webhook_events(processed_at) WHERE processed_at IS NULL"
-        )
-
-        # ═══════════════════════════════════════════════════════════
-        # Anchor: pending transfer reconciliation
-        # ═══════════════════════════════════════════════════════════
-        conn.exec_driver_sql("""
-            CREATE TABLE IF NOT EXISTS anchor_pending_transfers (
-                id               BIGSERIAL PRIMARY KEY,
-                reference        TEXT UNIQUE NOT NULL,
-                transfer_id      TEXT,
-                kind             TEXT NOT NULL CHECK (kind IN ('book','nip')),
-                from_account     TEXT,
-                to_account       TEXT,
-                amount           NUMERIC NOT NULL,
-                status           TEXT NOT NULL DEFAULT 'pending',
-                attempts         INTEGER DEFAULT 0,
-                last_checked_at  TIMESTAMPTZ,
-                error            TEXT,
-                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                completed_at     TIMESTAMPTZ
-            )
-        """)
-        conn.exec_driver_sql(
-            "CREATE INDEX IF NOT EXISTS idx_anchor_pending_status "
-            "ON anchor_pending_transfers(status, last_checked_at)"
-        )
-
-        # ═══════════════════════════════════════════════════════════
-        # Anchor: counterparty cache (external bank accounts)
-        # ═══════════════════════════════════════════════════════════
-        conn.exec_driver_sql("""
-            CREATE TABLE IF NOT EXISTS anchor_counterparties (
-                id                      BIGSERIAL PRIMARY KEY,
-                user_id                 TEXT NOT NULL,
-                bank_code               TEXT NOT NULL,
-                account_number          TEXT NOT NULL,
-                account_name            TEXT,
-                anchor_counterparty_id  TEXT,
-                created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (user_id, bank_code, account_number)
-            )
-        """)
-
-        # ═══════════════════════════════════════════════════════════
-        # Anchor: escrow holding sub-account placeholder
-        # ═══════════════════════════════════════════════════════════
-        conn.exec_driver_sql("""
-            INSERT INTO app_settings (key, value)
-            VALUES ('escrow_holding_sub_account_id', '')
-            ON CONFLICT (key) DO NOTHING
         """)
 
         # ═══════════════════════════════════════════════════════════
@@ -1321,14 +1159,12 @@ async def lifespan(app: FastAPI):
     # ═══════════════════════════════════════════════════════════
     task_escrow   = asyncio.create_task(_refund_expired_escrows())
     task_bookings = asyncio.create_task(_expire_stale_bookings())
-    task_recon    = asyncio.create_task(_reconcile_anchor_transfers())
     print("✅ Server is ready.")
     yield
 
     task_escrow.cancel()
     task_bookings.cancel()
-    task_recon.cancel()
-    for t in (task_escrow, task_bookings, task_recon):
+    for t in (task_escrow, task_bookings):
         try:
             await t
         except asyncio.CancelledError:
