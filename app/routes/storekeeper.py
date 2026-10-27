@@ -12,23 +12,20 @@ from app.services.image_embedder import (
 )
 from app.services.auto_fill import suggest_from_barcode
 from app.utils.category_utils import validate_item_category
+from app.utils import haversine  # 🚨 Added for Wanted matching
 from app.services.cloudinary_service import upload_image
+from app.routes.notifications import send_push_to_user  # 🚨 Added for Wanted matching
 from fastapi.responses import FileResponse
 from PIL import Image
 import uuid, os, json, io
+import asyncio  # 🚨 Added for background task
 from datetime import datetime
 import traceback
 
 router = APIRouter(prefix="/storekeeper", tags=["Storekeeper"])
 
-
 # ---------- image dimensions helper ----------
 def _image_dimensions(image_bytes: bytes) -> tuple[Optional[int], Optional[int]]:
-    """Return (width, height) for the exact bytes being uploaded.
-
-    Returns (None, None) on any decode failure so the caller still proceeds —
-    the frontend falls back to a deterministic hash ratio for those rows.
-    """
     try:
         img = Image.open(io.BytesIO(image_bytes))
         w, h = img.size
@@ -37,7 +34,6 @@ def _image_dimensions(image_bytes: bytes) -> tuple[Optional[int], Optional[int]]
     except Exception as e:
         print(f"⚠️  Could not read image dimensions: {e}")
     return None, None
-
 
 # ---------- Pydantic models ----------
 class StoreCreateRequest(BaseModel):
@@ -62,7 +58,6 @@ class VerificationSubmitRequest(BaseModel):
     business_address: str = Field(..., min_length=4, max_length=400)
     contact_phone: str = Field(..., min_length=7, max_length=30)
     evidence: List[str] = Field(default_factory=list)
-
 
 # ---------- helper ----------
 def compute_title_quality(title: str) -> float:
@@ -104,6 +99,41 @@ async def _log_store_verification_event(
             "ref": reference,
         },
     )
+
+# 🚨 NEW: Background task for Wanted matching
+async def _notify_wanted_matches(listing_id: str, title: str, lat: float, lng: float, store_name: str):
+    try:
+        alerts = await database.fetch_all(
+            """
+            SELECT id, user_id, title, lat, lng
+            FROM wanted_alerts
+            WHERE is_active = TRUE
+              AND expires_at > NOW()
+              AND (
+                LOWER(:t) LIKE '%' || LOWER(title) || '%'
+                OR LOWER(title) LIKE '%' || LOWER(:t) || '%'
+              )
+            """,
+            {"t": title}
+        )
+        for a in alerts:
+            # Check distance if the alert has coordinates
+            if a["lat"] and a["lng"]:
+                dist = haversine(lat, lng, a["lat"], a["lng"])
+                if dist > 50: # 50km radius limit
+                    continue
+                    
+            await send_push_to_user(
+                user_id=a["user_id"],
+                title="Wanted item found!",
+                body=f"{store_name} just listed: {title}",
+                data={
+                    "type": "order",
+                    "url": f"/item-detail/{listing_id}"
+                }
+            )
+    except Exception as e:
+        print(f"⚠️ Wanted matching failed: {e}")
 
 # ==================== CREATE STORE ====================
 @router.post("/store", status_code=201)
@@ -378,9 +408,6 @@ async def cancel_store_verification(
     }
 
 # ==================== CREATE LISTING ====================
-# 🔒 FIXED: added auth + store ownership check. Previously this route had NO
-#    auth dependency at all — any anonymous caller could create a listing on
-#    any store by supplying that store's store_id.
 @router.post("/listing")
 async def create_listing(
     request: Request,
@@ -402,9 +429,9 @@ async def create_listing(
             detail=f"Invalid category: '{category}'. Valid categories are: tech_electronics, food_beverage, health_wellness, fashion_apparel, building_industrial, home_garden, kids_toys, sports_outdoors, automotive, media_office"
         )
 
-    # ── Ownership check: caller must own the store they're listing into.
+    # 🚨 Added 'name' to the store fetch for the Wanted matcher
     existing_store = await database.fetch_one(
-        "SELECT store_id, owner_id FROM stores WHERE store_id = :sid",
+        "SELECT store_id, owner_id, name FROM stores WHERE store_id = :sid",
         {"sid": store_id},
     )
     if not existing_store:
@@ -421,7 +448,6 @@ async def create_listing(
         if info.get("suggested_category"):
             suggested_category = info["suggested_category"]
 
-    # Process + upload image to Cloudinary, keeping raw bytes for the embedder.
     image_url = None
     raw_image_bytes: bytes | None = None
     image_width: Optional[int] = None
@@ -489,6 +515,17 @@ async def create_listing(
         "qty": quantity,
     })
 
+    # 🚨 Trigger the Scavenge matching engine in the background
+    asyncio.create_task(
+        _notify_wanted_matches(
+            listing_id=listing_id,
+            title=final_title,
+            lat=lat,
+            lng=lng,
+            store_name=existing_store["name"]
+        )
+    )
+
     return {
         "listing_id": listing_id,
         "store_id": store_id,
@@ -511,11 +548,6 @@ async def get_listing(
     listing_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """Fetch a single listing for editing.
-
-    Owner-gated: this returns `SELECT *`, which includes the `embedding`
-    column. Only the owner should see that.
-    """
     listing = await database.fetch_one(
         "SELECT * FROM listings WHERE listing_id = :lid",
         {"lid": listing_id},
@@ -533,8 +565,6 @@ async def get_listing(
     return dict(listing)
 
 # ==================== UPDATE LISTING (owner only) ====================
-# Only these fields are mutable: title, description, quantity_total,
-# is_available, image. Price, category, and lat/lng are frozen after publish.
 @router.put("/listing/{listing_id}")
 async def update_listing(
     listing_id: str,
@@ -546,7 +576,6 @@ async def update_listing(
     image: UploadFile = File(None),
     style: str = Form("warm"),
 ):
-    # ── Fetch current row + ownership check
     listing = await database.fetch_one(
         "SELECT * FROM listings WHERE listing_id = :lid",
         {"lid": listing_id},
@@ -561,8 +590,6 @@ async def update_listing(
     if not store or store["owner_id"] != current_user["id"]:
         raise HTTPException(status_code=403, detail="Not your listing")
 
-    # ── Accumulate updates. Column names here are all from a fixed
-    #    whitelist — user input never reaches the SQL string.
     updates: dict = {}
 
     if title is not None:
@@ -604,8 +631,6 @@ async def update_listing(
     if is_available is not None:
         updates["is_available"] = bool(is_available)
 
-    # ── Optional image replacement. On success, recompute embedding so
-    #    SEAI lens / similar-item search reflects the new photo.
     if image and image.filename:
         image_bytes = await image.read()
         if image_bytes:
@@ -637,8 +662,6 @@ async def update_listing(
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    # ── Build a parameterized UPDATE. Column names are from `updates`
-    #    (our own dict, never user input). Values are bound.
     set_parts = []
     params = {"lid": listing_id}
     for col, val in updates.items():
@@ -690,8 +713,6 @@ async def upload_store_image(
     }
 
 # ==================== PREVIEW IMAGE ====================
-# 🔒 FIXED: added auth. Previously anonymous callers could pump arbitrary
-#    images through Cloudinary on the app's account — cost / storage abuse.
 @router.post("/preview-image")
 async def preview_image(
     request: Request,
@@ -705,14 +726,10 @@ async def preview_image(
     return {"image_url": image_url}
 
 # ==================== SERVE UPLOADED FILES (legacy) ====================
-# 🔒 FIXED: path traversal. Previously `os.path.join(cwd, "uploads", file_path)`
-#    with a `..`-containing file_path could escape the uploads directory and
-#    serve arbitrary files (e.g. `.env`, source code).
 @router.get("/uploads/{file_path:path}")
 async def get_upload(file_path: str):
     base_dir = os.path.realpath(os.path.join(os.getcwd(), "uploads"))
     filepath = os.path.realpath(os.path.join(base_dir, file_path))
-    # Must be inside base_dir (allows the dir itself, blocks "../")
     if filepath != base_dir and not filepath.startswith(base_dir + os.sep):
         raise HTTPException(status_code=404, detail="Image not found")
     if os.path.isfile(filepath):
@@ -720,9 +737,6 @@ async def get_upload(file_path: str):
     raise HTTPException(status_code=404, detail="Image not found")
 
 # ==================== LIST STORES (public discovery) ====================
-# Public endpoint — the SHOPNSTORE tab fetches this before the buyer is
-# necessarily logged in. Returns one row per store with the fields the
-# frontend's <Store> type expects.
 @router.get("/stores/locations")
 async def get_store_locations():
     rows = await database.fetch_all(
@@ -760,7 +774,6 @@ async def get_store(store_id: str):
 
     store = dict(row)
 
-    # Public social proof: unique buyers who actually received goods.
     owner_id = store.get("owner_id")
     patronizer_count = 0
     if owner_id:
@@ -809,9 +822,6 @@ async def update_item_order(
     return {"message": "Order updated"}
 
 # ==================== GET ORDERS FOR A STORE ====================
-# 🔒 FIXED: added auth + ownership check. Previously anonymous callers could
-#    enumerate any store's escrow rows (customer names, amounts, timestamps).
-#    This is the IDOR behind the "You are not the storekeeper" incident.
 @router.get("/orders/{store_id}")
 async def get_store_orders(
     store_id: str,
@@ -877,14 +887,12 @@ async def follow_store(store_id: str, current_user: dict = Depends(get_current_u
 
     now = datetime.utcnow()
 
-    # "I follow this store" — powers /shopper/saved favorites list
     await database.execute(
         "INSERT INTO favorites (user_id, store_id, created_at) "
         "VALUES (:uid, :sid, :now) ON CONFLICT DO NOTHING",
         {"uid": current_user["id"], "sid": store_id, "now": now},
     )
 
-    # Mirror into user_follows so the storekeeper's profile shows the count
     if owner_id:
         await database.execute(
             "INSERT INTO user_follows (follower_id, following_id) "
@@ -901,7 +909,6 @@ async def follow_store(store_id: str, current_user: dict = Depends(get_current_u
         "is_following": True,
         "followers_count": int(count or 0),
     }
-
 
 @router.get("/{store_id}/follow-status")
 async def get_follow_status(
@@ -927,7 +934,6 @@ async def get_follow_status(
         "is_following": record is not None,
         "followers_count": int(count or 0),
     }
-
 
 @router.delete("/{store_id}/unfollow")
 async def unfollow_store(
