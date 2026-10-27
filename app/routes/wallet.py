@@ -285,7 +285,105 @@ async def get_my_escrows(current_user: dict = Depends(get_current_user)):
     return [dict(row) for row in rows]
 
 # ═══════════════════════════════════════════════════════════════════
-# 6. INSTANT PICKUP
+# 6. READ: INSTANT TRANSACTIONS (PICKUPS & JOBS)
+# ═══════════════════════════════════════════════════════════════════
+async def _lookup_counterparty_user(user_id: str) -> dict:
+    row = await database.fetch_one(
+        """
+        SELECT u.id, u.real_name, u.nickname, u.first_name, u.last_name,
+               u.role, u.business_name,
+               s.name AS store_name
+          FROM users u
+          LEFT JOIN stores s ON s.owner_id = u.id
+         WHERE u.id = :uid
+         LIMIT 1
+        """,
+        {"uid": user_id},
+    )
+    if not row:
+        return {"user_id": user_id, "display_name": "Admerce user", "role": None, "store_name": None, "business_name": None}
+    r = dict(row)
+    name = r.get("real_name") or r.get("nickname") or f"{r.get('first_name') or ''} {r.get('last_name') or ''}".strip() or "Admerce user"
+    return {
+        "user_id": user_id,
+        "display_name": name,
+        "role": r.get("role"),
+        "store_name": r.get("store_name"),
+        "business_name": r.get("business_name"),
+    }
+
+@router.get("/instant-transactions")
+async def get_instant_transactions(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+
+    pickups_rows = await database.fetch_all(
+        """
+        SELECT w.id, w.reference, w.amount, w.description, w.status, w.created_at,
+               wc.user_id AS counterparty_user_id,
+               u.business_image_url AS store_image_url,
+               l.title AS listing_title,
+               l.image_url AS listing_image_url
+          FROM wallet_transactions w
+          LEFT JOIN wallet_transactions wc
+                 ON wc.reference = (w.reference || :credit_suffix)
+                AND wc.type = 'credit'
+          LEFT JOIN users u ON wc.user_id = u.id
+          LEFT JOIN listings l ON w.description = ('Instant pickup: ' || l.title)
+         WHERE w.user_id = :uid
+           AND w.reference LIKE :prefix
+           AND w.reference NOT LIKE :not_suffix
+           AND w.type = 'debit'
+         ORDER BY w.created_at DESC
+         LIMIT 50
+        """,
+        {
+            "uid": user_id,
+            "credit_suffix": ":credit",
+            "prefix": "pickup\\_%",
+            "not_suffix": "%:credit",
+        },
+    )
+
+    service_rows = await database.fetch_all(
+        """
+        SELECT w.id, w.reference, w.amount, w.description, w.status, w.created_at,
+               wc.user_id AS counterparty_user_id,
+               u.business_image_url AS provider_image_url,
+               s.title AS service_title,
+               s.image_url AS service_image_url
+          FROM wallet_transactions w
+          LEFT JOIN wallet_transactions wc
+                 ON wc.reference = w.reference
+                AND wc.type = 'credit'
+                AND wc.user_id != w.user_id
+          LEFT JOIN users u ON wc.user_id = u.id
+          LEFT JOIN services s ON w.description = ('Service payment: ' || s.title)
+         WHERE w.user_id = :uid
+           AND w.reference LIKE :prefix
+           AND w.type = 'debit'
+         ORDER BY w.created_at DESC
+         LIMIT 50
+        """,
+        {"uid": user_id, "prefix": "svcpay\\_%"},
+    )
+
+    async def enrich(rows) -> list:
+        out = []
+        for r in rows:
+            d = dict(r)
+            cp_user_id = d.pop("counterparty_user_id", None)
+            cp = await _lookup_counterparty_user(cp_user_id) if cp_user_id else None
+            d["counterparty"] = cp
+            out.append(d)
+        return out
+
+    return {
+        "pickups": await enrich(pickups_rows),
+        "services": await enrich(service_rows),
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+# 7. INSTANT PICKUP
 # ═══════════════════════════════════════════════════════════════════
 @router.post("/instant-pickup")
 async def instant_pickup(
@@ -367,7 +465,7 @@ async def instant_pickup(
     return {"message": "Payment successful", "amount": total}
 
 # ═══════════════════════════════════════════════════════════════════
-# 7. RESERVATION
+# 8. RESERVATION
 # ═══════════════════════════════════════════════════════════════════
 @router.post("/reserve")
 async def reserve(
@@ -452,7 +550,7 @@ async def reserve(
     return {"message": "Reserved successfully", "order_id": req.order_id, "status": "locked"}
 
 # ═══════════════════════════════════════════════════════════════════
-# 8. CONFIRM
+# 9. CONFIRM
 # ═══════════════════════════════════════════════════════════════════
 @router.post("/confirm")
 async def confirm_pickup(
@@ -507,7 +605,7 @@ async def confirm_pickup(
     return {"message": "Funds released", "order_id": req.order_id, "status": "picked_up"}
 
 # ═══════════════════════════════════════════════════════════════════
-# 9. WEBHOOK
+# 10. WEBHOOK
 # ═══════════════════════════════════════════════════════════════════
 @webhook_router.post("/paystack")
 async def paystack_webhook(
