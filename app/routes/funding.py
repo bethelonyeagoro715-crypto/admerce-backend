@@ -1,15 +1,10 @@
 """
-Admerce — wallet funding via virtual NUBAN.
-
-This replaces the old Paystack top-up. Users transfer money into their
-Anchor-issued virtual NUBAN; Anchor webhooks Admerce when the money
-arrives; the wallet webhook handler credits the display ledger.
-
-No merchant account in the middle. No custody. No ₦250M fine.
+Admerce — wallet funding via Paystack Dedicated Virtual Account (DVA).
 """
+import os
 import logging
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
-
 from app.db.database import database
 from app.utils.security import get_current_user
 
@@ -17,20 +12,30 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/funding", tags=["Funding"])
 
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
+
+async def _paystack_post(endpoint: str, payload: dict) -> dict:
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient() as client:
+        res = await client.post(f"https://api.paystack.co{endpoint}", json=payload, headers=headers)
+        res.raise_for_status()
+        return res.json()
+
 
 @router.get("/details")
 async def funding_details(current_user: dict = Depends(get_current_user)):
     """
-    Return the caller's virtual NUBAN so the UI can display it and the
-    user can transfer from any Nigerian bank app.
+    Return the caller's Paystack virtual NUBAN so the UI can display it.
+    If it doesn't exist, provision it via Paystack.
     """
     user_id = current_user["id"]
 
     row = await database.fetch_one(
         """
-        SELECT anchor_virtual_nuban,
-               anchor_sub_account_id,
-               anchor_kyc_status
+        SELECT paystack_customer_code, virtual_account_number, virtual_bank_name, email
           FROM users
          WHERE id = :uid
         """,
@@ -39,45 +44,65 @@ async def funding_details(current_user: dict = Depends(get_current_user)):
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if not row["anchor_virtual_nuban"]:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Your Admerce wallet is being set up. "
-                "Please try again in a few minutes, or complete KYC if prompted."
-            ),
+    # If the account already exists, return it immediately
+    if row["virtual_account_number"]:
+        return {
+            "account_number": row["virtual_account_number"],
+            "bank_name": row["virtual_bank_name"] or "Paystack Titan",
+            "account_name": f"Admerce / {current_user.get('nickname') or user_id[:8]}",
+            "note": "Transfer any amount from your bank app. Funds appear within seconds.",
+            "kyc_status": "verified",
+        }
+
+    # If account doesn't exist, we need to create it
+    customer_code = row["paystack_customer_code"]
+
+    # 1. Create Paystack Customer if we don't have one
+    if not customer_code:
+        email = row["email"]
+        if not email:
+            raise HTTPException(status_code=400, detail="Email required for account creation")
+
+        try:
+            cust_res = await _paystack_post("/customer", {"email": email})
+            customer_code = cust_res["data"]["customer_code"]
+            await database.execute(
+                "UPDATE users SET paystack_customer_code = :cc WHERE id = :uid",
+                {"cc": customer_code, "uid": user_id},
+            )
+        except Exception as e:
+            logger.error(f"Paystack customer creation failed: {e}")
+            raise HTTPException(status_code=502, detail="Failed to create Paystack customer profile.")
+
+    # 2. Create the Dedicated Virtual Account (DVA)
+    try:
+        dva_payload = {
+            "customer": customer_code,
+            "preferred_bank": "titan-paystack",
+        }
+        dva_res = await _paystack_post("/dedicated_account", dva_payload)
+        
+        account_number = dva_res["data"]["account_number"]
+        bank_name = dva_res["data"]["bank"]["name"]
+
+        await database.execute(
+            """
+            UPDATE users
+               SET virtual_account_number = :van,
+                   virtual_bank_name = :vbn
+             WHERE id = :uid
+            """,
+            {"van": account_number, "vbn": bank_name, "uid": user_id},
         )
 
-    return {
-        "account_number": row["anchor_virtual_nuban"],
-        "bank_name": "Admerce Escrow",  # Anchor will tell you the exact partner bank
-        "account_name": "Admerce / " + (current_user.get("nickname") or user_id[:8]),
-        "note": "Transfer any amount from your bank app. Funds appear within seconds.",
-        "kyc_status": row["anchor_kyc_status"] or "pending",
-    }
-
-
-@router.get("/history")
-async def funding_history(
-    limit: int = 20,
-    current_user: dict = Depends(get_current_user),
-):
-    """
-    Recent bank-transfer credits into this user's wallet.
-    Reads wallet_transactions filtered by source — the webhook writes
-    a row every time Anchor fires payment.received.
-    """
-    user_id = current_user["id"]
-    rows = await database.fetch_all(
-        """
-        SELECT id, amount, description, reference, status, created_at
-          FROM wallet_transactions
-         WHERE user_id = :uid
-           AND type = 'credit'
-           AND description ILIKE 'Bank transfer%'
-         ORDER BY created_at DESC
-         LIMIT :lim
-        """,
-        {"uid": user_id, "lim": max(1, min(limit, 100))},
-    )
-    return [dict(r) for r in rows]
+        return {
+            "account_number": account_number,
+            "bank_name": bank_name,
+            "account_name": f"Admerce / {current_user.get('nickname') or user_id[:8]}",
+            "note": "Transfer any amount from your bank app. Funds appear within seconds.",
+            "kyc_status": "verified",
+        }
+        
+    except Exception as e:
+        logger.error(f"Paystack DVA creation failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to provision virtual account. Please try again.")
