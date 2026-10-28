@@ -539,9 +539,57 @@ async def handle_get_store_info(params: dict) -> dict:
     }
 
 
+async def handle_optimize_cart(params: dict, lat: float, lng: float, user_id: str = None) -> dict:
+    items = params.get("items", [])
+    budget = params.get("budget")
+    
+    if not items or not budget:
+        return {"type": "text", "text": "I need a list of items and a budget to optimize your cart."}
+
+    from app.routes.shopper import OptimizeRequest, optimize_cart
+    
+    try:
+        req = OptimizeRequest(
+            items=items,
+            budget=float(budget),
+            lat=lat,
+            lng=lng,
+            radius_km=50.0
+        )
+        user = {"id": user_id} if user_id else None
+        
+        result = await optimize_cart(req, user)
+        
+        if result["status"] == "success":
+            decision = result["decision"]
+            items_str = ", ".join(decision["items"])
+            return {
+                "type": "text",
+                "text": (
+                    f"Based on your budget of ₦{budget:,.0f}, the best option is to go to "
+                    f"**{decision['store_name']}**. You can get {items_str} "
+                    f"for a total of ₦{decision['total']:,.0f}. "
+                    f"This leaves you with ₦{result['savings']:,.0f} to spare."
+                )
+            }
+        elif result["status"] == "over_budget":
+            return {
+                "type": "text",
+                "text": f"Even the cheapest options exceed your budget. You would need at least ₦{result['total_needed']:,.0f}."
+            }
+        else:
+            return {
+                "type": "text",
+                "text": result.get("message", "I couldn't find all the items nearby.")
+            }
+            
+    except Exception as e:
+        print(f"⚠️ Optimize failed: {e}")
+        return {"type": "text", "text": "I had trouble optimizing your cart right now."}
+
+
 async def _embedding_recall(user_id, lat, lng, radius_km, limit):
     return []
-
 
 async def _collab_recall(user_id, lat, lng, radius_km, limit):
     return []
