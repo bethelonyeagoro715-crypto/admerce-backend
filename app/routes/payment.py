@@ -18,43 +18,85 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/funding", tags=["Funding"])
 
 
-@router.get("/details")
+@router.get("/funding/details")
 async def funding_details(current_user: dict = Depends(get_current_user)):
-    """
-    Return the caller's virtual NUBAN so the UI can display it and the
-    user can transfer from any Nigerian bank app.
-    """
     user_id = current_user["id"]
 
     row = await database.fetch_one(
-        """
-        SELECT anchor_virtual_nuban,
-               anchor_sub_account_id,
-               anchor_kyc_status
-          FROM users
-         WHERE id = :uid
-        """,
+        "SELECT paystack_customer_code, virtual_account_number, virtual_bank_name, email "
+        "FROM users WHERE id = :uid",
         {"uid": user_id},
     )
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if not row["anchor_virtual_nuban"]:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Your Admerce wallet is being set up. "
-                "Please try again in a few minutes, or complete KYC if prompted."
-            ),
-        )
+    # If the account already exists, return it immediately
+    if row["virtual_account_number"]:
+        return {
+            "account_number": row["virtual_account_number"],
+            "bank_name": row["virtual_bank_name"] or "Paystack Titan",
+            "account_name": f"Admerce / {current_user.get('nickname') or user_id[:8]}",
+            "note": "Transfer any amount from your bank app. Funds appear within seconds.",
+            "kyc_status": "verified",
+        }
 
-    return {
-        "account_number": row["anchor_virtual_nuban"],
-        "bank_name": "Admerce Escrow",  # Anchor will tell you the exact partner bank
-        "account_name": "Admerce / " + (current_user.get("nickname") or user_id[:8]),
-        "note": "Transfer any amount from your bank app. Funds appear within seconds.",
-        "kyc_status": row["anchor_kyc_status"] or "pending",
+    # Create Paystack DVA if missing
+    customer_code = row["paystack_customer_code"]
+    
+    if not customer_code:
+        email = row["email"]
+        if not email:
+            raise HTTPException(status_code=400, detail="Email required for account creation")
+            
+        # Call Paystack to create customer
+        import httpx
+        import os
+        headers = {
+            "Authorization": f"Bearer {os.getenv('PAYSTACK_SECRET_KEY')}",
+            "Content-Type": "application/json"
+        }
+        async with httpx.AsyncClient() as client:
+            res = await client.post("https://api.paystack.co/customer", json={"email": email}, headers=headers)
+            if res.status_code != 200:
+                raise HTTPException(status_code=502, detail="Failed to create Paystack customer")
+            customer_code = res.json()["data"]["customer_code"]
+            await database.execute(
+                "UPDATE users SET paystack_customer_code = :cc WHERE id = :uid",
+                {"cc": customer_code, "uid": user_id}
+            )
+
+    # Call Paystack to create DVA
+    import httpx
+    import os
+    headers = {
+        "Authorization": f"Bearer {os.getenv('PAYSTACK_SECRET_KEY')}",
+        "Content-Type": "application/json"
     }
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://api.paystack.co/dedicated_account",
+            json={"customer": customer_code, "preferred_bank": "titan-paystack"},
+            headers=headers
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to create virtual account")
+            
+        data = res.json()["data"]
+        account_number = data["account_number"]
+        bank_name = data["bank"]["name"]
+        
+        await database.execute(
+            "UPDATE users SET virtual_account_number = :van, virtual_bank_name = :vbn WHERE id = :uid",
+            {"van": account_number, "vbn": bank_name, "uid": user_id}
+        )
+        
+        return {
+            "account_number": account_number,
+            "bank_name": bank_name,
+            "account_name": f"Admerce / {current_user.get('nickname') or user_id[:8]}",
+            "note": "Transfer any amount from your bank app. Funds appear within seconds.",
+            "kyc_status": "verified",
+        }
 
 
 @router.get("/history")
