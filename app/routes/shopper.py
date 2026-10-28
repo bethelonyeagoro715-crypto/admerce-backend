@@ -1,3 +1,4 @@
+# app/routes/shopper.py
 import math
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException
@@ -17,14 +18,6 @@ MAX_PER_STORE = 5
 
 # ---------- Helper ----------
 def _to_datetime(value):
-    """
-    Coerce a DB value into a timezone-aware UTC datetime.
-
-    Always returns aware, even if the input is a naive datetime (from a
-    still-naive TIMESTAMP column) or a naive ISO string. This makes
-    subtraction with `datetime.now(timezone.utc)` safe regardless of
-    which side of the TIMESTAMPTZ migration the column is on.
-    """
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -40,7 +33,6 @@ def _to_datetime(value):
 
 
 def _row_get(row, key):
-    """Safe accessor — asyncpg Record raises on missing key, dicts don't."""
     try:
         return row[key]
     except (KeyError, IndexError):
@@ -90,6 +82,14 @@ class WantedAlertResponse(BaseModel):
     is_active: bool = True
     created_at: Optional[str] = None
     expires_at: Optional[str] = None
+
+# 🚨 NEW: Model for the Optimizer
+class OptimizeRequest(BaseModel):
+    items: List[str]
+    budget: float
+    lat: float = 5.4833
+    lng: float = 7.0333
+    radius_km: float = 10.0
 
 
 # ---------- Existing ranking endpoint (legacy) ----------
@@ -178,7 +178,6 @@ async def feed_recall(req: RecallRequest, current_user: Optional[dict] = Depends
     total_candidates = 500
     candidates: Dict[str, dict] = {}
 
-    # 1. Geo
     try:
         geo_limit = int(total_candidates * weights["geo"])
         geo_items = await _geo_recall(req.lat, req.lng, req.radius_km, geo_limit)
@@ -193,7 +192,6 @@ async def feed_recall(req: RecallRequest, current_user: Optional[dict] = Depends
     except Exception as e:
         print(f"geo recall error: {e}")
 
-    # 2. Forage
     try:
         forage_limit = int(total_candidates * weights["forage"])
         forage_items = await _forage_recall(req.lat, req.lng, req.radius_km, forage_limit)
@@ -203,7 +201,6 @@ async def feed_recall(req: RecallRequest, current_user: Optional[dict] = Depends
     except Exception as e:
         print(f"forage recall error: {e}")
 
-    # 3. Trending
     try:
         trending_limit = int(total_candidates * weights["trending"])
         trending_items = await _trending_recall(req.lat, req.lng, req.radius_km, trending_limit)
@@ -213,7 +210,6 @@ async def feed_recall(req: RecallRequest, current_user: Optional[dict] = Depends
     except Exception as e:
         print(f"trending recall error: {e}")
 
-    # 4. Following
     if user_id:
         try:
             following_limit = int(total_candidates * weights["following"])
@@ -224,8 +220,6 @@ async def feed_recall(req: RecallRequest, current_user: Optional[dict] = Depends
         except Exception as e:
             print(f"following recall error: {e}")
 
-    # 5. Embedding
-    if user_id:
         try:
             embed_limit = int(total_candidates * weights["embedding"])
             embed_items = await _embedding_recall(user_id, req.lat, req.lng, req.radius_km, embed_limit)
@@ -235,8 +229,6 @@ async def feed_recall(req: RecallRequest, current_user: Optional[dict] = Depends
         except Exception as e:
             print(f"embedding recall error: {e}")
 
-    # 6. Collaborative
-    if user_id:
         try:
             collab_limit = int(total_candidates * weights["collab"])
             collab_items = await _collab_recall(user_id, req.lat, req.lng, req.radius_km, collab_limit)
@@ -269,7 +261,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
     if not rows:
         return {"feed": [], "total": 0, "model_used": model is not None}
 
-    # ── Fallback path (no ML model) ──
     if model is None:
         rows_by_id = {row["listing_id"]: row for row in rows}
         fallback_feed = []
@@ -305,7 +296,6 @@ async def rank_feed_endpoint(req: RankRequest, current_user: Optional[dict] = De
                 break
         return {"feed": fallback_feed, "total": len(fallback_feed), "model_used": False}
 
-    # ── ML-ranked path ──
     scored = []
     for row in rows:
         dist = haversine(req.lat, req.lng, row["lat"], row["lng"])
@@ -605,9 +595,6 @@ async def get_provider_services(provider_id: str):
         "SELECT * FROM services WHERE provider_id = :pid",
         {"pid": provider_id}
     )
-    # FIXED: serialize Record objects to dicts. Previously returned
-    # `rows` raw, which FastAPI cannot JSON-encode → 500 on any non-empty
-    # result.
     return [dict(row) for row in rows]
 
 
@@ -636,3 +623,82 @@ async def search_shopper_items(query: str, lat: float, lng: float, radius_km: fl
             })
     results.sort(key=lambda x: x["distance_km"])
     return results[:limit]
+
+# 🚨 NEW: The Optimizer Engine
+@router.post("/optimize-cart")
+async def optimize_cart(req: OptimizeRequest, current_user: Optional[dict] = Depends(get_optional_user)):
+    if not req.items:
+        raise HTTPException(status_code=400, detail="No items provided.")
+
+    all_matches = []
+    for item in req.items:
+        rows = await database.fetch_all(
+            """
+            SELECT l.listing_id, l.title, l.price, l.store_id, l.lat, l.lng,
+                   s.name AS store_name, s.latitude AS store_lat, s.longitude AS store_lng
+            FROM listings l
+            JOIN stores s ON l.store_id = s.store_id
+            WHERE LOWER(l.title) LIKE :q
+              AND (l.quantity_available IS NULL OR l.quantity_available > 0)
+            """,
+            {"q": f"%{item.lower()}%"}
+        )
+        
+        valid_rows = []
+        for r in rows:
+            d = dict(r)
+            item_lat = d["store_lat"] if d["store_lat"] is not None else d["lat"]
+            item_lng = d["store_lng"] if d["store_lng"] is not None else d["lng"]
+            
+            if item_lat and item_lng:
+                dist = haversine(req.lat, req.lng, item_lat, item_lng)
+                if dist <= req.radius_km:
+                    d["distance_km"] = dist
+                    valid_rows.append(d)
+                    
+        valid_rows.sort(key=lambda x: float(x.get("price") or 0))
+        if valid_rows:
+            all_matches.append({"item": item, "cheapest": valid_rows[0]})
+
+    if len(all_matches) < len(req.items):
+        missing = set(req.items) - set(m["item"] for m in all_matches)
+        return {
+            "status": "incomplete",
+            "message": f"Could not find nearby results for: {', '.join(missing)}",
+            "found": all_matches
+        }
+
+    store_totals: Dict[str, Dict] = {}
+    for match in all_matches:
+        store_id = match["cheapest"]["store_id"]
+        store_name = match["cheapest"]["store_name"]
+        price = float(match["cheapest"]["price"] or 0)
+        
+        if store_id not in store_totals:
+            store_totals[store_id] = {"store_name": store_name, "total": 0, "items": []}
+            
+        store_totals[store_id]["total"] += price
+        store_totals[store_id]["items"].append(match["cheapest"]["title"])
+
+    best_option = None
+    for store_id, data in store_totals.items():
+        if data["total"] <= req.budget:
+            if not best_option or data["total"] < best_option["total"]:
+                best_option = data
+
+    if not best_option:
+        return {
+            "status": "over_budget",
+            "message": f"Even the cheapest options exceed your budget of ₦{req.budget:,.0f}.",
+            "total_needed": min(d["total"] for d in store_totals.values())
+        }
+
+    return {
+        "status": "success",
+        "decision": {
+            "store_name": best_option["store_name"],
+            "total": best_option["total"],
+            "items": best_option["items"]
+        },
+        "savings": req.budget - best_option["total"]
+    }
