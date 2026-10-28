@@ -18,6 +18,7 @@ from app.services.seai_agent import (
     handle_book_service,
     handle_search_items,
     handle_get_store_info,
+    handle_optimize_cart,
 )
 from app.services.llm_agent import GROQ_ENABLED, GROQ_MODEL
 from app.services.seai_reflection import (
@@ -115,8 +116,8 @@ Before doing ANYTHING, think through the request inside a <think>...</think> blo
 Your thinking is private — users never see it. Inside <think>, work out:
 
 1. **What does the user actually want?** Restate it plainly.
-2. **Are there multiple distinct items or services?** If yes, list each one — you will call search_items once per item.
-3. **Budget**: Did the user name a specific number (e.g. "500 naira", "under 10k")? If yes, that exact number becomes max_price for every search.
+2. **Is this a shopping-list-with-budget request?** If the user gives 2+ distinct items AND a total budget (e.g. "rice, beans, oil for 5000"), call `optimize_cart` ONCE with the full item list and budget. Do NOT call search_items for those. Otherwise, if there are multiple distinct items without a total budget, list each one and call `search_items` once per item.
+3. **Budget**: Did the user name a specific number (e.g. "500 naira", "under 10k")? If yes, that exact number becomes max_price for every search_items call.
 4. **Synonyms / intent**: Resolve informal words yourself — "sneakers" → "shoes", "mobile" → "phone", "meatpie" → "meat pie", etc. Write the resolved term.
 5. **Is this purely conversational** (greeting, "thanks", "why", "ok", follow-up with no new request)? If yes, respond directly — do NOT call any tool.
 6. **Health / medical context**: Does the user mention a condition (diabetes, hypertension, pregnancy)? If yes, activate Doctor Mode: prescribe safe options, warn against harmful ones.
@@ -125,6 +126,7 @@ Only after your <think> block should you call tools or write a response.
 
 ## YOUR TOOLS
 - `search_items(query, max_price?)` — find items or services near the user. Call once per distinct item.
+- `optimize_cart(items, budget)` — when the user gives 2+ items AND a total budget, find the single cheapest nearby store that carries all of them. Do NOT also call search_items for the same request.
 - `reserve_item(query, quantity)` — reserve a physical item the user has chosen.
 - `book_service(service)` — book a service the user has explicitly chosen.
 - `get_store_info(store)` — get details about a specific store.
@@ -183,6 +185,33 @@ def _tools():
                         },
                     },
                     "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "optimize_cart",
+                "description": (
+                    "Find the SINGLE cheapest nearby store that carries ALL items in the user's "
+                    "shopping list, within their total budget. "
+                    "Call ONLY when the user gives 2+ distinct items AND a total budget in the same message. "
+                    "Do NOT also call search_items for the same request — this tool does its own search."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of item names to buy, e.g. ['rice', 'beans', 'palm oil']",
+                        },
+                        "budget": {
+                            "type": "number",
+                            "description": "Total Naira budget across all items.",
+                        },
+                    },
+                    "required": ["items", "budget"],
                 },
             },
         },
@@ -264,7 +293,6 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
     if ceiling is not None:
         print(f"💰 SEAI budget ceiling extracted: ₦{ceiling:,.0f}", flush=True)
 
-    # ── Reflexion: retrieve past failures BEFORE pass 2 ────────────
     past_reflections = await fetch_relevant_reflections(req.query)
     reflection_block = format_reflections_for_prompt(past_reflections)
 
@@ -285,7 +313,6 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
 
     messages.append({"role": "user", "content": req.query})
 
-    # ── Pass 1 ─────────────────────────────────────────────────────
     try:
         resp1 = await client.chat.completions.create(
             model=model,
@@ -332,7 +359,6 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
             media_type="text/event-stream",
         )
 
-    # ── Execute tool calls with budget clamp ───────────────────────
     messages.append({"role": "assistant", "content": msg1.content, "tool_calls": [
         {
             "id": tc.id,
@@ -404,7 +430,6 @@ async def _agent_loop(req: AskRequest, user_id: Optional[str], client, model: st
     if deduped:
         cards_payload = {"query": primary_query or req.query, "results": deduped[:6]}
 
-    # ── Pass 2 ─────────────────────────────────────────────────────
     ceiling_note = (
         f" User budget ceiling: ₦{ceiling:,.0f}. Do NOT mention or recommend anything priced above this."
         if ceiling is not None else ""
@@ -496,6 +521,9 @@ async def _execute_agent_function(
     try:
         if fn_name == "search_items":
             return await handle_search_items(args, lat, lng, user_id)
+
+        if fn_name == "optimize_cart":
+            return await handle_optimize_cart(args, lat, lng, user_id)
 
         if fn_name == "reserve_item":
             if not user_id:
