@@ -1176,9 +1176,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="SEAI - Admerce Backend (Multi-Role)", lifespan=lifespan)
 
+# 🚨 BULLETPROOF CORS: Do not use ["*"] with credentials in production.
+# This reads from your .env file. Add FRONTEND_URL=https://your-app.vercel.app to .env
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+origins = [
+    FRONTEND_URL,
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://admerce.vercel.app", # Fallback if env fails
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1248,6 +1258,23 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     print("❌ 422 validation errors:", exc.errors())
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
+# 🚨 BULLETPROOF EXCEPTION HANDLER: Prevents leaking server traces to hackers
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"🔥 UNHANDLED SERVER ERROR: {exc}", flush=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Please try again later."}
+    )
+
+# 🚨 HEALTH CHECK: Pings the DB to ensure Render doesn't route traffic to a dead server
+@app.get("/health")
+async def health_check():
+    try:
+        await database.fetch_one("SELECT 1")
+        return {"status": "healthy"}
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
 @app.get("/")
 async def root():
