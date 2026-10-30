@@ -1188,7 +1188,11 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "https://admerce-web-app-ashy.vercel.app", # Your production frontend
+        "http://localhost:3000",                   # Local development
+        "http://localhost:5173",                   # Vite local
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
